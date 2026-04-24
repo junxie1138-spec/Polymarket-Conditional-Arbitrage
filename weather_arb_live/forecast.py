@@ -36,6 +36,8 @@ def _load_cache() -> dict:
             try:
                 with CACHE_PATH.open(encoding="utf-8") as f:
                     _cache = json.load(f)
+                if not isinstance(_cache, dict):
+                    _cache = {}
             except Exception:
                 _cache = {}
         else:
@@ -48,7 +50,7 @@ def _save_cache():
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = CACHE_PATH.with_name(CACHE_PATH.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(_cache, f)
+            json.dump(_cache if isinstance(_cache, dict) else {}, f)
         os.replace(tmp, CACHE_PATH)
 
 
