@@ -1,0 +1,2036 @@
+{
+  "new york|above|0.45-0.50|1": {
+    "n": 3,
+    "wins": 3,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.4384939195509822
+  },
+  "new york|below|<0.25|1": {
+    "n": 39,
+    "wins": 2,
+    "win_rate": 0.05128205128205128,
+    "lower_95_ci": 0.014177657646399524
+  },
+  "new york|above|<0.25|2-3": {
+    "n": 3,
+    "wins": 2,
+    "win_rate": 0.6666666666666666,
+    "lower_95_ci": 0.20765495512648788
+  },
+  "london|above|<0.25|1": {
+    "n": 11,
+    "wins": 1,
+    "win_rate": 0.09090909090909091,
+    "lower_95_ci": 0.016231752262825964
+  },
+  "new york|below|<0.25|2-3": {
+    "n": 23,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|between|<0.25|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|<0.25|2-3": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|above|<0.25|1": {
+    "n": 13,
+    "wins": 1,
+    "win_rate": 0.07692307692307693,
+    "lower_95_ci": 0.013710066379696325
+  },
+  "atlanta|below|0.40-0.45|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|0.45-0.50|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|above|0.30-0.35|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "atlanta|below|<0.25|1": {
+    "n": 11,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 2.057132194452876e-17
+  },
+  "seoul|between|<0.25|1": {
+    "n": 31,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|between|<0.25|1": {
+    "n": 90,
+    "wins": 1,
+    "win_rate": 0.011111111111111112,
+    "lower_95_ci": 0.001964033535512348
+  },
+  "atlanta|above|<0.25|1": {
+    "n": 3,
+    "wins": 1,
+    "win_rate": 0.3333333333333333,
+    "lower_95_ci": 0.061490315276160515
+  },
+  "new york|above|0.30-0.35|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.45-0.50|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "toronto|above|0.40-0.45|1": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "toronto|above|0.65-0.70|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seoul|below|<0.25|1": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seattle|below|<0.25|1": {
+    "n": 24,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|above|0.50-0.55|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seattle|above|0.65-0.70|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|below|<0.25|1": {
+    "n": 14,
+    "wins": 2,
+    "win_rate": 0.14285714285714285,
+    "lower_95_ci": 0.04009307373792117
+  },
+  "toronto|above|<0.25|1": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|between|<0.25|1": {
+    "n": 92,
+    "wins": 1,
+    "win_rate": 0.010869565217391304,
+    "lower_95_ci": 0.0019212795763616508
+  },
+  "seattle|above|<0.25|1": {
+    "n": 9,
+    "wins": 1,
+    "win_rate": 0.1111111111111111,
+    "lower_95_ci": 0.019890371327130518
+  },
+  "atlanta|below|0.35-0.40|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "london|above|0.30-0.35|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|below|0.40-0.45|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|above|0.25-0.30|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|below|0.25-0.30|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.30-0.35|1": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "dallas|below|0.35-0.40|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seoul|above|<0.25|1": {
+    "n": 51,
+    "wins": 7,
+    "win_rate": 0.13725490196078433,
+    "lower_95_ci": 0.06811015331542725
+  },
+  "toronto|below|<0.25|1": {
+    "n": 16,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.40-0.45|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|below|0.55-0.60|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|below|<0.25|1": {
+    "n": 20,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "miami|below|<0.25|1": {
+    "n": 11,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 2.057132194452876e-17
+  },
+  "toronto|above|0.35-0.40|1": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "miami|below|0.75-0.80|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|<0.25|1": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "miami|below|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "miami|above|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|below|0.35-0.40|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.35-0.40|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|above|0.35-0.40|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seoul|above|0.25-0.30|1": {
+    "n": 6,
+    "wins": 4,
+    "win_rate": 0.6666666666666666,
+    "lower_95_ci": 0.2999883213415286
+  },
+  "seattle|above|0.40-0.45|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "paris|above|0.60-0.65|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "miami|below|0.35-0.40|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|below|0.30-0.35|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|below|0.50-0.55|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|below|0.45-0.50|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "miami|below|0.50-0.55|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|between|<0.25|1": {
+    "n": 44,
+    "wins": 6,
+    "win_rate": 0.13636363636363635,
+    "lower_95_ci": 0.06402867407860051
+  },
+  "chicago|above|<0.25|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|below|0.30-0.35|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|<0.25|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|above|0.50-0.55|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.60-0.65|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "hong kong|between|<0.25|1": {
+    "n": 146,
+    "wins": 11,
+    "win_rate": 0.07534246575342465,
+    "lower_95_ci": 0.0425878798068776
+  },
+  "atlanta|above|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|above|0.25-0.30|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|<0.25|2-3": {
+    "n": 77,
+    "wins": 8,
+    "win_rate": 0.1038961038961039,
+    "lower_95_ci": 0.05359228295797315
+  },
+  "seattle|above|<0.25|2-3": {
+    "n": 6,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|between|<0.25|2-3": {
+    "n": 101,
+    "wins": 15,
+    "win_rate": 0.1485148514851485,
+    "lower_95_ci": 0.092115201386504
+  },
+  "paris|between|<0.25|2-3": {
+    "n": 34,
+    "wins": 5,
+    "win_rate": 0.14705882352941177,
+    "lower_95_ci": 0.06449346382626417
+  },
+  "chicago|above|0.45-0.50|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "singapore|between|<0.25|2-3": {
+    "n": 72,
+    "wins": 3,
+    "win_rate": 0.041666666666666664,
+    "lower_95_ci": 0.01427054877259009
+  },
+  "seoul|above|0.25-0.30|2-3": {
+    "n": 11,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 2.057132194452876e-17
+  },
+  "singapore|between|<0.25|1": {
+    "n": 22,
+    "wins": 2,
+    "win_rate": 0.09090909090909091,
+    "lower_95_ci": 0.025294896282837778
+  },
+  "chicago|below|<0.25|2-3": {
+    "n": 12,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "tokyo|between|<0.25|2-3": {
+    "n": 23,
+    "wins": 1,
+    "win_rate": 0.043478260869565216,
+    "lower_95_ci": 0.007716466962126739
+  },
+  "seoul|between|<0.25|2-3": {
+    "n": 31,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|<0.25|2-3": {
+    "n": 13,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|between|<0.25|2-3": {
+    "n": 53,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "hong kong|between|<0.25|2-3": {
+    "n": 142,
+    "wins": 8,
+    "win_rate": 0.056338028169014086,
+    "lower_95_ci": 0.028820370601525463
+  },
+  "tokyo|between|<0.25|1": {
+    "n": 17,
+    "wins": 5,
+    "win_rate": 0.29411764705882354,
+    "lower_95_ci": 0.13279793865556405
+  },
+  "seoul|above|0.55-0.60|1": {
+    "n": 3,
+    "wins": 1,
+    "win_rate": 0.3333333333333333,
+    "lower_95_ci": 0.061490315276160515
+  },
+  "seoul|above|0.30-0.35|2-3": {
+    "n": 8,
+    "wins": 1,
+    "win_rate": 0.125,
+    "lower_95_ci": 0.02241690886329618
+  },
+  "seattle|above|0.25-0.30|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "los angeles|above|<0.25|1": {
+    "n": 22,
+    "wins": 2,
+    "win_rate": 0.09090909090909091,
+    "lower_95_ci": 0.025294896282837778
+  },
+  "houston|below|<0.25|1": {
+    "n": 13,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.35-0.40|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|<0.25|2-3": {
+    "n": 61,
+    "wins": 5,
+    "win_rate": 0.08196721311475409,
+    "lower_95_ci": 0.03551904291106631
+  },
+  "singapore|above|<0.25|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|below|<0.25|2-3": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.40-0.45|2-3": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.25-0.30|2-3": {
+    "n": 7,
+    "wins": 1,
+    "win_rate": 0.14285714285714285,
+    "lower_95_ci": 0.02567895594897479
+  },
+  "atlanta|between|<0.25|2-3": {
+    "n": 4,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|below|<0.25|1": {
+    "n": 10,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|0.40-0.45|1": {
+    "n": 3,
+    "wins": 3,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.4384939195509822
+  },
+  "san francisco|above|<0.25|1": {
+    "n": 14,
+    "wins": 1,
+    "win_rate": 0.07142857142857142,
+    "lower_95_ci": 0.012721886112291648
+  },
+  "seoul|above|0.55-0.60|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.35-0.40|4-7": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|0.60-0.65|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "los angeles|above|<0.25|4-7": {
+    "n": 18,
+    "wins": 3,
+    "win_rate": 0.16666666666666666,
+    "lower_95_ci": 0.058364704004657555
+  },
+  "london|between|<0.25|4-7": {
+    "n": 10,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.45-0.50|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|above|0.65-0.70|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|above|0.55-0.60|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seoul|above|0.65-0.70|1": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "atlanta|above|0.55-0.60|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seoul|above|0.50-0.55|2-3": {
+    "n": 4,
+    "wins": 1,
+    "win_rate": 0.25,
+    "lower_95_ci": 0.045586062644636216
+  },
+  "seoul|above|0.35-0.40|2-3": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.30-0.35|4-7": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.45-0.50|2-3": {
+    "n": 4,
+    "wins": 2,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.15003570882017145
+  },
+  "paris|between|<0.25|4-7": {
+    "n": 10,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "tokyo|above|<0.25|2-3": {
+    "n": 16,
+    "wins": 2,
+    "win_rate": 0.125,
+    "lower_95_ci": 0.034976749337057134
+  },
+  "los angeles|between|<0.25|1": {
+    "n": 7,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|above|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.80-0.85|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.75-0.80|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "los angeles|between|<0.25|2-3": {
+    "n": 13,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|<0.25|2-3": {
+    "n": 4,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "denver|below|<0.25|4-7": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "tokyo|above|0.35-0.40|2-3": {
+    "n": 5,
+    "wins": 3,
+    "win_rate": 0.6,
+    "lower_95_ci": 0.23071993220883702
+  },
+  "tokyo|above|0.40-0.45|2-3": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "atlanta|below|<0.25|4-7": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|<0.25|4-7": {
+    "n": 3,
+    "wins": 1,
+    "win_rate": 0.3333333333333333,
+    "lower_95_ci": 0.061490315276160515
+  },
+  "new york|above|0.40-0.45|2-3": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "tokyo|above|0.25-0.30|2-3": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "denver|below|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|above|<0.25|2-3": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|above|0.40-0.45|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|above|0.70-0.75|2-3": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|above|0.55-0.60|4-7": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.25-0.30|4-7": {
+    "n": 9,
+    "wins": 3,
+    "win_rate": 0.3333333333333333,
+    "lower_95_ci": 0.12058159868274292
+  },
+  "dallas|above|<0.25|4-7": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "toronto|above|0.65-0.70|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "tokyo|between|<0.25|4-7": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seattle|below|<0.25|2-3": {
+    "n": 16,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "denver|above|0.55-0.60|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "san francisco|above|<0.25|2-3": {
+    "n": 5,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.25-0.30|2-3": {
+    "n": 4,
+    "wins": 3,
+    "win_rate": 0.75,
+    "lower_95_ci": 0.30063605244263664
+  },
+  "denver|above|0.45-0.50|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "denver|above|0.60-0.65|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "san francisco|between|<0.25|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|above|0.35-0.40|4-7": {
+    "n": 4,
+    "wins": 1,
+    "win_rate": 0.25,
+    "lower_95_ci": 0.045586062644636216
+  },
+  "austin|above|0.25-0.30|4-7": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "houston|above|<0.25|4-7": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "denver|above|<0.25|4-7": {
+    "n": 6,
+    "wins": 2,
+    "win_rate": 0.3333333333333333,
+    "lower_95_ci": 0.09676933255921684
+  },
+  "austin|above|<0.25|2-3": {
+    "n": 6,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "hong kong|between|<0.25|4-7": {
+    "n": 11,
+    "wins": 1,
+    "win_rate": 0.09090909090909091,
+    "lower_95_ci": 0.016231752262825964
+  },
+  "austin|above|0.25-0.30|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "singapore|between|<0.25|4-7": {
+    "n": 17,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "tokyo|above|<0.25|1": {
+    "n": 14,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.35-0.40|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "san francisco|above|0.60-0.65|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "san francisco|above|0.50-0.55|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "toronto|above|0.45-0.50|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "toronto|above|0.25-0.30|2-3": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "san francisco|above|<0.25|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|below|<0.25|4-7": {
+    "n": 4,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.30-0.35|4-7": {
+    "n": 3,
+    "wins": 2,
+    "win_rate": 0.6666666666666666,
+    "lower_95_ci": 0.20765495512648788
+  },
+  "seoul|above|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|above|0.25-0.30|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.50-0.55|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.40-0.45|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "toronto|above|0.80-0.85|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.65-0.70|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.30-0.35|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.25-0.30|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.45-0.50|2-3": {
+    "n": 4,
+    "wins": 2,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.15003570882017145
+  },
+  "seoul|above|<0.25|4-7": {
+    "n": 23,
+    "wins": 10,
+    "win_rate": 0.43478260869565216,
+    "lower_95_ci": 0.25634368332198654
+  },
+  "dallas|above|0.30-0.35|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|above|0.35-0.40|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|above|<0.25|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "toronto|above|0.75-0.80|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|below|<0.25|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|0.75-0.80|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "los angeles|above|0.25-0.30|1": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "toronto|above|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|above|0.40-0.45|4-7": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "toronto|above|0.65-0.70|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|<0.25|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.70-0.75|1": {
+    "n": 4,
+    "wins": 4,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.5100999795960008
+  },
+  "los angeles|above|0.65-0.70|1": {
+    "n": 3,
+    "wins": 3,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.4384939195509822
+  },
+  "paris|above|0.60-0.65|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.55-0.60|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.50-0.55|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.65-0.70|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "london|above|<0.25|2-3": {
+    "n": 7,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "paris|above|0.50-0.55|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.55-0.60|2-3": {
+    "n": 3,
+    "wins": 3,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.4384939195509822
+  },
+  "denver|above|0.40-0.45|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.45-0.50|2-3": {
+    "n": 3,
+    "wins": 1,
+    "win_rate": 0.3333333333333333,
+    "lower_95_ci": 0.061490315276160515
+  },
+  "los angeles|above|0.75-0.80|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "los angeles|above|0.50-0.55|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.50-0.55|2-3": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "los angeles|above|0.35-0.40|2-3": {
+    "n": 5,
+    "wins": 3,
+    "win_rate": 0.6,
+    "lower_95_ci": 0.23071993220883702
+  },
+  "denver|above|0.55-0.60|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.55-0.60|2-3": {
+    "n": 4,
+    "wins": 4,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.5100999795960008
+  },
+  "new york|above|0.30-0.35|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.85-0.90|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.60-0.65|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "san francisco|above|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "london|above|<0.25|4-7": {
+    "n": 8,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.35-0.40|4-7": {
+    "n": 3,
+    "wins": 3,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.4384939195509822
+  },
+  "toronto|between|<0.25|4-7": {
+    "n": 17,
+    "wins": 4,
+    "win_rate": 0.23529411764705882,
+    "lower_95_ci": 0.09554889071675943
+  },
+  "los angeles|above|0.35-0.40|4-7": {
+    "n": 5,
+    "wins": 4,
+    "win_rate": 0.8,
+    "lower_95_ci": 0.37552826411853885
+  },
+  "chicago|below|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.45-0.50|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.25-0.30|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|above|0.70-0.75|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.30-0.35|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|below|<0.25|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "paris|above|0.55-0.60|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|below|0.25-0.30|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.50-0.55|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.25-0.30|4-7": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "san francisco|above|0.50-0.55|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.65-0.70|2-3": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "denver|above|0.25-0.30|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.25-0.30|4-7": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "denver|above|0.45-0.50|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "paris|above|0.80-0.85|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|0.65-0.70|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "tokyo|above|0.40-0.45|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "atlanta|below|0.40-0.45|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|below|0.35-0.40|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|below|0.65-0.70|2-3": {
+    "n": 3,
+    "wins": 3,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.4384939195509822
+  },
+  "atlanta|below|0.30-0.35|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|below|0.55-0.60|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|below|0.70-0.75|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "tokyo|above|<0.25|4-7": {
+    "n": 5,
+    "wins": 3,
+    "win_rate": 0.6,
+    "lower_95_ci": 0.23071993220883702
+  },
+  "san francisco|above|0.30-0.35|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "new york|below|0.70-0.75|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|below|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|below|0.60-0.65|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "san francisco|below|<0.25|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "amsterdam|between|<0.25|1": {
+    "n": 4,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|between|<0.25|4-7": {
+    "n": 4,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "amsterdam|between|<0.25|2-3": {
+    "n": 11,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 2.057132194452876e-17
+  },
+  "austin|below|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|<0.25|4-7": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|below|<0.25|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|between|<0.25|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "miami|above|<0.25|2-3": {
+    "n": 4,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "amsterdam|above|0.45-0.50|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|above|0.45-0.50|4-7": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "amsterdam|above|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "amsterdam|above|0.25-0.30|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.70-0.75|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "houston|above|0.75-0.80|2-3": {
+    "n": 4,
+    "wins": 4,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.5100999795960008
+  },
+  "amsterdam|above|0.35-0.40|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "amsterdam|above|0.70-0.75|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "houston|above|0.70-0.75|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "paris|above|<0.25|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "amsterdam|above|<0.25|2-3": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "dallas|above|0.75-0.80|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "houston|above|0.50-0.55|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|above|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "austin|above|0.40-0.45|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "houston|above|0.35-0.40|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "london|below|0.30-0.35|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|between|<0.25|1": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|0.85-0.90|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "austin|above|0.50-0.55|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seattle|above|0.30-0.35|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|above|0.55-0.60|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "seattle|above|0.25-0.30|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "houston|above|0.70-0.75|2-3": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "seattle|above|<0.25|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "amsterdam|below|0.30-0.35|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "chicago|above|0.55-0.60|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "amsterdam|below|0.55-0.60|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "houston|above|0.80-0.85|2-3": {
+    "n": 4,
+    "wins": 4,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.5100999795960008
+  },
+  "denver|above|0.80-0.85|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|0.50-0.55|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.55-0.60|4-7": {
+    "n": 2,
+    "wins": 1,
+    "win_rate": 0.5,
+    "lower_95_ci": 0.09452865480086611
+  },
+  "tokyo|above|0.25-0.30|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|0.60-0.65|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|0.55-0.60|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "paris|below|0.50-0.55|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "london|below|0.45-0.50|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "london|below|0.60-0.65|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "houston|above|0.65-0.70|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "paris|below|0.65-0.70|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "houston|above|0.25-0.30|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.80-0.85|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.70-0.75|2-3": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|above|0.70-0.75|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "houston|above|0.75-0.80|4-7": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "houston|above|0.30-0.35|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "austin|above|0.55-0.60|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "tokyo|above|0.25-0.30|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "denver|above|0.65-0.70|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.65-0.70|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|above|0.60-0.65|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "dallas|above|0.60-0.65|4-7": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|above|0.60-0.65|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|between|<0.25|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|above|0.55-0.60|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "austin|above|0.60-0.65|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "chicago|between|<0.25|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "tokyo|above|0.35-0.40|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "austin|above|0.30-0.35|4-7": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "tokyo|above|0.30-0.35|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|<0.25|1": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|0.65-0.70|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|0.55-0.60|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "houston|above|<0.25|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|0.65-0.70|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|below|0.70-0.75|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "denver|above|<0.25|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.30-0.35|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|0.45-0.50|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.60-0.65|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "los angeles|above|0.35-0.40|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|above|0.40-0.45|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "seoul|above|0.60-0.65|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "new york|below|0.30-0.35|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|below|0.25-0.30|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.65-0.70|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "new york|below|0.40-0.45|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "denver|above|0.70-0.75|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "los angeles|above|0.85-0.90|1": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "los angeles|above|0.75-0.80|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "san francisco|above|0.60-0.65|2-3": {
+    "n": 2,
+    "wins": 2,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.3423719528896193
+  },
+  "seoul|above|0.75-0.80|1": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  },
+  "los angeles|above|0.45-0.50|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "houston|between|<0.25|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "houston|below|<0.25|2-3": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "toronto|above|<0.25|2-3": {
+    "n": 3,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "atlanta|above|0.25-0.30|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "dallas|below|0.25-0.30|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|below|0.80-0.85|1": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|below|0.75-0.80|1": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|below|0.70-0.75|2-3": {
+    "n": 2,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "chicago|below|0.60-0.65|2-3": {
+    "n": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "lower_95_ci": 0.0
+  },
+  "austin|below|<0.25|2-3": {
+    "n": 1,
+    "wins": 1,
+    "win_rate": 1.0,
+    "lower_95_ci": 0.20654329147389294
+  }
+}

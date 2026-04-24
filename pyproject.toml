@@ -1,0 +1,20 @@
+[project]
+name = "polymarket-weather-live-bot"
+version = "0.1.0"
+description = "Standalone fixed_v1 Polymarket weather arbitrage live bot"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "py-clob-client-v2>=1.0.0",
+  "requests>=2.31.0",
+  "scipy>=1.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
