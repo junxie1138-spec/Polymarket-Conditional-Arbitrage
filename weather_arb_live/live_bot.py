@@ -6,7 +6,7 @@ import signal
 import time
 from datetime import datetime, timezone
 
-from . import config
+from . import config, network
 from .calibration import load_calibration
 from .forecast import flush_cache
 from .ledger import PositionLedger
@@ -68,13 +68,14 @@ class LiveBot:
         self.calibration = load_calibration()
         self.logger.info(
             "startup model=%s variant=%s no_side=%s dry_run=%s clob_host=%s "
-            "poll_interval_seconds=%s positions=%s",
+            "poll_interval_seconds=%s offline_retry_seconds=%s positions=%s",
             self.runtime.model_name,
             self.runtime.model_variant,
             self.runtime.enable_no_side,
             self.runtime.dry_run,
             self.runtime.clob_host,
             self.runtime.poll_interval_seconds,
+            self.runtime.offline_retry_seconds,
             len(self.ledger.positions),
         )
         self._log_artifact_status()
@@ -106,10 +107,21 @@ class LiveBot:
         self.install_signal_handlers()
         try:
             while self.running:
-                self.run_one_cycle()
+                try:
+                    cycle_ok = self.run_one_cycle()
+                except Exception as exc:
+                    cycle_ok = False
+                    self.logger.exception("cycle_unhandled_error error=%s", exc)
                 if not self.running:
                     break
-                time.sleep(self.runtime.poll_interval_seconds)
+                sleep_seconds = (
+                    self.runtime.poll_interval_seconds
+                    if cycle_ok
+                    else self.runtime.offline_retry_seconds
+                )
+                if not cycle_ok:
+                    self.logger.warning("cycle_retry_after seconds=%s", sleep_seconds)
+                time.sleep(sleep_seconds)
         finally:
             self.shutdown()
 
@@ -120,14 +132,14 @@ class LiveBot:
         finally:
             self.shutdown()
 
-    def run_one_cycle(self) -> None:
+    def run_one_cycle(self) -> bool:
         cycle_started = datetime.now(timezone.utc)
         self.logger.info("cycle_start at=%s", cycle_started.isoformat())
         try:
             markets = self.fetcher.fetch_active_markets(limit=config.live_market_limit())
         except Exception as exc:
             self.logger.exception("cycle_fetch_error error=%s", exc)
-            return
+            return False
 
         entered_positions = self.ledger.entered_positions(include_dry_run=self.runtime.dry_run)
         self.logger.info("cycle_markets count=%s", len(markets))
@@ -175,6 +187,7 @@ class LiveBot:
                 self.logger.exception("market_error market_id=%s error=%s", market_id, exc)
         self.ledger.save()
         self.logger.info("cycle_end positions=%s", len(self.ledger.positions))
+        return True
 
     def _evaluate_side(
         self,
@@ -236,11 +249,34 @@ class LiveBot:
     def _record_entry(self, decision: Decision, entered_positions: dict) -> None:
         assert decision.plan is not None
         plan = decision.plan
-        result = self.order_placer.place_order(
-            token_id=plan.token_id,
-            market_price=plan.market_price,
-            position_usd=plan.position_usd,
-        )
+        try:
+            result = self.order_placer.place_order(
+                token_id=plan.token_id,
+                market_price=plan.market_price,
+                position_usd=plan.position_usd,
+            )
+        except Exception as exc:
+            if not self.runtime.dry_run and network.is_retryable_exception(exc):
+                row = self.ledger.record(
+                    plan,
+                    dry_run=False,
+                    order_response={
+                        "posted": "unknown",
+                        "reason": "order_submission_interrupted",
+                        "error": str(exc),
+                    },
+                )
+                entered_positions[plan.market_id] = row
+                self.ledger.save()
+                self.logger.exception(
+                    "order_submit_unknown market_id=%s side=%s token_id=%s error=%s",
+                    plan.market_id,
+                    plan.side,
+                    plan.token_id,
+                    exc,
+                )
+                return
+            raise
         row = self.ledger.record(
             plan,
             dry_run=self.runtime.dry_run,

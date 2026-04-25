@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import requests
+
 from weather_arb_live.ledger import PositionLedger
 from weather_arb_live.live_bot import LiveBot
 from weather_arb_live.order_placer import OrderResult, build_order_intent
@@ -149,6 +151,81 @@ def test_run_one_cycle_falls_back_to_no_side(monkeypatch):
         assert "m2" in bot.ledger.positions
         assert bot.ledger.positions["m2"]["side"] == "NO"
         assert bot.ledger.positions["m2"]["token_id"] == "no-token"
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+class OfflineFetcher:
+    def fetch_active_markets(self, **_kwargs):
+        raise ConnectionError("offline")
+
+
+def test_run_one_cycle_reports_fetch_outage_without_crashing():
+    logger = logging.getLogger("test_live_bot_offline")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=OfflineFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=PositionLedger(Path("data/test_offline_positions.json")).load(),
+        logger=logger,
+    )
+
+    assert bot.run_one_cycle() is False
+
+
+class InterruptedOrderPlacer:
+    def place_order(self, **_kwargs):
+        raise requests.ConnectionError("response lost")
+
+
+def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
+    path = Path("data/test_unknown_order_positions.json")
+    if path.exists():
+        path.unlink()
+    plan = TradePlan(
+        market_id="m3",
+        token_id="yes-token",
+        side="YES",
+        question="Q",
+        city="New York",
+        target_date="2026-04-27",
+        market_price=0.30,
+        entry_price=0.3015,
+        shares=165.837,
+        position_usd=50.0,
+        forecast_prob=0.80,
+        edge=0.4985,
+        lead_days=3,
+        entry_time=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+    def fake_evaluate(_market, current_price, **_kwargs):
+        if current_price is None:
+            return Decision.skip("missing_live_price", market_id="m3", token_id="yes-token")
+        return Decision.enter(plan)
+
+    monkeypatch.setattr("weather_arb_live.live_bot.evaluate_market", fake_evaluate)
+    logger = logging.getLogger("test_live_bot_unknown_order")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=InterruptedOrderPlacer(),
+        ledger=PositionLedger(path).load(),
+        logger=logger,
+    )
+    bot.calibration = None
+
+    try:
+        assert bot.run_one_cycle() is True
+        row = bot.ledger.positions["m3"]
+        assert row["dry_run"] is False
+        assert row["order_response"]["posted"] == "unknown"
+        assert row["order_response"]["reason"] == "order_submission_interrupted"
     finally:
         if path.exists():
             path.unlink()

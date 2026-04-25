@@ -59,6 +59,7 @@ Minimum safe dry-run settings:
 ```powershell
 $env:DRY_RUN="true"
 $env:POLL_INTERVAL_MINUTES="15"
+$env:OFFLINE_RETRY_SECONDS="60"
 $env:MAX_POSITION_USD="50"
 $env:ENABLE_NO_SIDE="true"
 ```
@@ -123,6 +124,7 @@ $env:POLYMARKET_CLOB_HOST="https://clob.polymarket.com"
 $env:POLYMARKET_SIGNATURE_TYPE="..."
 $env:POLYMARKET_FUNDER_ADDRESS="..."
 $env:POLL_INTERVAL_MINUTES="15"
+$env:OFFLINE_RETRY_SECONDS="60"
 $env:MAX_POSITION_USD="50"
 $env:LIVE_MARKET_LIMIT="0"
 $env:ENABLE_NO_SIDE="true"
@@ -146,6 +148,17 @@ uv run python -m weather_arb_live.live_bot
 - `logs/live_bot.log` contains startup, skip, enter, and order logs.
 - `data/live_positions.json` tracks entered markets across restarts.
 - `data/weather_cache.json` caches Open-Meteo forecast responses.
+
+If your internet drops while the bot is running continuously, the bot logs the
+failed fetch, leaves existing positions untouched, and retries after
+`OFFLINE_RETRY_SECONDS`. Transient forecast failures are not written into
+`data/weather_cache.json`, so recovered connectivity can produce fresh signals
+on the next cycle.
+
+If the connection drops during a live order submission, the bot fails closed:
+it records the market in `data/live_positions.json` with
+`order_response.posted="unknown"` and does not re-enter that market
+automatically. Check Polymarket manually before clearing that row.
 
 To allow the bot to consider markets again after a dry-run validation, move or
 delete `data/live_positions.json`. Do this only when you intentionally want to

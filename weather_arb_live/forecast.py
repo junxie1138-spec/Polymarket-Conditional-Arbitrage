@@ -98,29 +98,32 @@ def _fetch_forecast_response(
         "models": model,
         "temperature_unit": temp_unit,
     }
+    cache_failure = False
     try:
         r = None
-        for attempt in range(4):
+        for attempt in range(1, 5):
             r = _session.get(url, params=params, timeout=30)
             if r.status_code == 200:
                 break
-            if r.status_code in (429, 502, 503, 504):
-                import time as _t
-                _t.sleep(1.0 + attempt * 2.0)
+            if network.is_retryable_status(r.status_code):
+                if attempt < 4:
+                    network.sleep_for_attempt(attempt, base_seconds=2.0)
                 continue
+            cache_failure = True
             break
         if r is None or r.status_code != 200:
-            with _cache_lock:
-                cache[key] = None
-                _save_counter += 1
-                should_save = (_save_counter % 100 == 0)
-            if should_save:
-                _save_cache()
+            if cache_failure:
+                with _cache_lock:
+                    cache[key] = None
+                    _save_counter += 1
+                    should_save = (_save_counter % 100 == 0)
+                if should_save:
+                    _save_cache()
             return None
         data = r.json()
     except Exception:
-        with _cache_lock:
-            cache[key] = None
+        # Do not cache transient connection/DNS/timeout failures. A local
+        # internet outage should be retried on the next cycle after recovery.
         return None
 
     with _cache_lock:

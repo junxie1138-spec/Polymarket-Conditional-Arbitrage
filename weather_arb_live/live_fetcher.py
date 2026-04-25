@@ -61,7 +61,8 @@ class LiveFetcher:
         offset = 0
         limit = 100
         while True:
-            response = self.session.get(
+            batch = network.get_json_with_retries(
+                self.session,
                 config.GAMMA_EVENTS_URL,
                 params={
                     "tag_slug": tag_slug,
@@ -71,8 +72,8 @@ class LiveFetcher:
                 },
                 timeout=30,
             )
-            response.raise_for_status()
-            batch = response.json()
+            if not isinstance(batch, list):
+                raise ValueError(f"unexpected Gamma events response: {type(batch).__name__}")
             if not batch:
                 break
             events.extend(batch)
@@ -106,13 +107,12 @@ class LiveFetcher:
         return markets
 
     def fetch_order_book(self, token_id: str) -> dict:
-        response = self.session.get(
+        data = network.get_json_with_retries(
+            self.session,
             f"{self.clob_host}/book",
             params={"token_id": token_id},
             timeout=20,
         )
-        response.raise_for_status()
-        data = response.json()
         if isinstance(data, dict):
             return data
         raise ValueError(f"unexpected order book response for token_id={token_id}")

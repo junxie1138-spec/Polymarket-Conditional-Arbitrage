@@ -1,4 +1,7 @@
 import json
+from datetime import date
+
+import requests
 
 from weather_arb_live import forecast
 
@@ -40,3 +43,29 @@ def test_save_cache_never_writes_json_null(monkeypatch):
             path.write_text(original_text, encoding="utf-8")
         elif path.exists():
             path.unlink()
+
+
+def test_transient_forecast_failure_does_not_poison_cache(monkeypatch):
+    original_cache = forecast._cache
+
+    class OfflineSession:
+        def get(self, *_args, **_kwargs):
+            raise requests.ConnectionError("offline")
+
+    try:
+        monkeypatch.setattr(forecast, "_cache", {})
+        monkeypatch.setattr(forecast, "_session", OfflineSession())
+
+        result = forecast._fetch_forecast_response(
+            1.234,
+            2.345,
+            "UTC",
+            date(2026, 4, 27),
+            "F",
+        )
+
+        key = "pr2|1.23,2.35|2026-04-27|F|gfs_seamless"
+        assert result is None
+        assert key not in forecast._cache
+    finally:
+        monkeypatch.setattr(forecast, "_cache", original_cache)

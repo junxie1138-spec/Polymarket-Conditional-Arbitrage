@@ -62,20 +62,8 @@ def _required_env(name: str) -> str:
     return value
 
 
-def _response_status(exc: Exception) -> int | None:
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    if status is not None:
-        return int(status)
-    status = getattr(exc, "status_code", None)
-    if status is not None:
-        return int(status)
-    return None
-
-
 def _is_retryable(exc: Exception) -> bool:
-    status = _response_status(exc)
-    return status == 429 or (status is not None and 500 <= status <= 599)
+    return network.is_retryable_status(network.response_status(exc))
 
 
 class OrderPlacer:

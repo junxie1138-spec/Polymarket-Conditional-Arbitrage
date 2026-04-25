@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import socket
 import ssl
+import time
 import urllib.parse
 import urllib.request
+from typing import Any
 
 import requests
 
@@ -20,6 +22,7 @@ _RESOLVER_IPS = ["1.1.1.1", "1.0.0.1"]
 _cache: dict[str, list[str]] = {}
 _orig_getaddrinfo = socket.getaddrinfo
 _installed = False
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 def _doh_resolve(hostname: str) -> list[str]:
@@ -70,3 +73,55 @@ def get_session() -> requests.Session:
     session = requests.Session()
     session.headers["User-Agent"] = "polymarket-weather-live-bot/0.1"
     return session
+
+
+def response_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        return int(status)
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return int(status)
+    return None
+
+
+def is_retryable_status(status: int | None) -> bool:
+    return status in RETRYABLE_HTTP_STATUSES
+
+
+def is_retryable_exception(exc: Exception) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    return is_retryable_status(response_status(exc))
+
+
+def sleep_for_attempt(attempt: int, *, base_seconds: float = 1.0, cap_seconds: float = 30.0) -> None:
+    time.sleep(min(cap_seconds, base_seconds * (2 ** max(0, attempt - 1))))
+
+
+def get_json_with_retries(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: float = 30,
+    attempts: int = 3,
+    backoff_seconds: float = 1.0,
+) -> Any:
+    """GET JSON with bounded retry for transient network/server failures."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(url, params=params, timeout=timeout)
+            if is_retryable_status(response.status_code) and attempt < attempts:
+                sleep_for_attempt(attempt, base_seconds=backoff_seconds)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == attempts or not is_retryable_exception(exc):
+                raise
+            sleep_for_attempt(attempt, base_seconds=backoff_seconds)
+    raise RuntimeError(f"GET failed after retries: {url}") from last_exc

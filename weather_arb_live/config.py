@@ -28,6 +28,7 @@ MODEL_NAME = "fixed_v1_no"
 MODEL_VARIANT = "Combined"
 ENABLE_NO_SIDE = True
 MAX_NO_ENTRY_PRICE = 0.75
+OFFLINE_RETRY_SECONDS = 60
 
 MAX_LEAD_DAYS = 7
 DEFAULT_MODEL = "gfs_seamless"
@@ -84,6 +85,10 @@ def poll_interval_seconds() -> int:
     return max(1, env_int("POLL_INTERVAL_MINUTES", 15)) * 60
 
 
+def offline_retry_seconds() -> int:
+    return max(5, env_int("OFFLINE_RETRY_SECONDS", OFFLINE_RETRY_SECONDS))
+
+
 def max_position_usd() -> float:
     return min(MAX_POSITION_USD, env_float("MAX_POSITION_USD", MAX_POSITION_USD))
 
@@ -102,6 +107,7 @@ class RuntimeConfig:
     model_name: str
     model_variant: str
     enable_no_side: bool
+    offline_retry_seconds: int
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -113,4 +119,5 @@ def load_runtime_config() -> RuntimeConfig:
         model_name=MODEL_NAME,
         model_variant=MODEL_VARIANT,
         enable_no_side=enable_no_side(),
+        offline_retry_seconds=offline_retry_seconds(),
     )

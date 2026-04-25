@@ -1,3 +1,6 @@
+import requests
+
+from weather_arb_live import network
 from weather_arb_live.live_fetcher import LiveFetcher, midpoint_from_book
 
 
@@ -32,3 +35,32 @@ def test_flatten_event_markets_attaches_event_context():
     assert markets[0]["_event_title"] == "Weather"
     assert markets[0]["_event_id"] == "e1"
     assert markets[0]["_event_tags"] == ["weather"]
+
+
+def test_fetch_midpoint_retries_transient_connection(monkeypatch):
+    monkeypatch.setattr(network, "sleep_for_attempt", lambda *_args, **_kwargs: None)
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "bids": [{"price": "0.40"}],
+                "asks": [{"price": "0.44"}],
+            }
+
+    class Session:
+        def get(self, *_args, **_kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise requests.ConnectionError("offline")
+            return Response()
+
+    fetcher = LiveFetcher(session=Session(), clob_host="https://example.invalid")
+
+    assert fetcher.fetch_midpoint("token") == 0.42
+    assert len(calls) == 2
