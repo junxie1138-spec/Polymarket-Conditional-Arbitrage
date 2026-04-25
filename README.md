@@ -8,6 +8,7 @@ The model evaluates YES first using fixed_v1 gates. If YES does not qualify on p
 
 - `DRY_RUN=true` by default. The bot logs intended orders and skips actual order posting.
 - `data/live_positions.json` is ignored by Git and prevents one re-entry per market across restarts.
+- Live mode blocks trading until startup reconciliation checks open orders and positions.
 - `logs/` is ignored by Git.
 - Live trading requires Polymarket CLOB credentials in environment variables.
 
@@ -60,6 +61,7 @@ Minimum safe dry-run settings:
 $env:DRY_RUN="true"
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
+$env:RECONCILE_ON_STARTUP="true"
 $env:MAX_POSITION_USD="50"
 $env:ENABLE_NO_SIDE="true"
 ```
@@ -117,6 +119,13 @@ $env:POLYMARKET_API_PASSPHRASE="..."
 $env:POLYMARKET_PRIVATE_KEY="..."
 ```
 
+If you use a proxy/funder wallet, set the reconciliation address to the wallet
+that Polymarket's Data API shows as holding positions:
+
+```powershell
+$env:POLYMARKET_RECONCILE_USER_ADDRESS="0x..."
+```
+
 Optional:
 
 ```powershell
@@ -125,6 +134,7 @@ $env:POLYMARKET_SIGNATURE_TYPE="..."
 $env:POLYMARKET_FUNDER_ADDRESS="..."
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
+$env:RECONCILE_ON_STARTUP="true"
 $env:MAX_POSITION_USD="50"
 $env:LIVE_MARKET_LIMIT="0"
 $env:ENABLE_NO_SIDE="true"
@@ -149,6 +159,13 @@ uv run python -m weather_arb_live.live_bot
 - `data/live_positions.json` tracks entered markets across restarts.
 - `data/weather_cache.json` caches Open-Meteo forecast responses.
 
+When `DRY_RUN=false` and `RECONCILE_ON_STARTUP=true`, the bot queries CLOB
+open orders and Polymarket Data API positions before trading. Any live
+exchange exposure in an active weather market gets a local guard row in
+`data/live_positions.json`, so a cloud restart or lost local file does not
+blindly re-enter that market. If reconciliation cannot complete, continuous
+mode keeps retrying after `OFFLINE_RETRY_SECONDS` and does not trade.
+
 If your internet drops while the bot is running continuously, the bot logs the
 failed fetch, leaves existing positions untouched, and retries after
 `OFFLINE_RETRY_SECONDS`. Transient forecast failures are not written into
@@ -160,9 +177,22 @@ it records the market in `data/live_positions.json` with
 `order_response.posted="unknown"` and does not re-enter that market
 automatically. Check Polymarket manually before clearing that row.
 
+If startup reconciliation cannot find a matching exchange order or position for
+an existing live local row, the bot keeps the row and marks it with
+`reconciliation.requires_manual_review=true`. Review Polymarket before deleting
+or editing that row.
+
 To allow the bot to consider markets again after a dry-run validation, move or
 delete `data/live_positions.json`. Do this only when you intentionally want to
 clear the one-entry-per-market guard.
+
+## Cloud Hosting Notes
+
+For a VPS, EC2, or Droplet, run the bot under `systemd`, Docker restart policy,
+or another process manager. Keep `.env` secrets on the server only, and keep
+`data/` on persistent disk so ledgers, caches, and reconciliation guards survive
+restarts. Start cloud deployment with `DRY_RUN=true`, then switch to
+`DRY_RUN=false` only after logs and `data/live_positions.json` look correct.
 
 ## Strategy Artifacts
 

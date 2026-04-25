@@ -146,6 +146,37 @@ class OrderPlacer:
         self._client = ClobClient(**kwargs)
         return self._client
 
+    def get_client_address(self) -> str:
+        if self.dry_run:
+            raise MissingCredentialsError("client address is only available when DRY_RUN=false")
+        return str(self._get_client().get_address())
+
+    def fetch_open_orders(self) -> list[dict[str, Any]]:
+        if self.dry_run:
+            return []
+
+        client = self._get_client()
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = client.get_open_orders()
+                if not isinstance(response, list):
+                    raise ValueError(f"unexpected open orders response: {type(response).__name__}")
+                return [row for row in response if isinstance(row, dict)]
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 3 or not network.is_retryable_exception(exc):
+                    raise
+                sleep_seconds = 2 ** (attempt - 1)
+                logger.warning(
+                    "open_orders_retry attempt=%s sleep=%s error=%s",
+                    attempt,
+                    sleep_seconds,
+                    exc,
+                )
+                time.sleep(sleep_seconds)
+        raise RuntimeError(f"open orders fetch failed after retries: {last_exc}")
+
     @staticmethod
     def _post_order(client, intent: OrderIntent):
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side

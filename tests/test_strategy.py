@@ -61,6 +61,42 @@ def test_skip_already_entered_market():
     assert decision.reason == "already_entered"
 
 
+def test_skip_already_entered_by_reconciled_condition_id():
+    decision = evaluate_market(
+        market(id="gamma-1", conditionId="0xabc"),
+        0.30,
+        as_of=AS_OF,
+        entered_positions={
+            "0xabc": {
+                "market_id": "0xabc",
+                "condition_id": "0xabc",
+                "token_id": "yes-token",
+            }
+        },
+        forecast_probability_fn=forecast(0.80),
+    )
+
+    assert decision.reason == "already_entered"
+
+
+def test_skip_opposite_side_when_reconciled_token_is_in_same_market():
+    decision = evaluate_market(
+        market(id="gamma-1", conditionId="0xabc"),
+        0.30,
+        side="YES",
+        as_of=AS_OF,
+        entered_positions={
+            "external-no-token": {
+                "market_id": "external-no-token",
+                "token_id": "no-token",
+            }
+        },
+        forecast_probability_fn=forecast(0.80),
+    )
+
+    assert decision.reason == "already_entered"
+
+
 def test_skip_low_price():
     decision = evaluate_market(
         market(),

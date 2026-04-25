@@ -182,6 +182,7 @@ class InterruptedOrderPlacer:
 
 def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
     monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
     path = Path("data/test_unknown_order_positions.json")
     if path.exists():
@@ -229,3 +230,30 @@ def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
     finally:
         if path.exists():
             path.unlink()
+
+
+class UncalledFetcher:
+    def fetch_active_markets(self, **_kwargs):
+        raise AssertionError("market fetch should wait for reconciliation")
+
+
+class FailingReconciler:
+    def reconcile(self, **_kwargs):
+        raise requests.ConnectionError("data api offline")
+
+
+def test_live_mode_blocks_cycle_until_startup_reconcile_succeeds(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "true")
+    logger = logging.getLogger("test_live_bot_reconcile_blocks")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=UncalledFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=PositionLedger(Path("data/test_reconcile_block_positions.json")).load(),
+        logger=logger,
+    )
+    bot.reconciler = FailingReconciler()
+
+    assert bot.run_one_cycle() is False

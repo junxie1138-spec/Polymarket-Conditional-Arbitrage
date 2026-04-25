@@ -60,6 +60,30 @@ def token_ids_from_market(market: dict) -> list[str]:
     return []
 
 
+def entered_position_for_market(market: dict, entered_positions: Mapping[str, dict] | None) -> dict | None:
+    if not entered_positions:
+        return None
+
+    market_id = str(market.get("id") or market.get("conditionId") or "")
+    condition_id = str(market.get("conditionId") or "")
+    market_keys = {value for value in (market_id, condition_id) if value}
+    market_tokens = set(token_ids_from_market(market))
+
+    for key, row in entered_positions.items():
+        row_market_id = str(row.get("market_id") or "")
+        row_condition_id = str(row.get("condition_id") or "")
+        row_token_id = str(row.get("token_id") or "")
+        if str(key) in market_keys:
+            return row
+        if row_market_id and row_market_id in market_keys:
+            return row
+        if row_condition_id and row_condition_id in market_keys:
+            return row
+        if row_token_id and row_token_id in market_tokens:
+            return row
+    return None
+
+
 def yes_token_from_market(market: dict) -> str | None:
     token_ids = token_ids_from_market(market)
     if token_ids:
@@ -129,8 +153,13 @@ def evaluate_market(
     if not market_id:
         return Decision.skip("missing_market_id")
 
-    if entered_positions and market_id in entered_positions:
-        return Decision.skip("already_entered", market_id=market_id)
+    existing_position = entered_position_for_market(market, entered_positions)
+    if existing_position is not None:
+        return Decision.skip(
+            "already_entered",
+            market_id=market_id,
+            token_id=existing_position.get("token_id"),
+        )
 
     token_id = token_from_market(market, side)
     if not token_id:

@@ -15,6 +15,7 @@ RESIDUALS_CACHE_PATH = DATA_DIR / "empirical_residuals.json"
 CALIBRATION_PATH = DATA_DIR / "calibration_table.json"
 POSITIONS_PATH = DATA_DIR / "live_positions.json"
 
+DATA_API_BASE_URL = "https://data-api.polymarket.com"
 MIN_EDGE = 0.12
 MAX_POSITION_USD = 50.0
 SLIPPAGE = 0.005
@@ -29,6 +30,7 @@ MODEL_VARIANT = "Combined"
 ENABLE_NO_SIDE = True
 MAX_NO_ENTRY_PRICE = 0.75
 OFFLINE_RETRY_SECONDS = 60
+RECONCILE_ON_STARTUP = True
 
 MAX_LEAD_DAYS = 7
 DEFAULT_MODEL = "gfs_seamless"
@@ -89,6 +91,10 @@ def offline_retry_seconds() -> int:
     return max(5, env_int("OFFLINE_RETRY_SECONDS", OFFLINE_RETRY_SECONDS))
 
 
+def reconcile_on_startup() -> bool:
+    return env_bool("RECONCILE_ON_STARTUP", RECONCILE_ON_STARTUP)
+
+
 def max_position_usd() -> float:
     return min(MAX_POSITION_USD, env_float("MAX_POSITION_USD", MAX_POSITION_USD))
 
@@ -108,6 +114,7 @@ class RuntimeConfig:
     model_variant: str
     enable_no_side: bool
     offline_retry_seconds: int
+    reconcile_on_startup: bool
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -120,4 +127,5 @@ def load_runtime_config() -> RuntimeConfig:
         model_variant=MODEL_VARIANT,
         enable_no_side=enable_no_side(),
         offline_retry_seconds=offline_retry_seconds(),
+        reconcile_on_startup=reconcile_on_startup(),
     )

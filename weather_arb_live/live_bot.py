@@ -12,6 +12,7 @@ from .forecast import flush_cache
 from .ledger import PositionLedger
 from .live_fetcher import LiveFetcher
 from .order_placer import OrderPlacer
+from .reconciliation import Reconciler
 from .strategy import Decision, evaluate_market
 
 
@@ -59,6 +60,13 @@ class LiveBot:
             dry_run=self.runtime.dry_run,
         )
         self.ledger = ledger or PositionLedger()
+        self.reconciler = Reconciler(
+            fetcher=self.fetcher,
+            order_placer=self.order_placer,
+            ledger=self.ledger,
+            logger_=self.logger,
+        )
+        self.reconciliation_ready = self.runtime.dry_run or not self.runtime.reconcile_on_startup
         self.calibration = None
         self.running = True
 
@@ -68,7 +76,7 @@ class LiveBot:
         self.calibration = load_calibration()
         self.logger.info(
             "startup model=%s variant=%s no_side=%s dry_run=%s clob_host=%s "
-            "poll_interval_seconds=%s offline_retry_seconds=%s positions=%s",
+            "poll_interval_seconds=%s offline_retry_seconds=%s reconcile_on_startup=%s positions=%s",
             self.runtime.model_name,
             self.runtime.model_variant,
             self.runtime.enable_no_side,
@@ -76,9 +84,12 @@ class LiveBot:
             self.runtime.clob_host,
             self.runtime.poll_interval_seconds,
             self.runtime.offline_retry_seconds,
+            self.runtime.reconcile_on_startup,
             len(self.ledger.positions),
         )
         self._log_artifact_status()
+        if self.runtime.reconcile_on_startup and not self.runtime.dry_run:
+            self._ensure_reconciled()
 
     def _log_artifact_status(self) -> None:
         artifacts = {
@@ -133,6 +144,9 @@ class LiveBot:
             self.shutdown()
 
     def run_one_cycle(self) -> bool:
+        if not self._ensure_reconciled():
+            return False
+
         cycle_started = datetime.now(timezone.utc)
         self.logger.info("cycle_start at=%s", cycle_started.isoformat())
         try:
@@ -187,6 +201,17 @@ class LiveBot:
                 self.logger.exception("market_error market_id=%s error=%s", market_id, exc)
         self.ledger.save()
         self.logger.info("cycle_end positions=%s", len(self.ledger.positions))
+        return True
+
+    def _ensure_reconciled(self) -> bool:
+        if self.reconciliation_ready:
+            return True
+        try:
+            self.reconciler.reconcile(market_limit=config.live_market_limit())
+        except Exception as exc:
+            self.logger.exception("startup_reconcile_error error=%s", exc)
+            return False
+        self.reconciliation_ready = True
         return True
 
     def _evaluate_side(
