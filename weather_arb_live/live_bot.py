@@ -4,7 +4,6 @@ import argparse
 import logging
 import signal
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
 
 from . import config
@@ -13,7 +12,17 @@ from .forecast import flush_cache
 from .ledger import PositionLedger
 from .live_fetcher import LiveFetcher
 from .order_placer import OrderPlacer
-from .strategy import evaluate_market
+from .strategy import Decision, evaluate_market
+
+
+YES_TO_NO_FALLBACK_REASONS = frozenset(
+    {
+        "below_min_entry_price",
+        "below_min_forecast_probability",
+        "below_min_edge",
+        "calibration_rejected",
+    }
+)
 
 
 def setup_logging() -> logging.Logger:
@@ -58,7 +67,11 @@ class LiveBot:
         self.ledger.load()
         self.calibration = load_calibration()
         self.logger.info(
-            "startup dry_run=%s clob_host=%s poll_interval_seconds=%s positions=%s",
+            "startup model=%s variant=%s no_side=%s dry_run=%s clob_host=%s "
+            "poll_interval_seconds=%s positions=%s",
+            self.runtime.model_name,
+            self.runtime.model_variant,
+            self.runtime.enable_no_side,
             self.runtime.dry_run,
             self.runtime.clob_host,
             self.runtime.poll_interval_seconds,
@@ -121,88 +134,141 @@ class LiveBot:
         for market in markets:
             market_id = str(market.get("id") or market.get("conditionId") or "")
             try:
-                preflight = evaluate_market(
-                    market,
-                    None,
-                    as_of=cycle_started,
+                yes_decision = self._evaluate_side(
+                    market=market,
+                    side="YES",
+                    cycle_started=cycle_started,
                     entered_positions=entered_positions,
-                    calibration=self.calibration,
-                    max_position_usd=self.runtime.max_position_usd,
                 )
-                if preflight.reason != "missing_live_price":
-                    self.logger.info(
-                        "decision_skip market_id=%s reason=%s details=%s",
-                        market_id,
-                        preflight.reason,
-                        preflight.details,
-                    )
+                if yes_decision.action == "ENTER":
+                    self._record_entry(yes_decision, entered_positions)
                     continue
 
-                token_id = preflight.details["token_id"]
-                try:
-                    yes_midpoint = self.fetcher.fetch_yes_midpoint(token_id)
-                except Exception as exc:
-                    self.logger.exception(
-                        "price_error market_id=%s token_id=%s error=%s",
-                        market_id,
-                        token_id,
-                        exc,
-                    )
-                    continue
-                if yes_midpoint is None:
-                    self.logger.info(
-                        "decision_skip market_id=%s token_id=%s reason=missing_two_sided_book",
-                        market_id,
-                        token_id,
-                    )
+                if (
+                    not self.runtime.enable_no_side
+                    or yes_decision.reason not in YES_TO_NO_FALLBACK_REASONS
+                ):
+                    self._log_skip(market_id, yes_decision)
                     continue
 
-                decision = evaluate_market(
-                    market,
-                    yes_midpoint,
-                    as_of=cycle_started,
+                no_decision = self._evaluate_side(
+                    market=market,
+                    side="NO",
+                    cycle_started=cycle_started,
                     entered_positions=entered_positions,
-                    calibration=self.calibration,
-                    max_position_usd=self.runtime.max_position_usd,
                 )
-                if decision.action == "SKIP":
-                    self.logger.info(
-                        "decision_skip market_id=%s reason=%s details=%s",
-                        market_id,
-                        decision.reason,
-                        decision.details,
-                    )
+                if no_decision.action == "ENTER":
+                    self._record_entry(no_decision, entered_positions)
                     continue
 
-                assert decision.plan is not None
-                result = self.order_placer.place_yes_order(
-                    token_id=decision.plan.token_id,
-                    market_price=decision.plan.market_price,
-                    position_usd=decision.plan.position_usd,
-                )
-                self.ledger.record(
-                    decision.plan,
-                    dry_run=self.runtime.dry_run,
-                    order_response=result.response,
-                )
-                entered_positions[decision.plan.market_id] = asdict(decision.plan)
                 self.logger.info(
-                    "decision_enter market_id=%s token_id=%s price=%.4f entry=%.4f "
-                    "shares=%.4f position_usd=%.2f forecast_prob=%.4f edge=%.4f posted=%s",
-                    decision.plan.market_id,
-                    decision.plan.token_id,
-                    decision.plan.market_price,
-                    decision.plan.entry_price,
-                    decision.plan.shares,
-                    decision.plan.position_usd,
-                    decision.plan.forecast_prob,
-                    decision.plan.edge,
-                    result.posted,
+                    "decision_skip market_id=%s reason=no_qualified_side details=%s",
+                    market_id,
+                    {
+                        "yes_reason": yes_decision.reason,
+                        "yes_details": yes_decision.details,
+                        "no_reason": no_decision.reason,
+                        "no_details": no_decision.details,
+                    },
                 )
             except Exception as exc:
                 self.logger.exception("market_error market_id=%s error=%s", market_id, exc)
         self.ledger.save()
         self.logger.info("cycle_end positions=%s", len(self.ledger.positions))
+
+    def _evaluate_side(
+        self,
+        *,
+        market: dict,
+        side: str,
+        cycle_started: datetime,
+        entered_positions: dict,
+    ) -> Decision:
+        preflight = evaluate_market(
+            market,
+            None,
+            side=side,
+            as_of=cycle_started,
+            entered_positions=entered_positions,
+            calibration=self.calibration,
+            max_position_usd=self.runtime.max_position_usd,
+        )
+        if preflight.reason != "missing_live_price":
+            return preflight
+
+        market_id = str(market.get("id") or market.get("conditionId") or "")
+        token_id = preflight.details["token_id"]
+        try:
+            midpoint = self.fetcher.fetch_midpoint(token_id)
+        except Exception as exc:
+            self.logger.exception(
+                "price_error market_id=%s side=%s token_id=%s error=%s",
+                market_id,
+                side,
+                token_id,
+                exc,
+            )
+            return Decision.skip(
+                "price_error",
+                market_id=market_id,
+                side=side,
+                token_id=token_id,
+                error=str(exc),
+            )
+        if midpoint is None:
+            return Decision.skip(
+                "missing_two_sided_book",
+                market_id=market_id,
+                side=side,
+                token_id=token_id,
+            )
+
+        return evaluate_market(
+            market,
+            midpoint,
+            side=side,
+            as_of=cycle_started,
+            entered_positions=entered_positions,
+            calibration=self.calibration,
+            max_position_usd=self.runtime.max_position_usd,
+        )
+
+    def _record_entry(self, decision: Decision, entered_positions: dict) -> None:
+        assert decision.plan is not None
+        plan = decision.plan
+        result = self.order_placer.place_order(
+            token_id=plan.token_id,
+            market_price=plan.market_price,
+            position_usd=plan.position_usd,
+        )
+        row = self.ledger.record(
+            plan,
+            dry_run=self.runtime.dry_run,
+            order_response=result.response,
+        )
+        entered_positions[plan.market_id] = row
+        self.logger.info(
+            "decision_enter market_id=%s side=%s token_id=%s price=%.4f entry=%.4f "
+            "shares=%.4f position_usd=%.2f forecast_prob=%.4f edge=%.4f posted=%s",
+            plan.market_id,
+            plan.side,
+            plan.token_id,
+            plan.market_price,
+            plan.entry_price,
+            plan.shares,
+            plan.position_usd,
+            plan.forecast_prob,
+            plan.edge,
+            result.posted,
+        )
+
+    def _log_skip(self, market_id: str, decision: Decision) -> None:
+        self.logger.info(
+            "decision_skip market_id=%s reason=%s details=%s",
+            market_id,
+            decision.reason,
+            decision.details,
+        )
 
     def shutdown(self) -> None:
         try:

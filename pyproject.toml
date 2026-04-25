@@ -1,7 +1,7 @@
 [project]
 name = "polymarket-weather-live-bot"
 version = "0.1.0"
-description = "Standalone fixed_v1 Polymarket weather arbitrage live bot"
+description = "Standalone fixed_v1_no Combined Polymarket weather arbitrage live bot"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

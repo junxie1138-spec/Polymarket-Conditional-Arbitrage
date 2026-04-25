@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Mapping
+from typing import Callable, Literal, Mapping
 
 from . import config
 from .forecast import estimate_forecast_prob
@@ -14,6 +14,7 @@ from .market_parser import _parse_end_date, parse_market_question
 class TradePlan:
     market_id: str
     token_id: str
+    side: str
     question: str
     city: str
     target_date: str
@@ -44,18 +45,39 @@ class Decision:
 
 
 ForecastProbabilityFn = Callable[..., float | None]
+ContractSide = Literal["YES", "NO"]
 
 
-def yes_token_from_market(market: dict) -> str | None:
+def token_ids_from_market(market: dict) -> list[str]:
     token_ids = market.get("clobTokenIds")
     if isinstance(token_ids, str):
         try:
             token_ids = json.loads(token_ids)
         except Exception:
-            return None
-    if isinstance(token_ids, list) and token_ids:
-        return str(token_ids[0])
+            return []
+    if isinstance(token_ids, list):
+        return [str(token_id) for token_id in token_ids]
+    return []
+
+
+def yes_token_from_market(market: dict) -> str | None:
+    token_ids = token_ids_from_market(market)
+    if token_ids:
+        return token_ids[0]
     return None
+
+
+def no_token_from_market(market: dict) -> str | None:
+    token_ids = token_ids_from_market(market)
+    if len(token_ids) >= 2:
+        return token_ids[1]
+    return None
+
+
+def token_from_market(market: dict, side: ContractSide) -> str | None:
+    if side == "YES":
+        return yes_token_from_market(market)
+    return no_token_from_market(market)
 
 
 def market_volume_usd(market: dict) -> float:
@@ -89,12 +111,16 @@ def evaluate_market(
     market: dict,
     current_price: float | None,
     *,
+    side: ContractSide = "YES",
     as_of: datetime | None = None,
     entered_positions: Mapping[str, dict] | None = None,
     calibration=None,
     forecast_probability_fn: ForecastProbabilityFn = estimate_forecast_prob,
     max_position_usd: float | None = None,
 ) -> Decision:
+    if side not in {"YES", "NO"}:
+        raise ValueError(f"unsupported contract side: {side}")
+
     now = as_of or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -106,9 +132,10 @@ def evaluate_market(
     if entered_positions and market_id in entered_positions:
         return Decision.skip("already_entered", market_id=market_id)
 
-    token_id = yes_token_from_market(market)
+    token_id = token_from_market(market, side)
     if not token_id:
-        return Decision.skip("missing_yes_token", market_id=market_id)
+        reason = "missing_yes_token" if side == "YES" else "missing_no_token"
+        return Decision.skip(reason, market_id=market_id, side=side)
 
     question = market.get("question") or ""
     end_date_hint = _parse_end_date(market.get("endDate") or market.get("_event_endDate"))
@@ -151,22 +178,35 @@ def evaluate_market(
         )
 
     if current_price is None:
-        return Decision.skip("missing_live_price", market_id=market_id, token_id=token_id)
+        return Decision.skip("missing_live_price", market_id=market_id, token_id=token_id, side=side)
     try:
         price = float(current_price)
     except (TypeError, ValueError):
-        return Decision.skip("invalid_live_price", market_id=market_id, price=current_price)
+        return Decision.skip("invalid_live_price", market_id=market_id, price=current_price, side=side)
     if price <= 0.0 or price >= 1.0:
-        return Decision.skip("invalid_live_price", market_id=market_id, price=price)
-    if price < config.MIN_ENTRY_PRICE:
+        return Decision.skip("invalid_live_price", market_id=market_id, price=price, side=side)
+
+    entry_price = min(0.999, price * (1.0 + config.SLIPPAGE))
+    if entry_price < config.MIN_ENTRY_PRICE:
         return Decision.skip(
             "below_min_entry_price",
             market_id=market_id,
             price=price,
+            entry_price=entry_price,
             min_price=config.MIN_ENTRY_PRICE,
+            side=side,
+        )
+    if side == "NO" and entry_price > config.MAX_NO_ENTRY_PRICE:
+        return Decision.skip(
+            "above_max_no_entry_price",
+            market_id=market_id,
+            price=price,
+            entry_price=entry_price,
+            max_price=config.MAX_NO_ENTRY_PRICE,
+            side=side,
         )
 
-    forecast_prob = forecast_probability_fn(
+    yes_forecast_prob = forecast_probability_fn(
         lat=parsed["lat"],
         lon=parsed["lon"],
         tz=parsed["tz"],
@@ -181,22 +221,30 @@ def evaluate_market(
         use_empirical=config.USE_EMPIRICAL,
         city=parsed.get("city"),
     )
-    if forecast_prob is None:
+    if yes_forecast_prob is None:
         return Decision.skip("missing_forecast_probability", market_id=market_id)
 
+    forecast_prob = yes_forecast_prob if side == "YES" else 1.0 - yes_forecast_prob
     if forecast_prob < config.MIN_FORECAST_PROB:
         return Decision.skip(
             "below_min_forecast_probability",
             market_id=market_id,
             forecast_prob=forecast_prob,
             min_forecast_prob=config.MIN_FORECAST_PROB,
+            side=side,
         )
 
-    edge = forecast_prob - price
+    edge = forecast_prob - entry_price
     if edge < config.MIN_EDGE:
-        return Decision.skip("below_min_edge", market_id=market_id, edge=edge, min_edge=config.MIN_EDGE)
+        return Decision.skip(
+            "below_min_edge",
+            market_id=market_id,
+            edge=edge,
+            min_edge=config.MIN_EDGE,
+            side=side,
+        )
 
-    if calibration is not None and not calibration.passes(
+    if side == "YES" and calibration is not None and not calibration.passes(
         city=parsed.get("city") or "",
         bracket_low=parsed.get("bracket_low"),
         bracket_high=parsed.get("bracket_high"),
@@ -205,13 +253,13 @@ def evaluate_market(
     ):
         return Decision.skip("calibration_rejected", market_id=market_id)
 
-    entry_price = min(0.999, price * (1.0 + config.SLIPPAGE))
     position_usd = max_position_usd if max_position_usd is not None else config.max_position_usd()
     shares = position_usd / entry_price
     return Decision.enter(
         TradePlan(
             market_id=market_id,
             token_id=token_id,
+            side=side,
             question=question,
             city=parsed["city"],
             target_date=target_date.isoformat(),

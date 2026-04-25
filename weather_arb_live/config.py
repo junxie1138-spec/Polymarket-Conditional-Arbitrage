@@ -24,6 +24,10 @@ MIN_ENTRY_PRICE = 0.25
 MIN_MARKET_VOLUME_USD = 500.0
 MIN_FORECAST_PROB = 0.65
 USE_EMPIRICAL = True
+MODEL_NAME = "fixed_v1_no"
+MODEL_VARIANT = "Combined"
+ENABLE_NO_SIDE = True
+MAX_NO_ENTRY_PRICE = 0.75
 
 MAX_LEAD_DAYS = 7
 DEFAULT_MODEL = "gfs_seamless"
@@ -55,6 +59,10 @@ def env_int(name: str, default: int) -> int:
     if value is None or value.strip() == "":
         return default
     return int(value)
+
+
+def enable_no_side() -> bool:
+    return env_bool("ENABLE_NO_SIDE", ENABLE_NO_SIDE)
 
 
 def default_clob_host(now: datetime | None = None) -> str:
@@ -91,6 +99,9 @@ class RuntimeConfig:
     poll_interval_seconds: int
     max_position_usd: float
     clob_host: str
+    model_name: str
+    model_variant: str
+    enable_no_side: bool
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -99,4 +110,7 @@ def load_runtime_config() -> RuntimeConfig:
         poll_interval_seconds=poll_interval_seconds(),
         max_position_usd=max_position_usd(),
         clob_host=clob_host(),
+        model_name=MODEL_NAME,
+        model_variant=MODEL_VARIANT,
+        enable_no_side=enable_no_side(),
     )

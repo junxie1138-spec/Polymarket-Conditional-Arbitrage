@@ -117,8 +117,11 @@ class LiveFetcher:
             return data
         raise ValueError(f"unexpected order book response for token_id={token_id}")
 
-    def fetch_yes_midpoint(self, token_id: str) -> float | None:
+    def fetch_midpoint(self, token_id: str) -> float | None:
         return midpoint_from_book(self.fetch_order_book(token_id))
+
+    def fetch_yes_midpoint(self, token_id: str) -> float | None:
+        return self.fetch_midpoint(token_id)
 
     def fetch_snapshots(self, *, limit: int | None = None) -> list[LiveMarketSnapshot]:
         snapshots: list[LiveMarketSnapshot] = []

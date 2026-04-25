@@ -1,6 +1,8 @@
 # Polymarket Weather Live Bot
 
-Standalone live bot for the fixed_v1 Polymarket weather arbitrage strategy. It is intentionally separated from the backtesting repository and carries only the runtime strategy/model code needed to poll active weather markets, compute fixed_v1 entries, and place dry-run or live CLOB orders.
+Standalone live bot for the fixed_v1_no (Combined) Polymarket weather arbitrage strategy. It is intentionally separated from the backtesting repository and carries only the runtime strategy/model code needed to poll active weather markets, compute fixed_v1_no entries, and place dry-run or live CLOB orders.
+
+The model evaluates YES first using fixed_v1 gates. If YES does not qualify on price, probability, edge, or calibration, it evaluates the NO token with `1 - P(YES)`, mirrored fixed_v1 gates, and a `0.75` maximum NO entry price. It records one side per market.
 
 ## Safety Defaults
 
@@ -48,6 +50,7 @@ Optional:
 - `POLL_INTERVAL_MINUTES`
 - `MAX_POSITION_USD`
 - `LIVE_MARKET_LIMIT` for bounded validation runs; leave unset or `0` for production.
+- `ENABLE_NO_SIDE`; defaults to `true` for fixed_v1_no (Combined).
 
 ## Strategy Artifacts
 

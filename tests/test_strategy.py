@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from weather_arb_live.strategy import evaluate_market
 
 AS_OF = datetime(2026, 4, 24, 12, tzinfo=timezone.utc)
@@ -40,8 +42,9 @@ def test_enter_when_fixed_v1_gates_pass():
     assert decision.plan is not None
     assert decision.plan.market_id == "m1"
     assert decision.plan.token_id == "yes-token"
+    assert decision.plan.side == "YES"
     assert decision.plan.entry_price == 0.30 * 1.005
-    assert decision.plan.edge == 0.50
+    assert decision.plan.edge == pytest.approx(0.80 - (0.30 * 1.005))
     assert decision.plan.lead_days == 3
 
 
@@ -89,6 +92,65 @@ def test_skip_low_edge():
     )
 
     assert decision.reason == "below_min_edge"
+
+
+def test_edge_gate_uses_slipped_entry_price():
+    decision = evaluate_market(
+        market(),
+        0.60,
+        as_of=AS_OF,
+        forecast_probability_fn=forecast(0.722),
+    )
+
+    assert decision.reason == "below_min_edge"
+    assert decision.details["edge"] == pytest.approx(0.722 - (0.60 * 1.005))
+
+
+def test_no_side_enters_when_no_gates_pass():
+    decision = evaluate_market(
+        market(),
+        0.30,
+        side="NO",
+        as_of=AS_OF,
+        forecast_probability_fn=forecast(0.20),
+        max_position_usd=50.0,
+    )
+
+    assert decision.action == "ENTER"
+    assert decision.plan is not None
+    assert decision.plan.token_id == "no-token"
+    assert decision.plan.side == "NO"
+    assert decision.plan.forecast_prob == pytest.approx(0.80)
+    assert decision.plan.edge == pytest.approx(0.80 - (0.30 * 1.005))
+
+
+def test_no_side_rejects_overpriced_no_token():
+    decision = evaluate_market(
+        market(),
+        0.75,
+        side="NO",
+        as_of=AS_OF,
+        forecast_probability_fn=forecast(0.20),
+    )
+
+    assert decision.reason == "above_max_no_entry_price"
+
+
+def test_no_side_does_not_apply_yes_calibration():
+    class RejectingCalibration:
+        def passes(self, **_kwargs):
+            return False
+
+    decision = evaluate_market(
+        market(),
+        0.30,
+        side="NO",
+        as_of=AS_OF,
+        forecast_probability_fn=forecast(0.20),
+        calibration=RejectingCalibration(),
+    )
+
+    assert decision.action == "ENTER"
 
 
 def test_skip_low_volume():

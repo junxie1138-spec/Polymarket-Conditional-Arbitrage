@@ -9,6 +9,7 @@ def plan():
     return TradePlan(
         market_id="m1",
         token_id="yes-token",
+        side="YES",
         question="Q",
         city="New York",
         target_date="2026-04-27",

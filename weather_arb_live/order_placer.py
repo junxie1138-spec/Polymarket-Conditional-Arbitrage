@@ -85,7 +85,7 @@ class OrderPlacer:
         network.install()
         self._client = None
 
-    def place_yes_order(
+    def place_order(
         self,
         *,
         token_id: str,
@@ -117,6 +117,19 @@ class OrderPlacer:
                 logger.warning("order_retry attempt=%s sleep=%s error=%s", attempt, sleep_seconds, exc)
                 time.sleep(sleep_seconds)
         raise RuntimeError(f"order failed after retries: {last_exc}")
+
+    def place_yes_order(
+        self,
+        *,
+        token_id: str,
+        market_price: float,
+        position_usd: float | None = None,
+    ) -> OrderResult:
+        return self.place_order(
+            token_id=token_id,
+            market_price=market_price,
+            position_usd=position_usd,
+        )
 
     def _get_client(self):
         if self._client is not None:
