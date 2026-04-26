@@ -107,6 +107,19 @@ Dry-run orders are logged but not posted. They are also recorded in
 `data/live_positions.json` so the bot does not repeatedly enter the same market
 during validation.
 
+## Local Dashboard
+
+Run the dashboard in a second PowerShell window while the bot is running:
+
+```powershell
+uv run python -m weather_arb_live.dashboard --host 127.0.0.1 --port 8765
+```
+
+Then open `http://127.0.0.1:8765`. The dashboard reads local runtime state from
+`data/live_positions.json`, `logs/live_bot.log`, environment/config settings,
+and the seeded model artifacts. It reports whether live credentials are present
+without exposing credential values.
+
 ## Required Environment For Live Trading
 
 Set these only after dry-run validation passes:
