@@ -2,13 +2,14 @@
 
 Standalone live bot for the fixed_v1_no (Combined) Polymarket weather arbitrage strategy. It is intentionally separated from the backtesting repository and carries only the runtime strategy/model code needed to poll active weather markets, compute fixed_v1_no entries, and place dry-run or live CLOB orders.
 
-The model evaluates YES first using fixed_v1 gates. If YES does not qualify on price, probability, edge, or calibration, it evaluates the NO token with `1 - P(YES)`, mirrored fixed_v1 gates, and a `0.75` maximum NO entry price. It records one side per market.
+The model evaluates YES first using fixed_v1 gates. If YES does not qualify on price, probability, edge, calibration, or because the YES token does not have a two-sided live book, it evaluates the NO token with `1 - P(YES)`, mirrored fixed_v1 gates, and a `0.75` maximum NO entry price. It records one side per market.
 
 ## Safety Defaults
 
 - `DRY_RUN=true` by default. The bot logs intended orders and skips actual order posting.
 - `data/live_positions.json` is ignored by Git and prevents one re-entry per market across restarts.
 - Live mode blocks trading until startup reconciliation checks open orders and positions.
+- Live mode refreshes CLOB collateral balance/allowance before each order and fails closed if either is below the order size.
 - `logs/` is ignored by Git.
 - Live trading requires Polymarket CLOB credentials in environment variables.
 
@@ -44,9 +45,9 @@ uv run pytest -p no:cacheprovider
 
 ## Environment Variables
 
-The bot reads environment variables from the current process. PowerShell does
-not automatically load `.env`, so either set variables directly in the shell or
-load them before running the bot.
+The bot and dashboard automatically load simple `KEY=value` settings from the
+repo-root `.env` file. Variables already set in the shell take precedence over
+`.env`, which is useful for one-off validation overrides.
 
 Start by creating a local env file from the example:
 
@@ -62,7 +63,7 @@ $env:DRY_RUN="true"
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
 $env:RECONCILE_ON_STARTUP="true"
-$env:MAX_POSITION_USD="50"
+$env:MAX_POSITION_USD="2.50"
 $env:ENABLE_NO_SIDE="true"
 ```
 
@@ -75,15 +76,10 @@ $env:LIVE_MARKET_LIMIT="10"
 Use `LIVE_MARKET_LIMIT=10` for bounded validation. Use `0` or leave it unset
 for the full live weather market scan.
 
-To load simple `KEY=value` lines from `.env` into the current PowerShell
-session:
-
-```powershell
-Get-Content .env | Where-Object { $_ -and -not $_.StartsWith("#") } | ForEach-Object {
-    $name, $value = $_ -split "=", 2
-    Set-Item -Path "Env:$name" -Value $value
-}
-```
+The effective cap is logged at startup as `max_position_usd=...` and shown in
+the dashboard runtime panel. Existing rows in `data/live_positions.json` keep
+the position size they were recorded with; old dry-run rows are not
+retroactively resized when you lower `MAX_POSITION_USD`.
 
 ## Dry-Run Commands
 
@@ -120,6 +116,11 @@ Then open `http://127.0.0.1:8765`. The dashboard reads local runtime state from
 and the seeded model artifacts. It reports whether live credentials are present
 without exposing credential values.
 
+The bot saves `data/live_positions.json` after every dry-run or live entry, so
+the dashboard should show test entries during a long scan instead of waiting
+for `cycle_end`. If you run the bot and dashboard in separate shells, keep
+`WEATHER_ARB_DATA_DIR` and `WEATHER_ARB_LOG_DIR` identical in both shells.
+
 ## Required Environment For Live Trading
 
 Set these only after dry-run validation passes:
@@ -148,7 +149,7 @@ $env:POLYMARKET_FUNDER_ADDRESS="..."
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
 $env:RECONCILE_ON_STARTUP="true"
-$env:MAX_POSITION_USD="50"
+$env:MAX_POSITION_USD="2.50"
 $env:LIVE_MARKET_LIMIT="0"
 $env:ENABLE_NO_SIDE="true"
 ```
@@ -178,6 +179,11 @@ exchange exposure in an active weather market gets a local guard row in
 `data/live_positions.json`, so a cloud restart or lost local file does not
 blindly re-enter that market. If reconciliation cannot complete, continuous
 mode keeps retrying after `OFFLINE_RETRY_SECONDS` and does not trade.
+
+Before each live order, the bot refreshes CLOB collateral balance/allowance and
+blocks the order locally if either value is below `MAX_POSITION_USD` for that
+entry. A balance preflight failure does not create an `unknown` ledger row,
+because no order has been submitted yet.
 
 If your internet drops while the bot is running continuously, the bot logs the
 failed fetch, leaves existing positions untouched, and retries after
@@ -219,4 +225,4 @@ Large backtest/raw/runtime files are intentionally ignored.
 
 ## Current CLOB SDK
 
-This implementation uses Polymarket CLOB v2 SDK conventions. Polymarket's docs state V2 is testable at `https://clob-v2.polymarket.com` before the April 28, 2026 cutover, and production moves to `https://clob.polymarket.com` after that. The bot chooses the default host dynamically unless `POLYMARKET_CLOB_HOST` is set.
+This implementation uses Polymarket CLOB v2 SDK conventions. The live bot defaults to `https://clob.polymarket.com` because Gamma active markets are production markets and the v2 test host can have sparse or empty books. Set `POLYMARKET_CLOB_HOST=https://clob-v2.polymarket.com` only when you intentionally want to validate against the test host.

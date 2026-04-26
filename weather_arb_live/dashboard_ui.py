@@ -1015,6 +1015,7 @@ DASHBOARD_HTML = """<!doctype html>
 
     function statusFor(row) {
       if (row.manual_review) return { kind: "status-review", label: "Review" };
+      if (row.over_max_position) return { kind: "status-review", label: "Over max" };
       if (row.posted === "unknown") return { kind: "status-unknown", label: "Unknown" };
       if (row.dry_run) return { kind: "status-dry", label: "Dry run" };
       return { kind: "status-live", label: "Posted" };
@@ -1054,13 +1055,13 @@ DASHBOARD_HTML = """<!doctype html>
       setText("exposureMetric", formatMoney(positions.total_position_usd));
       setText("exposureSub", `${positions.yes_count} YES / ${positions.no_count} NO`);
       setText("reviewMetric", positions.manual_review);
-      setText("reviewSub", `${positions.unknown_posted} unknown order state${positions.unknown_posted === 1 ? "" : "s"}`);
+      setText("reviewSub", `${positions.unknown_posted} unknown / ${positions.over_max_position_count || 0} over max`);
       setText("activityMetric", health.activity_label);
       setText("activitySub", health.last_log_age_seconds === null ? health.detail : ageText(health.last_log_age_seconds));
       setText("credentialsMetric", liveReady ? "Ready" : "Missing");
       setText("credentialsSub", runtime.dry_run ? "Not required in dry run" : `${data.environment.missing_required.length} missing`);
 
-      updateMetricClass("reviewMetric", positions.manual_review > 0 ? "is-bad" : "");
+      updateMetricClass("reviewMetric", positions.manual_review > 0 || positions.over_max_position_count > 0 ? "is-bad" : "");
       updateMetricClass("activityMetric", health.activity === "stale" ? "is-warn" : "");
       updateMetricClass("credentialsMetric", liveReady ? "is-good" : "is-bad");
     }
@@ -1374,6 +1375,7 @@ DASHBOARD_HTML = """<!doctype html>
       const status = statusFor(row);
       pills.append(pill(status.label, status.kind));
       if (row.manual_review) pills.append(pill("Manual review", "status-review"));
+      if (row.over_max_position) pills.append(pill("Over current max", "status-review"));
 
       const stats = $("drawerStats");
       clearNode(stats);

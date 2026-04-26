@@ -30,6 +30,15 @@ REQUIRED_LIVE_CREDENTIALS = (
 )
 
 OPTIONAL_RUNTIME_ENV = (
+    "DRY_RUN",
+    "POLL_INTERVAL_MINUTES",
+    "OFFLINE_RETRY_SECONDS",
+    "RECONCILE_ON_STARTUP",
+    "MAX_POSITION_USD",
+    "ENABLE_NO_SIDE",
+    "LIVE_MARKET_LIMIT",
+    "WEATHER_ARB_DATA_DIR",
+    "WEATHER_ARB_LOG_DIR",
     "POLYMARKET_RECONCILE_USER_ADDRESS",
     "POLYMARKET_FUNDER_ADDRESS",
     "POLYMARKET_PROXY_ADDRESS",
@@ -157,13 +166,14 @@ def parse_log_lines(lines: list[str]) -> dict[str, Any]:
     }
 
 
-def summarize_positions(positions: dict[str, Any]) -> dict[str, Any]:
+def summarize_positions(positions: dict[str, Any], *, max_position_usd: float | None = None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     side_counts: Counter[str] = Counter()
     dry_run_count = 0
     live_count = 0
     unknown_posted = 0
     manual_review = 0
+    over_max_position_count = 0
     total_position_usd = 0.0
 
     for key, value in positions.items():
@@ -189,6 +199,12 @@ def summarize_positions(positions: dict[str, Any]) -> dict[str, Any]:
         position_usd = _safe_float(value.get("position_usd"))
         if position_usd is not None:
             total_position_usd += position_usd
+        over_max_position = (
+            max_position_usd is not None
+            and position_usd is not None
+            and position_usd > max_position_usd + 1e-9
+        )
+        over_max_position_count += int(over_max_position)
 
         rows.append(
             {
@@ -209,6 +225,7 @@ def summarize_positions(positions: dict[str, Any]) -> dict[str, Any]:
                 "dry_run": dry_run,
                 "posted": posted,
                 "manual_review": requires_review,
+                "over_max_position": over_max_position,
                 "reconciliation_status": reconciliation.get("status"),
             }
         )
@@ -226,6 +243,7 @@ def summarize_positions(positions: dict[str, Any]) -> dict[str, Any]:
         "no_count": side_counts.get("NO", 0),
         "unknown_posted": unknown_posted,
         "manual_review": manual_review,
+        "over_max_position_count": over_max_position_count,
         "total_position_usd": round(total_position_usd, 2),
         "recent": rows,
     }
@@ -341,7 +359,10 @@ def build_dashboard_state(*, log_limit: int = 160) -> dict[str, Any]:
 
     log_lines, logs_error = tail_lines(LOG_PATH, log_limit)
     parsed_logs = parse_log_lines(log_lines)
-    position_summary = summarize_positions(positions)
+    position_summary = summarize_positions(
+        positions,
+        max_position_usd=_safe_float(runtime.get("max_position_usd")),
+    )
     recent_positions = position_summary.pop("recent")
 
     return {
