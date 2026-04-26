@@ -2,6 +2,7 @@ import requests
 
 from weather_arb_live import network
 from weather_arb_live.live_fetcher import LiveFetcher, midpoint_from_book
+from weather_arb_live.ws_stream import BestBidAskCache
 
 
 def test_midpoint_from_two_sided_book():
@@ -64,3 +65,20 @@ def test_fetch_midpoint_retries_transient_connection(monkeypatch):
 
     assert fetcher.fetch_midpoint("token") == 0.42
     assert len(calls) == 2
+
+
+def test_fetch_midpoint_prefers_fresh_websocket_cache():
+    class Session:
+        def get(self, *_args, **_kwargs):
+            raise AssertionError("fresh websocket quote should avoid REST book fetch")
+
+    cache = BestBidAskCache()
+    cache.update_quote("token", best_bid="0.40", best_ask="0.44", source="best_bid_ask")
+    fetcher = LiveFetcher(
+        session=Session(),
+        clob_host="https://example.invalid",
+        price_cache=cache,
+        ws_stale_seconds=30,
+    )
+
+    assert fetcher.fetch_midpoint("token") == 0.42

@@ -1229,6 +1229,10 @@ DASHBOARD_HTML = """<!doctype html>
       appendKv(el, "Live limit", runtime.live_market_limit === null ? "Full scan" : runtime.live_market_limit, { mono: true });
       appendKv(el, "NO side", pill(runtime.enable_no_side ? "Enabled" : "Disabled", runtime.enable_no_side ? "status-live" : "status-dry"));
       appendKv(el, "Reconcile", pill(runtime.reconcile_on_startup ? "On startup" : "Off", runtime.reconcile_on_startup ? "status-live" : "status-dry"));
+      appendKv(el, "Market WS", pill(runtime.market_ws_enabled ? "Enabled" : "Disabled", runtime.market_ws_enabled ? "status-live" : "status-dry"));
+      appendKv(el, "User WS", pill(runtime.user_ws_enabled ? "Enabled" : "Disabled", runtime.user_ws_enabled ? "status-live" : "status-dry"));
+      appendKv(el, "Quote stale", `${runtime.ws_market_stale_seconds}s`, { mono: true });
+      appendKv(el, "Safety check", `${runtime.safety_reconcile_interval_seconds}s`, { mono: true });
       appendKv(el, "Data dir", shortPath(runtime.data_dir), { mono: true, small: true });
       appendKv(el, "Log dir", shortPath(runtime.log_dir), { mono: true, small: true });
     }

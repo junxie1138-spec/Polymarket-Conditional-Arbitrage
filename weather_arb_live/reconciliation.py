@@ -243,10 +243,20 @@ class Reconciler:
         self.session = session or network.get_session()
         self.logger = logger_ or logger
 
-    def reconcile(self, *, market_limit: int | None = None) -> ReconciliationResult:
+    def reconcile(
+        self,
+        *,
+        market_limit: int | None = None,
+        active_markets: list[dict] | None = None,
+        reason: str = "startup",
+    ) -> ReconciliationResult:
         user_address, address_source = self._resolve_user_address()
-        active_markets = self.fetcher.fetch_active_markets(limit=market_limit)
-        by_token, by_condition = _token_market_indexes(active_markets)
+        markets = (
+            active_markets
+            if active_markets is not None
+            else self.fetcher.fetch_active_markets(limit=market_limit)
+        )
+        by_token, by_condition = _token_market_indexes(markets)
 
         open_orders = self.order_placer.fetch_open_orders()
         positions = self._fetch_user_positions(user_address)
@@ -292,18 +302,19 @@ class Reconciler:
 
         self.ledger.save()
         self.logger.info(
-            "startup_reconcile_complete user_address=%s source=%s active_markets=%s "
+            "reconcile_complete reason=%s user_address=%s source=%s active_markets=%s "
             "exchange_exposures=%s matched_local=%s missing_local=%s added_guards=%s",
+            reason,
             user_address,
             address_source,
-            len(active_markets),
+            len(markets),
             len(exposures),
             matched_local,
             missing_local,
             added_guards,
         )
         return ReconciliationResult(
-            active_markets=len(active_markets),
+            active_markets=len(markets),
             exchange_exposures=len(exposures),
             matched_local=matched_local,
             missing_local=missing_local,
