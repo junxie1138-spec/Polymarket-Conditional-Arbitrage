@@ -56,6 +56,7 @@ POLYMARKET_API_ENV_VARS = (
     "POLYMARKET_API_PASSPHRASE",
 )
 VALID_SIGNATURE_TYPES = {0, 1, 2}
+LIVE_ORDER_TYPE = "FOK"
 
 
 def build_order_intent(
@@ -70,7 +71,7 @@ def build_order_intent(
     return OrderIntent(
         token_id=token_id,
         side="BUY",
-        order_type="GTC",
+        order_type=LIVE_ORDER_TYPE,
         market_price=float(market_price),
         limit_price=limit_price,
         shares=max_usd / limit_price,
@@ -429,6 +430,10 @@ class OrderPlacer:
     def _post_order(client, intent: OrderIntent):
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 
+        order_type = getattr(OrderType, intent.order_type, None)
+        if order_type is None:
+            raise ValueError(f"unsupported Polymarket order type: {intent.order_type!r}")
+
         return client.create_and_post_order(
             order_args=OrderArgs(
                 token_id=intent.token_id,
@@ -437,5 +442,5 @@ class OrderPlacer:
                 size=intent.shares,
             ),
             options=PartialCreateOrderOptions(tick_size=os.getenv("POLYMARKET_TICK_SIZE", "0.01")),
-            order_type=OrderType.GTC,
+            order_type=order_type,
         )

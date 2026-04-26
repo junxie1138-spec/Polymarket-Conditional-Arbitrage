@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import requests
+import pytest
 
 from weather_arb_live.event_log import LiveEventLog
 from weather_arb_live.ledger import PositionLedger
@@ -39,7 +40,27 @@ def _jsonl(path: Path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_run_one_cycle_records_dry_run_position(monkeypatch):
+@pytest.fixture
+def isolated_event_log(request):
+    name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in request.node.name)
+    base_path = Path("data/test_event_logs") / name
+    paths = {
+        "event_path": base_path / "live_events.jsonl",
+        "market_snapshot_path": base_path / "market_snapshots.jsonl",
+        "forecast_snapshot_path": base_path / "forecast_snapshots.jsonl",
+    }
+    for path in paths.values():
+        path.unlink(missing_ok=True)
+    yield LiveEventLog(**paths)
+    for path in paths.values():
+        path.unlink(missing_ok=True)
+    try:
+        base_path.rmdir()
+    except FileNotFoundError:
+        pass
+
+
+def test_run_one_cycle_records_dry_run_position(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_positions.json")
     if path.exists():
@@ -77,6 +98,7 @@ def test_run_one_cycle_records_dry_run_position(monkeypatch):
         order_placer=FakeOrderPlacer(),
         ledger=PositionLedger(path).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
     bot.calibration = None
 
@@ -91,7 +113,7 @@ def test_run_one_cycle_records_dry_run_position(monkeypatch):
             path.unlink()
 
 
-def test_record_entry_saves_position_immediately(monkeypatch):
+def test_record_entry_saves_position_immediately(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_immediate_positions.json")
     if path.exists():
@@ -122,6 +144,7 @@ def test_record_entry_saves_position_immediately(monkeypatch):
         order_placer=FakeOrderPlacer(),
         ledger=PositionLedger(path).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
 
     try:
@@ -226,7 +249,7 @@ class FakeNoSideOrderPlacer:
         return OrderResult(intent=intent, posted=False, response={"dry_run": True})
 
 
-def test_run_one_cycle_falls_back_to_no_side(monkeypatch):
+def test_run_one_cycle_falls_back_to_no_side(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_no_positions.json")
     if path.exists():
@@ -268,6 +291,7 @@ def test_run_one_cycle_falls_back_to_no_side(monkeypatch):
         order_placer=FakeNoSideOrderPlacer(),
         ledger=PositionLedger(path).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
     bot.calibration = None
 
@@ -294,7 +318,7 @@ class FakeMissingYesBookFetcher:
         return {"yes-token": None, "no-token": 0.30}[token_id]
 
 
-def test_run_one_cycle_falls_back_to_no_side_when_yes_book_missing(monkeypatch):
+def test_run_one_cycle_falls_back_to_no_side_when_yes_book_missing(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_missing_yes_book_positions.json")
     if path.exists():
@@ -337,6 +361,7 @@ def test_run_one_cycle_falls_back_to_no_side_when_yes_book_missing(monkeypatch):
         order_placer=FakeNoSideOrderPlacer(),
         ledger=PositionLedger(path).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
     bot.calibration = None
 
@@ -356,7 +381,7 @@ class OfflineFetcher:
         raise ConnectionError("offline")
 
 
-def test_run_one_cycle_reports_fetch_outage_without_crashing():
+def test_run_one_cycle_reports_fetch_outage_without_crashing(isolated_event_log):
     logger = logging.getLogger("test_live_bot_offline")
     logger.handlers.clear()
     logger.addHandler(logging.NullHandler())
@@ -365,6 +390,7 @@ def test_run_one_cycle_reports_fetch_outage_without_crashing():
         order_placer=FakeOrderPlacer(),
         ledger=PositionLedger(Path("data/test_offline_positions.json")).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
 
     assert bot.run_one_cycle() is False
@@ -380,7 +406,7 @@ class BalancePreflightFailingOrderPlacer:
         raise BalancePreflightError("balance preflight failed")
 
 
-def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
+def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
     monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
@@ -418,6 +444,7 @@ def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
         order_placer=InterruptedOrderPlacer(),
         ledger=PositionLedger(path).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
     bot.calibration = None
 
@@ -432,7 +459,7 @@ def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
             path.unlink()
 
 
-def test_live_balance_preflight_failure_does_not_record_unknown_guard(monkeypatch):
+def test_live_balance_preflight_failure_does_not_record_unknown_guard(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
     monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
@@ -470,6 +497,7 @@ def test_live_balance_preflight_failure_does_not_record_unknown_guard(monkeypatc
         order_placer=BalancePreflightFailingOrderPlacer(),
         ledger=PositionLedger(path).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
     bot.calibration = None
 
@@ -491,7 +519,7 @@ class FailingReconciler:
         raise requests.ConnectionError("data api offline")
 
 
-def test_live_mode_blocks_cycle_until_startup_reconcile_succeeds(monkeypatch):
+def test_live_mode_blocks_cycle_until_startup_reconcile_succeeds(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "true")
     logger = logging.getLogger("test_live_bot_reconcile_blocks")
@@ -502,6 +530,7 @@ def test_live_mode_blocks_cycle_until_startup_reconcile_succeeds(monkeypatch):
         order_placer=FakeOrderPlacer(),
         ledger=PositionLedger(Path("data/test_reconcile_block_positions.json")).load(),
         logger=logger,
+        event_log=isolated_event_log,
     )
     bot.reconciler = FailingReconciler()
 
@@ -532,7 +561,7 @@ class RecordingUserStream:
         self.condition_ids = unique_market_condition_ids(markets)
 
 
-def test_sync_stream_subscriptions_uses_token_and_condition_ids(monkeypatch):
+def test_sync_stream_subscriptions_uses_token_and_condition_ids(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
     monkeypatch.setenv("POLYMARKET_WS_MARKET_WARMUP_SECONDS", "0")
@@ -548,6 +577,7 @@ def test_sync_stream_subscriptions_uses_token_and_condition_ids(monkeypatch):
         logger=logger,
         market_stream=market_stream,
         user_stream=user_stream,
+        event_log=isolated_event_log,
     )
     markets = [
         {
@@ -572,7 +602,7 @@ class RecordingReconciler:
         self.calls.append(kwargs)
 
 
-def test_periodic_safety_reconciliation_reuses_cycle_markets(monkeypatch):
+def test_periodic_safety_reconciliation_reuses_cycle_markets(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
     monkeypatch.setenv("SAFETY_RECONCILE_INTERVAL_MINUTES", "60")
@@ -586,6 +616,7 @@ def test_periodic_safety_reconciliation_reuses_cycle_markets(monkeypatch):
         logger=logger,
         market_stream=None,
         user_stream=None,
+        event_log=isolated_event_log,
     )
     reconciler = RecordingReconciler()
     bot.reconciler = reconciler

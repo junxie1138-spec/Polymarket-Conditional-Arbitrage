@@ -27,8 +27,23 @@ def test_order_intent_uses_slippage_and_position_cap():
     assert intent.limit_price == 0.40 * 1.005
     assert intent.position_usd == 1.0
     assert intent.shares == intent.position_usd / intent.limit_price
-    assert intent.order_type == "GTC"
+    assert intent.order_type == "FOK"
     assert intent.side == "BUY"
+
+
+def test_post_order_uses_non_resting_fok_order_type():
+    intent = build_order_intent(token_id="yes-token", market_price=0.40, position_usd=1.0, dry_run=False)
+    captured = {}
+
+    class FakeClient:
+        def create_and_post_order(self, **kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+    response = OrderPlacer._post_order(FakeClient(), intent)
+
+    assert response == {"success": True}
+    assert captured["order_type"] == "FOK"
 
 
 def test_dry_run_order_does_not_require_credentials():
