@@ -9,6 +9,7 @@ The model evaluates YES first using fixed_v1 gates. If YES does not qualify on p
 - `DRY_RUN=true` by default. The bot logs intended orders and skips actual order posting.
 - `data/live_positions.json` is ignored by Git and prevents one re-entry per market across restarts.
 - Live mode blocks trading until startup reconciliation checks open orders and positions.
+- Live mode refreshes CLOB collateral balance/allowance before each order and fails closed if either is below the order size.
 - `logs/` is ignored by Git.
 - Live trading requires Polymarket CLOB credentials in environment variables.
 
@@ -178,6 +179,11 @@ exchange exposure in an active weather market gets a local guard row in
 `data/live_positions.json`, so a cloud restart or lost local file does not
 blindly re-enter that market. If reconciliation cannot complete, continuous
 mode keeps retrying after `OFFLINE_RETRY_SECONDS` and does not trade.
+
+Before each live order, the bot refreshes CLOB collateral balance/allowance and
+blocks the order locally if either value is below `MAX_POSITION_USD` for that
+entry. A balance preflight failure does not create an `unknown` ledger row,
+because no order has been submitted yet.
 
 If your internet drops while the bot is running continuously, the bot logs the
 failed fetch, leaves existing positions untouched, and retries after

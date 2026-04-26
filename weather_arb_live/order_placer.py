@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from . import config, network
@@ -12,6 +13,18 @@ logger = logging.getLogger(__name__)
 
 
 class MissingCredentialsError(RuntimeError):
+    pass
+
+
+class BalancePreflightError(RuntimeError):
+    pass
+
+
+class InsufficientBalanceError(BalancePreflightError):
+    pass
+
+
+class OrderPostRejectedError(RuntimeError):
     pass
 
 
@@ -66,6 +79,47 @@ def _is_retryable(exc: Exception) -> bool:
     return network.is_retryable_status(network.response_status(exc))
 
 
+def _parse_decimal_amount(value: Any, field: str) -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise BalancePreflightError(f"balance preflight response missing numeric {field}")
+    try:
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise BalancePreflightError(f"balance preflight response has invalid {field}: {value!r}") from exc
+    if not amount.is_finite():
+        raise BalancePreflightError(f"balance preflight response has non-finite {field}: {value!r}")
+    return amount
+
+
+def _parse_balance_allowance(response: Any) -> tuple[Decimal, Decimal | None]:
+    if not isinstance(response, dict):
+        raise BalancePreflightError(
+            f"balance preflight response must be an object, got {type(response).__name__}"
+        )
+
+    balance = _parse_decimal_amount(response.get("balance"), "balance")
+    allowance: Decimal | None = None
+    if response.get("allowance") not in (None, ""):
+        allowance = _parse_decimal_amount(response.get("allowance"), "allowance")
+    elif isinstance(response.get("allowances"), dict) and response["allowances"]:
+        allowance_values = [
+            _parse_decimal_amount(value, f"allowances[{key}]")
+            for key, value in response["allowances"].items()
+            if value not in (None, "")
+        ]
+        if allowance_values:
+            allowance = min(allowance_values)
+    return balance, allowance
+
+
+def _raise_for_rejected_order_response(response: dict[str, Any]) -> None:
+    error = response.get("error") or response.get("errorMsg") or response.get("error_msg")
+    if error:
+        raise OrderPostRejectedError(f"order rejected by CLOB: {error}")
+    if response.get("success") is False:
+        raise OrderPostRejectedError(f"order rejected by CLOB: {response}")
+
+
 class OrderPlacer:
     def __init__(self, *, clob_host: str | None = None, dry_run: bool | None = None):
         self.clob_host = (clob_host or config.clob_host()).rstrip("/")
@@ -91,11 +145,13 @@ class OrderPlacer:
             return OrderResult(intent=intent, posted=False, response={"dry_run": True})
 
         client = self._get_client()
+        self._ensure_sufficient_collateral(client, intent)
         last_exc: Exception | None = None
         for attempt in range(1, 4):
             try:
                 response = self._post_order(client, intent)
                 response_dict = response if isinstance(response, dict) else {"response": response}
+                _raise_for_rejected_order_response(response_dict)
                 return OrderResult(intent=intent, posted=True, response=response_dict)
             except Exception as exc:
                 last_exc = exc
@@ -176,6 +232,36 @@ class OrderPlacer:
                 )
                 time.sleep(sleep_seconds)
         raise RuntimeError(f"open orders fetch failed after retries: {last_exc}")
+
+    @staticmethod
+    def _ensure_sufficient_collateral(client, intent: OrderIntent) -> None:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        try:
+            client.update_balance_allowance(params)
+            response = client.get_balance_allowance(params)
+        except BalancePreflightError:
+            raise
+        except Exception as exc:
+            raise BalancePreflightError(f"balance preflight failed before order submit: {exc}") from exc
+
+        balance, allowance = _parse_balance_allowance(response)
+        required = Decimal(str(intent.position_usd))
+        if balance < required:
+            raise InsufficientBalanceError(
+                f"insufficient Polymarket collateral balance: required={required} available={balance}"
+            )
+        if allowance is not None and allowance < required:
+            raise InsufficientBalanceError(
+                f"insufficient Polymarket collateral allowance: required={required} available={allowance}"
+            )
+        logger.info(
+            "balance_preflight_ok required_usd=%s collateral_balance=%s collateral_allowance=%s",
+            required,
+            balance,
+            allowance,
+        )
 
     @staticmethod
     def _post_order(client, intent: OrderIntent):

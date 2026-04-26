@@ -7,7 +7,7 @@ import requests
 
 from weather_arb_live.ledger import PositionLedger
 from weather_arb_live.live_bot import LiveBot
-from weather_arb_live.order_placer import OrderResult, build_order_intent
+from weather_arb_live.order_placer import BalancePreflightError, OrderResult, build_order_intent
 from weather_arb_live.strategy import TradePlan, Decision
 
 
@@ -290,6 +290,11 @@ class InterruptedOrderPlacer:
         raise requests.ConnectionError("response lost")
 
 
+class BalancePreflightFailingOrderPlacer:
+    def place_order(self, **_kwargs):
+        raise BalancePreflightError("balance preflight failed")
+
+
 def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
@@ -337,6 +342,55 @@ def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch):
         assert row["dry_run"] is False
         assert row["order_response"]["posted"] == "unknown"
         assert row["order_response"]["reason"] == "order_submission_interrupted"
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def test_live_balance_preflight_failure_does_not_record_unknown_guard(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
+    monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
+    path = Path("data/test_balance_preflight_positions.json")
+    if path.exists():
+        path.unlink()
+    plan = TradePlan(
+        market_id="m4",
+        token_id="yes-token",
+        side="YES",
+        question="Q",
+        city="New York",
+        target_date="2026-04-27",
+        market_price=0.30,
+        entry_price=0.3015,
+        shares=165.837,
+        position_usd=50.0,
+        forecast_prob=0.80,
+        edge=0.4985,
+        lead_days=3,
+        entry_time=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+    def fake_evaluate(_market, current_price, **_kwargs):
+        if current_price is None:
+            return Decision.skip("missing_live_price", market_id="m4", token_id="yes-token")
+        return Decision.enter(plan)
+
+    monkeypatch.setattr("weather_arb_live.live_bot.evaluate_market", fake_evaluate)
+    logger = logging.getLogger("test_live_bot_balance_preflight")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=BalancePreflightFailingOrderPlacer(),
+        ledger=PositionLedger(path).load(),
+        logger=logger,
+    )
+    bot.calibration = None
+
+    try:
+        assert bot.run_one_cycle() is True
+        assert "m4" not in bot.ledger.positions
     finally:
         if path.exists():
             path.unlink()
