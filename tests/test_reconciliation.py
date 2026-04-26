@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from weather_arb_live.event_log import LiveEventLog
 from weather_arb_live.ledger import PositionLedger
 from weather_arb_live.reconciliation import Reconciler
 
@@ -52,6 +53,10 @@ def _cleanup(ledger: PositionLedger) -> None:
         ledger.path.unlink()
 
 
+def _jsonl(path: Path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def test_reconcile_adds_guard_for_exchange_position():
     ledger = _ledger("test_reconcile_position.json")
     reconciler = StaticPositionsReconciler(
@@ -88,6 +93,53 @@ def test_reconcile_adds_guard_for_exchange_position():
         assert row["order_response"]["exchange"]["cashPnl"] == 1.5
     finally:
         _cleanup(ledger)
+
+
+def test_reconcile_appends_exchange_position_fill_event():
+    ledger = _ledger("test_reconcile_position_event.json")
+    event_path = Path("data/test_reconcile_position_events.jsonl")
+    market_path = Path("data/test_reconcile_position_market.jsonl")
+    forecast_path = Path("data/test_reconcile_position_forecast.jsonl")
+    for path in (event_path, market_path, forecast_path):
+        path.unlink(missing_ok=True)
+    event_log = LiveEventLog(
+        event_path=event_path,
+        market_snapshot_path=market_path,
+        forecast_snapshot_path=forecast_path,
+    )
+    reconciler = StaticPositionsReconciler(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=ledger,
+        event_log=event_log,
+        positions=[
+            {
+                "asset": "yes-token",
+                "conditionId": "0xabc",
+                "size": 10,
+                "avgPrice": 0.4,
+                "curPrice": 0.55,
+                "cashPnl": 1.5,
+                "outcome": "Yes",
+                "title": "Weather",
+            }
+        ],
+    )
+
+    try:
+        reconciler.reconcile()
+
+        rows = _jsonl(event_path)
+        assert rows[0]["event_type"] == "order_filled"
+        assert rows[0]["market_id"] == "gamma-1"
+        assert rows[0]["city"] == "New York"
+        assert rows[0]["filled_price"] == 0.4
+        assert rows[0]["fill_quantity"] == 10
+        assert rows[0]["mark_to_market_pnl"] == 1.5
+    finally:
+        _cleanup(ledger)
+        for path in (event_path, market_path, forecast_path):
+            path.unlink(missing_ok=True)
 
 
 def test_reconcile_matches_existing_unknown_order_guard():
@@ -141,6 +193,49 @@ def test_reconcile_marks_local_live_row_missing_for_manual_review():
         assert ledger.positions["gamma-1"]["reconciliation"]["requires_manual_review"] is True
     finally:
         _cleanup(ledger)
+
+
+def test_reconcile_appends_position_closed_event_for_missing_exchange_match():
+    ledger = _ledger("test_reconcile_missing_event.json")
+    ledger.positions["gamma-1"] = {
+        "market_id": "gamma-1",
+        "condition_id": "0xabc",
+        "token_id": "yes-token",
+        "side": "YES",
+        "city": "New York",
+        "target_date": "2026-04-27",
+        "dry_run": False,
+        "order_response": {"posted": "unknown"},
+    }
+    event_path = Path("data/test_reconcile_missing_events.jsonl")
+    market_path = Path("data/test_reconcile_missing_market.jsonl")
+    forecast_path = Path("data/test_reconcile_missing_forecast.jsonl")
+    for path in (event_path, market_path, forecast_path):
+        path.unlink(missing_ok=True)
+    event_log = LiveEventLog(
+        event_path=event_path,
+        market_snapshot_path=market_path,
+        forecast_snapshot_path=forecast_path,
+    )
+    reconciler = StaticPositionsReconciler(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=ledger,
+        event_log=event_log,
+        positions=[],
+    )
+
+    try:
+        reconciler.reconcile()
+
+        rows = _jsonl(event_path)
+        assert rows[0]["event_type"] == "position_closed"
+        assert rows[0]["requires_manual_review"] is True
+        assert rows[0]["market_id"] == "gamma-1"
+    finally:
+        _cleanup(ledger)
+        for path in (event_path, market_path, forecast_path):
+            path.unlink(missing_ok=True)
 
 
 def test_reconcile_adds_guard_for_open_order():

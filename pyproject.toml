@@ -10,6 +10,9 @@ dependencies = [
   "scipy>=1.11.0",
 ]
 
+[project.scripts]
+weather-daily-report = "weather_arb_live.daily_report:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",

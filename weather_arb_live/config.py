@@ -51,6 +51,9 @@ RESIDUALS_CACHE_PATH = DATA_DIR / "empirical_residuals.json"
 CALIBRATION_PATH = DATA_DIR / "calibration_table.json"
 POSITIONS_PATH = DATA_DIR / "live_positions.json"
 PNL_HISTORY_PATH = DATA_DIR / "pnl_history.json"
+EVENT_LOG_PATH = DATA_DIR / "live_events.jsonl"
+MARKET_SNAPSHOT_PATH = DATA_DIR / "market_snapshots.jsonl"
+FORECAST_SNAPSHOT_PATH = DATA_DIR / "forecast_snapshots.jsonl"
 
 DATA_API_BASE_URL = "https://data-api.polymarket.com"
 MIN_EDGE = 0.12
@@ -90,6 +93,7 @@ WS_MARKET_WARMUP_SECONDS = 1.5
 SAFETY_RECONCILE_INTERVAL_MINUTES = 60
 SAFETY_RECONCILE_MIN_INTERVAL_SECONDS = 300.0
 WALLET_BALANCE_TTL_SECONDS = 60.0
+EVENT_SNAPSHOT_INTERVAL_MINUTES = 5.0
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -211,6 +215,13 @@ def wallet_balance_ttl_seconds() -> float:
     return max(15.0, env_float("POLYMARKET_WALLET_BALANCE_TTL_SECONDS", WALLET_BALANCE_TTL_SECONDS))
 
 
+def event_snapshot_interval_seconds() -> float:
+    minutes = env_float("EVENT_SNAPSHOT_INTERVAL_MINUTES", EVENT_SNAPSHOT_INTERVAL_MINUTES)
+    if minutes <= 0:
+        return 0.0
+    return max(60.0, minutes * 60.0)
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     dry_run: bool
@@ -234,6 +245,7 @@ class RuntimeConfig:
     safety_reconcile_interval_seconds: float
     safety_reconcile_min_interval_seconds: float
     wallet_balance_ttl_seconds: float
+    event_snapshot_interval_seconds: float
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -259,4 +271,5 @@ def load_runtime_config() -> RuntimeConfig:
         safety_reconcile_interval_seconds=safety_reconcile_interval_seconds(),
         safety_reconcile_min_interval_seconds=safety_reconcile_min_interval_seconds(),
         wallet_balance_ttl_seconds=wallet_balance_ttl_seconds(),
+        event_snapshot_interval_seconds=event_snapshot_interval_seconds(),
     )

@@ -26,6 +26,11 @@ class TradePlan:
     edge: float
     lead_days: int
     entry_time: datetime
+    condition_id: str | None = None
+    bracket_low: float | None = None
+    bracket_high: float | None = None
+    bracket_unit: str | None = None
+    metric: str | None = None
 
 
 @dataclass(frozen=True)
@@ -300,5 +305,10 @@ def evaluate_market(
             edge=float(edge),
             lead_days=lead_days,
             entry_time=now,
+            condition_id=str(market.get("conditionId") or "") or None,
+            bracket_low=parsed.get("bracket_low"),
+            bracket_high=parsed.get("bracket_high"),
+            bracket_unit=parsed.get("unit"),
+            metric=parsed.get("metric"),
         )
     )

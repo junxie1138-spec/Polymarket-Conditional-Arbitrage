@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from . import config, network
 
@@ -45,6 +45,9 @@ class OrderResult:
     intent: OrderIntent
     posted: bool
     response: dict[str, Any] | None = None
+
+
+OrderSubmitCallback = Callable[[OrderIntent, int], None]
 
 
 def build_order_intent(
@@ -133,6 +136,7 @@ class OrderPlacer:
         token_id: str,
         market_price: float,
         position_usd: float | None = None,
+        on_submit_attempt: OrderSubmitCallback | None = None,
     ) -> OrderResult:
         intent = build_order_intent(
             token_id=token_id,
@@ -141,6 +145,8 @@ class OrderPlacer:
             dry_run=self.dry_run,
         )
         if intent.dry_run:
+            if on_submit_attempt is not None:
+                on_submit_attempt(intent, 0)
             logger.info("dry_run_order %s", asdict(intent))
             return OrderResult(intent=intent, posted=False, response={"dry_run": True})
 
@@ -149,6 +155,8 @@ class OrderPlacer:
         last_exc: Exception | None = None
         for attempt in range(1, 4):
             try:
+                if on_submit_attempt is not None:
+                    on_submit_attempt(intent, attempt)
                 response = self._post_order(client, intent)
                 response_dict = response if isinstance(response, dict) else {"response": response}
                 _raise_for_rejected_order_response(response_dict)

@@ -13,11 +13,16 @@ pytest-cache-files-*/
 .ruff_cache/
 
 logs/
+reports/
 data/raw_markets.json
 data/raw_events.json
 data/weather_cache.json
 data/price_cache/
 data/live_positions.json
 data/pnl_history.json
+data/live_events.jsonl
+data/market_snapshots.jsonl
+data/forecast_snapshots.jsonl
 data/test_*.json
+data/test_*.jsonl
 data/*.tmp
