@@ -64,6 +64,8 @@ def test_reconcile_adds_guard_for_exchange_position():
                 "conditionId": "0xabc",
                 "size": 10,
                 "avgPrice": 0.4,
+                "curPrice": 0.55,
+                "cashPnl": 1.5,
                 "outcome": "Yes",
                 "title": "Weather",
             }
@@ -78,9 +80,12 @@ def test_reconcile_adds_guard_for_exchange_position():
         row = ledger.positions["gamma-1"]
         assert row["token_id"] == "yes-token"
         assert row["condition_id"] == "0xabc"
+        assert row["side"] == "YES"
         assert row["dry_run"] is False
         assert row["order_response"]["posted"] == "reconciled"
         assert row["order_response"]["reason"] == "exchange_position"
+        assert row["order_response"]["exchange"]["curPrice"] == 0.55
+        assert row["order_response"]["exchange"]["cashPnl"] == 1.5
     finally:
         _cleanup(ledger)
 
@@ -162,6 +167,7 @@ def test_reconcile_adds_guard_for_open_order():
 
         assert result.added_guards == 1
         assert ledger.positions["gamma-1"]["token_id"] == "no-token"
+        assert ledger.positions["gamma-1"]["side"] == "NO"
         assert ledger.positions["gamma-1"]["order_response"]["reason"] == "exchange_open_order"
     finally:
         _cleanup(ledger)

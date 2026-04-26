@@ -78,8 +78,9 @@ for the full live weather market scan.
 
 The effective cap is logged at startup as `max_position_usd=...` and shown in
 the dashboard runtime panel. Existing rows in `data/live_positions.json` keep
-the position size they were recorded with; old dry-run rows are not
-retroactively resized when you lower `MAX_POSITION_USD`.
+their recorded ledger size, but the dashboard reports old dry-run rows using
+the current capped size so validation exposure matches `MAX_POSITION_USD`.
+Live rows continue to show actual recorded exchange exposure.
 
 ## Dry-Run Commands
 
@@ -120,6 +121,13 @@ The bot saves `data/live_positions.json` after every dry-run or live entry, so
 the dashboard should show test entries during a long scan instead of waiting
 for `cycle_end`. If you run the bot and dashboard in separate shells, keep
 `WEATHER_ARB_DATA_DIR` and `WEATHER_ARB_LOG_DIR` identical in both shells.
+The dashboard also attempts to mark each position from the live CLOB book for
+per-position PnL. If a token has no two-sided book or the machine is offline,
+the PnL cell is left blank while the rest of the dashboard continues to load.
+When live credentials are set, the dashboard also shows the CLOB collateral
+balance and allowance. That account lookup is read-only and timeout-bounded;
+if credentials are missing or connectivity drops, the balance card reports the
+error while positions, logs, and PnL continue to render.
 
 ## Required Environment For Live Trading
 

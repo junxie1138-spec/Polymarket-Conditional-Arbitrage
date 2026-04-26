@@ -76,6 +76,9 @@ def _compact_exchange_row(row: dict[str, Any]) -> dict[str, Any]:
         "outcome",
         "price",
         "avgPrice",
+        "curPrice",
+        "cashPnl",
+        "percentPnl",
         "size",
         "original_size",
         "remaining_size",
@@ -122,6 +125,25 @@ def _market_key(market: dict) -> str:
 
 def _market_condition_id(market: dict) -> str:
     return str(market.get("conditionId") or "")
+
+
+def _normalized_outcome_side(value: Any) -> str | None:
+    side = str(value or "").strip().upper()
+    return side if side in {"YES", "NO"} else None
+
+
+def _outcome_side_for_exposure(exposure: ExchangeExposure, market: dict | None) -> str | None:
+    side = _normalized_outcome_side(exposure.side)
+    if side is not None:
+        return side
+    if not market:
+        return None
+    token_ids = token_ids_from_market(market)
+    if token_ids and exposure.token_id == token_ids[0]:
+        return "YES"
+    if len(token_ids) > 1 and exposure.token_id == token_ids[1]:
+        return "NO"
+    return None
 
 
 def _token_market_indexes(markets: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -365,7 +387,7 @@ class Reconciler:
             "market_id": market_id,
             "condition_id": condition_id,
             "token_id": exposure.token_id,
-            "side": exposure.side,
+            "side": _outcome_side_for_exposure(exposure, market),
             "question": (market or {}).get("question") or exposure.title or "",
             "city": None,
             "target_date": None,
