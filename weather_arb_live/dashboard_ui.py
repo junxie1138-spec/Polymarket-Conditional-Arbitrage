@@ -494,7 +494,108 @@ DASHBOARD_HTML = """<!doctype html>
     .edge-bar > i { display: block; height: 100%; }
     .edge-pos { color: var(--green); }
     .edge-neg { color: var(--red); }
-    .spark { display: inline-block; vertical-align: middle; }
+    .pnl-cell {
+      display: grid;
+      justify-items: end;
+      gap: 2px;
+      line-height: 1.15;
+    }
+
+    .pnl-cell small {
+      color: var(--muted);
+      font-family: var(--font-mono);
+      font-size: var(--fs-caption);
+    }
+
+    .pnl-chart-body {
+      display: grid;
+      gap: var(--s-6);
+      padding: 16px;
+    }
+
+    .pnl-chart-stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--s-5);
+    }
+
+    .chart-stat {
+      min-width: 0;
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-card);
+      background: var(--panel-2);
+      padding: 10px 12px;
+    }
+
+    .chart-stat span {
+      display: block;
+      color: var(--muted);
+      font-size: var(--fs-microlabel);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .chart-stat strong {
+      display: block;
+      min-width: 0;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+      font-family: var(--font-display);
+      font-variation-settings: 'opsz' 96;
+      font-size: 22px;
+      font-weight: 500;
+      line-height: 1.05;
+      letter-spacing: 0;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .pnl-chart-frame {
+      position: relative;
+      min-height: 220px;
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-card);
+      background: var(--panel-2);
+      padding: 10px;
+    }
+
+    .pnl-chart {
+      display: block;
+      width: 100%;
+      height: 220px;
+      overflow: visible;
+    }
+
+    .pnl-chart-grid { stroke: var(--line-2); stroke-width: 1; vector-effect: non-scaling-stroke; }
+    .pnl-chart-zero { stroke: var(--muted-2); stroke-width: 1; stroke-dasharray: 5 5; vector-effect: non-scaling-stroke; }
+    .pnl-chart-area { fill: var(--teal-soft); opacity: 0.72; }
+    .pnl-chart-area.neg { fill: var(--red-soft); }
+    .pnl-chart-line {
+      fill: none;
+      stroke: var(--teal);
+      stroke-width: 2.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      vector-effect: non-scaling-stroke;
+    }
+    .pnl-chart-line.neg { stroke: var(--red); }
+    .pnl-chart-point {
+      fill: var(--panel);
+      stroke: var(--teal);
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
+    }
+    .pnl-chart-point.neg { stroke: var(--red); }
+    .pnl-chart-empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: var(--fs-body);
+      text-align: center;
+      padding: 16px;
+    }
 
     .logs {
       max-height: 360px;
@@ -716,6 +817,7 @@ DASHBOARD_HTML = """<!doctype html>
       .card-head { align-items: flex-start; flex-direction: column; }
       .card-head-r { width: 100%; justify-content: flex-start; }
       .card-head-r .input { flex: 1 1 140px; }
+      .pnl-chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv { grid-template-columns: 1fr; gap: var(--s-2); }
       .log-row { grid-template-columns: 1fr; gap: var(--s-2); }
       .drawer-stat-grid { grid-template-columns: 1fr; }
@@ -776,14 +878,36 @@ DASHBOARD_HTML = """<!doctype html>
         <div id="activitySub" class="kpi-sub">-</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">Credentials</div>
-        <div id="credentialsMetric" class="kpi-value">-</div>
-        <div id="credentialsSub" class="kpi-sub">-</div>
+        <div class="kpi-label">Account balance</div>
+        <div id="accountMetric" class="kpi-value">-</div>
+        <div id="accountSub" class="kpi-sub">-</div>
       </div>
     </section>
 
     <div class="layout">
       <div class="main">
+        <section class="card">
+          <div class="card-head">
+            <div class="card-head-l">
+              <h2>Cumulative PnL</h2>
+              <span id="pnlChartMeta" class="muted card-head-meta">0 marked positions</span>
+            </div>
+            <div class="card-head-r"><span id="pnlChartBadge" class="pill status-dry">-</span></div>
+          </div>
+          <div class="pnl-chart-body">
+            <div class="pnl-chart-stats">
+              <div class="chart-stat"><span>Latest</span><strong id="pnlChartLatest">-</strong></div>
+              <div class="chart-stat"><span>High water</span><strong id="pnlChartHigh">-</strong></div>
+              <div class="chart-stat"><span>Low water</span><strong id="pnlChartLow">-</strong></div>
+              <div class="chart-stat"><span>Marked</span><strong id="pnlChartMarked">-</strong></div>
+            </div>
+            <div class="pnl-chart-frame">
+              <svg id="pnlChart" class="pnl-chart" viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="Cumulative PnL chart"></svg>
+              <div id="pnlChartEmpty" class="pnl-chart-empty">No marked PnL yet.</div>
+            </div>
+          </div>
+        </section>
+
         <section class="card">
           <div class="card-head">
             <div class="card-head-l">
@@ -814,7 +938,7 @@ DASHBOARD_HTML = """<!doctype html>
                   <th data-sort="entry_price" class="t-right">Entry</th>
                   <th data-sort="forecast_prob" class="t-right">Forecast</th>
                   <th data-sort="edge" class="t-right">Edge</th>
-                  <th class="t-right">Trend</th>
+                  <th data-sort="pnl_usd" class="t-right">PnL</th>
                   <th data-sort="position_usd" class="t-right">USD</th>
                   <th data-sort="shares" class="t-right">Shares</th>
                   <th>Status</th>
@@ -859,6 +983,14 @@ DASHBOARD_HTML = """<!doctype html>
         </section>
 
         <section class="card">
+          <div class="card-head">
+            <div class="card-head-l"><h2>Account</h2></div>
+            <div class="card-head-r"><span id="accountStatus" class="pill status-dry">-</span></div>
+          </div>
+          <div id="accountDetails" class="kv-list"></div>
+        </section>
+
+        <section class="card">
           <div class="card-head"><div class="card-head-l"><h2>Artifacts</h2></div></div>
           <div id="artifactList" class="list"></div>
         </section>
@@ -899,7 +1031,6 @@ DASHBOARD_HTML = """<!doctype html>
       sortDir: "desc",
     };
     const $ = (id) => document.getElementById(id);
-    const SVG_NS = "http://www.w3.org/2000/svg";
 
     function setText(id, value) {
       $(id).textContent = value === null || value === undefined || value === "" ? "-" : String(value);
@@ -947,6 +1078,17 @@ DASHBOARD_HTML = """<!doctype html>
         currency: "USD",
         maximumFractionDigits: 2,
       });
+    }
+
+    function formatSignedMoney(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      const number = Number(value);
+      const formatted = Math.abs(number).toLocaleString(undefined, {
+        style: "currency",
+        currency: "USD",
+        maximumFractionDigits: 2,
+      });
+      return `${number < 0 ? "-" : "+"}${formatted}`;
     }
 
     function formatDecimal(value, digits = 3) {
@@ -1015,7 +1157,6 @@ DASHBOARD_HTML = """<!doctype html>
 
     function statusFor(row) {
       if (row.manual_review) return { kind: "status-review", label: "Review" };
-      if (row.over_max_position) return { kind: "status-review", label: "Over max" };
       if (row.posted === "unknown") return { kind: "status-unknown", label: "Unknown" };
       if (row.dry_run) return { kind: "status-dry", label: "Dry run" };
       return { kind: "status-live", label: "Posted" };
@@ -1031,8 +1172,8 @@ DASHBOARD_HTML = """<!doctype html>
       const runtime = data.runtime;
       const positions = data.positions.summary;
       const health = data.health;
+      const account = data.account || {};
       const isLive = !runtime.dry_run;
-      const liveReady = runtime.dry_run || data.environment.live_credentials_ready;
       const modeDotClass = isLive ? "is-live" : "is-dry";
 
       $("modeDot").className = `mode-dot ${modeDotClass}`;
@@ -1053,17 +1194,28 @@ DASHBOARD_HTML = """<!doctype html>
       setText("positionsMetric", positions.total);
       setText("positionsSub", `${positions.dry_run} dry run / ${positions.live} live`);
       setText("exposureMetric", formatMoney(positions.total_position_usd));
-      setText("exposureSub", `${positions.yes_count} YES / ${positions.no_count} NO`);
+      setText("exposureSub", `${positions.yes_count} YES / ${positions.no_count} NO / PnL ${positions.pnl_count ? formatSignedMoney(positions.total_pnl_usd) : "-"}`);
       setText("reviewMetric", positions.manual_review);
-      setText("reviewSub", `${positions.unknown_posted} unknown / ${positions.over_max_position_count || 0} over max`);
+      setText("reviewSub", `${positions.unknown_posted} unknown posted`);
       setText("activityMetric", health.activity_label);
       setText("activitySub", health.last_log_age_seconds === null ? health.detail : ageText(health.last_log_age_seconds));
-      setText("credentialsMetric", liveReady ? "Ready" : "Missing");
-      setText("credentialsSub", runtime.dry_run ? "Not required in dry run" : `${data.environment.missing_required.length} missing`);
+      const hasAccountBalance = account.balance_usd !== null && account.balance_usd !== undefined && !Number.isNaN(Number(account.balance_usd));
+      setText("accountMetric", hasAccountBalance ? formatMoney(account.balance_usd) : account.status_label);
+      setText(
+        "accountSub",
+        account.status === "ok"
+          ? `Allowance ${account.allowance_usd === null || account.allowance_usd === undefined ? "-" : formatMoney(account.allowance_usd)}`
+          : account.error || account.status_label
+      );
 
-      updateMetricClass("reviewMetric", positions.manual_review > 0 || positions.over_max_position_count > 0 ? "is-bad" : "");
+      updateMetricClass("reviewMetric", positions.manual_review > 0 ? "is-bad" : "");
       updateMetricClass("activityMetric", health.activity === "stale" ? "is-warn" : "");
-      updateMetricClass("credentialsMetric", liveReady ? "is-good" : "is-bad");
+      updateMetricClass(
+        "accountMetric",
+        account.status === "ok"
+          ? Number(account.balance_usd) < Number(runtime.max_position_usd) ? "is-warn" : "is-good"
+          : account.status === "disabled" ? "" : "is-warn"
+      );
     }
 
     function renderRuntime(data) {
@@ -1077,8 +1229,28 @@ DASHBOARD_HTML = """<!doctype html>
       appendKv(el, "Live limit", runtime.live_market_limit === null ? "Full scan" : runtime.live_market_limit, { mono: true });
       appendKv(el, "NO side", pill(runtime.enable_no_side ? "Enabled" : "Disabled", runtime.enable_no_side ? "status-live" : "status-dry"));
       appendKv(el, "Reconcile", pill(runtime.reconcile_on_startup ? "On startup" : "Off", runtime.reconcile_on_startup ? "status-live" : "status-dry"));
+      appendKv(el, "Market WS", pill(runtime.market_ws_enabled ? "Enabled" : "Disabled", runtime.market_ws_enabled ? "status-live" : "status-dry"));
+      appendKv(el, "User WS", pill(runtime.user_ws_enabled ? "Enabled" : "Disabled", runtime.user_ws_enabled ? "status-live" : "status-dry"));
+      appendKv(el, "Quote stale", `${runtime.ws_market_stale_seconds}s`, { mono: true });
+      appendKv(el, "Safety check", `${runtime.safety_reconcile_interval_seconds}s`, { mono: true });
       appendKv(el, "Data dir", shortPath(runtime.data_dir), { mono: true, small: true });
       appendKv(el, "Log dir", shortPath(runtime.log_dir), { mono: true, small: true });
+    }
+
+    function renderAccount(data) {
+      const el = $("accountDetails");
+      clearNode(el);
+      const account = data.account || {};
+      const status = $("accountStatus");
+      const statusKind = account.status === "ok" ? "status-live" : account.status === "disabled" ? "status-dry" : "status-review";
+      status.className = `pill ${statusKind}`;
+      status.textContent = account.status_label || "-";
+
+      appendKv(el, "Collateral balance", formatMoney(account.balance_usd), { mono: true });
+      appendKv(el, "Collateral allowance", formatMoney(account.allowance_usd), { mono: true });
+      appendKv(el, "Status", account.status || "-", { mono: true });
+      appendKv(el, "Updated", formatCompactDate(account.updated_at));
+      if (account.error) appendKv(el, "Error", account.error, { small: true });
     }
 
     function renderArtifacts(data) {
@@ -1174,46 +1346,6 @@ DASHBOARD_HTML = """<!doctype html>
       if (state.data) renderPositions(state.data);
     }
 
-    function sparkValues(seed, edge) {
-      const values = [];
-      let value = 0.5;
-      const lift = Number(edge || 0) / 18;
-      for (let i = 0; i < 18; i += 1) {
-        value += Math.sin(seed + i * 0.7) * 0.025 + lift;
-        values.push(value);
-      }
-      return values;
-    }
-
-    function sparkline(values, color) {
-      const width = 96;
-      const height = 28;
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const span = max - min || 1;
-      const step = width / Math.max(1, values.length - 1);
-      const points = values.map((value, index) => {
-        const x = (index * step).toFixed(1);
-        const y = (height - ((value - min) / span) * height).toFixed(1);
-        return `${x},${y}`;
-      });
-      const d = `M${points.join(" L")}`;
-      const svg = document.createElementNS(SVG_NS, "svg");
-      svg.setAttribute("width", width);
-      svg.setAttribute("height", height);
-      svg.setAttribute("class", "spark");
-      svg.setAttribute("aria-hidden", "true");
-      const path = document.createElementNS(SVG_NS, "path");
-      path.setAttribute("d", d);
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke", color);
-      path.setAttribute("stroke-width", "1.25");
-      path.setAttribute("stroke-linecap", "round");
-      path.setAttribute("stroke-linejoin", "round");
-      svg.append(path);
-      return svg;
-    }
-
     function appendCell(row, child, className = "") {
       const cell = document.createElement("td");
       if (className) cell.className = className;
@@ -1223,6 +1355,120 @@ DASHBOARD_HTML = """<!doctype html>
       return cell;
     }
 
+    function pnlNode(row) {
+      const pnl = Number(row.pnl_usd);
+      if (row.pnl_usd === null || row.pnl_usd === undefined || Number.isNaN(pnl)) return "-";
+      const wrapper = document.createElement("div");
+      wrapper.className = "pnl-cell";
+      const money = document.createElement("span");
+      money.className = pnl >= 0 ? "edge-pos" : "edge-neg";
+      money.textContent = formatSignedMoney(row.pnl_usd);
+      const pct = document.createElement("small");
+      pct.textContent = formatSignedPct(row.pnl_pct);
+      wrapper.append(money, pct);
+      return wrapper;
+    }
+
+    function svgNode(name, attrs = {}) {
+      const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+      Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+      return node;
+    }
+
+    function chartPath(points) {
+      return points.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
+    }
+
+    function renderPnlChart(data) {
+      const curve = (data.positions.pnl_curve || [])
+        .map((point) => ({
+          ...point,
+          value: Number(point.cumulative_pnl_usd),
+          pnl: Number(point.pnl_usd),
+        }))
+        .filter((point) => !Number.isNaN(point.value));
+      const svg = $("pnlChart");
+      const empty = $("pnlChartEmpty");
+      const badge = $("pnlChartBadge");
+      clearNode(svg);
+
+      if (!curve.length) {
+        setText("pnlChartMeta", "0 marked positions");
+        setText("pnlChartLatest", "-");
+        setText("pnlChartHigh", "-");
+        setText("pnlChartLow", "-");
+        setText("pnlChartMarked", "0");
+        badge.className = "pill status-dry";
+        badge.textContent = "No PnL";
+        empty.hidden = false;
+        return;
+      }
+
+      const values = curve.map((point) => point.value);
+      const latest = curve[curve.length - 1].value;
+      const high = Math.max(...values);
+      const low = Math.min(...values);
+      const first = curve[0];
+      const last = curve[curve.length - 1];
+      setText("pnlChartMeta", `${curve.length} marked positions / ${formatCompactDate(first.entry_time)} to ${formatCompactDate(last.entry_time)}`);
+      setText("pnlChartLatest", formatSignedMoney(latest));
+      setText("pnlChartHigh", formatSignedMoney(high));
+      setText("pnlChartLow", formatSignedMoney(low));
+      setText("pnlChartMarked", curve.length);
+      badge.className = `pill ${latest >= 0 ? "status-live" : "status-review"}`;
+      badge.textContent = formatSignedMoney(latest);
+      empty.hidden = true;
+
+      const width = 640;
+      const height = 220;
+      const pad = { left: 16, right: 16, top: 16, bottom: 18 };
+      let minY = Math.min(0, low);
+      let maxY = Math.max(0, high);
+      if (minY === maxY) {
+        minY -= 1;
+        maxY += 1;
+      } else {
+        const margin = (maxY - minY) * 0.12;
+        minY -= margin;
+        maxY += margin;
+      }
+      const innerW = width - pad.left - pad.right;
+      const innerH = height - pad.top - pad.bottom;
+      const xFor = (index) => curve.length === 1 ? width / 2 : pad.left + (index / (curve.length - 1)) * innerW;
+      const yFor = (value) => pad.top + ((maxY - value) / (maxY - minY)) * innerH;
+      const coords = curve.map((point, index) => ({ ...point, x: xFor(index), y: yFor(point.value) }));
+      const zeroY = Math.max(pad.top, Math.min(height - pad.bottom, yFor(0)));
+
+      [0.25, 0.5, 0.75].forEach((fraction) => {
+        const y = pad.top + fraction * innerH;
+        svg.append(svgNode("line", { class: "pnl-chart-grid", x1: pad.left, y1: y, x2: width - pad.right, y2: y }));
+      });
+      svg.append(svgNode("line", { class: "pnl-chart-zero", x1: pad.left, y1: zeroY, x2: width - pad.right, y2: zeroY }));
+
+      if (coords.length > 1) {
+        const lineD = chartPath(coords);
+        const areaD = `M ${coords[0].x.toFixed(2)} ${zeroY.toFixed(2)} ${lineD.slice(1)} L ${coords[coords.length - 1].x.toFixed(2)} ${zeroY.toFixed(2)} Z`;
+        svg.append(svgNode("path", { class: `pnl-chart-area ${latest < 0 ? "neg" : ""}`.trim(), d: areaD }));
+        svg.append(svgNode("path", { class: `pnl-chart-line ${latest < 0 ? "neg" : ""}`.trim(), d: lineD }));
+      }
+
+      const pointStep = Math.max(1, Math.ceil(coords.length / 80));
+      coords.forEach((point, index) => {
+        const isLast = index === coords.length - 1;
+        if (!isLast && index % pointStep !== 0) return;
+        const circle = svgNode("circle", {
+          class: `pnl-chart-point ${point.value < 0 ? "neg" : ""}`.trim(),
+          cx: point.x.toFixed(2),
+          cy: point.y.toFixed(2),
+          r: isLast ? 4 : 2.5,
+        });
+        const title = svgNode("title");
+        title.textContent = `${formatCompactDate(point.entry_time)} / ${point.market_id || "-"} / ${formatSignedMoney(point.pnl)} / cum ${formatSignedMoney(point.value)}`;
+        circle.append(title);
+        svg.append(circle);
+      });
+    }
+
     function renderPositions(data) {
       const body = $("positionsBody");
       clearNode(body);
@@ -1230,7 +1476,8 @@ DASHBOARD_HTML = """<!doctype html>
       const sourceRows = data.positions.recent || [];
       const rows = sourceRows.filter(positionMatches).sort(compareRows);
       const maxEdge = Math.max(...sourceRows.map((row) => Math.abs(Number(row.edge || 0))), 0.001);
-      $("positionsCount").textContent = `${rows.length} of ${sourceRows.length} shown`;
+      const markMeta = data.positions.mark_count ? ` / ${data.positions.mark_count} marks` : "";
+      $("positionsCount").textContent = `${rows.length} of ${sourceRows.length} shown${markMeta}`;
       $("positionsEmpty").hidden = rows.length > 0;
       updateSortHeaders();
 
@@ -1279,11 +1526,7 @@ DASHBOARD_HTML = """<!doctype html>
         edgeCell.append(bar, edgeText);
         appendCell(tr, edgeCell, "num t-right");
 
-        appendCell(
-          tr,
-          sparkline(sparkValues(index + Number(row.lead_days || 1), row.edge), row.side === "NO" ? "#b36b00" : "#14746f"),
-          "t-right"
-        );
+        appendCell(tr, pnlNode(row), "num t-right");
         appendCell(tr, formatMoney(row.position_usd), "num t-right");
         appendCell(tr, formatDecimal(row.shares, 2), "num t-right");
         appendCell(tr, pill(status.label, status.kind));
@@ -1375,7 +1618,6 @@ DASHBOARD_HTML = """<!doctype html>
       const status = statusFor(row);
       pills.append(pill(status.label, status.kind));
       if (row.manual_review) pills.append(pill("Manual review", "status-review"));
-      if (row.over_max_position) pills.append(pill("Over current max", "status-review"));
 
       const stats = $("drawerStats");
       clearNode(stats);
@@ -1383,15 +1625,19 @@ DASHBOARD_HTML = """<!doctype html>
         drawerStat("Entry price", formatDecimal(row.entry_price)),
         drawerStat("Forecast prob", formatPct(row.forecast_prob)),
         drawerStat("Edge", formatSignedPct(row.edge), Number(row.edge || 0) >= 0 ? "edge-pos" : "edge-neg"),
+        drawerStat("PnL", formatSignedMoney(row.pnl_usd), Number(row.pnl_usd || 0) >= 0 ? "edge-pos" : "edge-neg"),
         drawerStat("Position", formatMoney(row.position_usd)),
-        drawerStat("Shares", formatDecimal(row.shares, 2)),
-        drawerStat("Lead", row.lead_days === null || row.lead_days === undefined ? "-" : `${row.lead_days}d`)
+        drawerStat("Current price", formatDecimal(row.current_price)),
+        drawerStat("Shares", formatDecimal(row.shares, 2))
       );
 
       const details = $("drawerDetails");
       clearNode(details);
       appendKv(details, "Token ID", row.token_id, { mono: true, small: true });
       appendKv(details, "Market price", formatDecimal(row.market_price), { mono: true });
+      appendKv(details, "Recorded position", formatMoney(row.recorded_position_usd), { mono: true });
+      appendKv(details, "Current value", formatMoney(row.current_value_usd), { mono: true });
+      appendKv(details, "PnL source", row.pnl_source || "-", { mono: true });
       appendKv(details, "Posted", row.posted || "-", { mono: true });
       appendKv(details, "Reconciliation", row.reconciliation_status || "-", { mono: true, small: true });
       appendKv(details, "Entered", formatCompactDate(row.entry_time));
@@ -1407,8 +1653,10 @@ DASHBOARD_HTML = """<!doctype html>
       setError("errorBanner", "");
       renderMetrics(data);
       renderRuntime(data);
+      renderAccount(data);
       renderArtifacts(data);
       renderEnvironment(data);
+      renderPnlChart(data);
       renderPositions(data);
       renderLogs(data);
     }

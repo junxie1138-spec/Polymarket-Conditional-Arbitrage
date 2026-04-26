@@ -76,10 +76,36 @@ $env:LIVE_MARKET_LIMIT="10"
 Use `LIVE_MARKET_LIMIT=10` for bounded validation. Use `0` or leave it unset
 for the full live weather market scan.
 
+Market discovery, weather forecasts, startup reconciliation, periodic safety
+checks, and reconnect recovery stay on REST. The public market WebSocket is a
+low-latency best bid/ask cache for candidate YES/NO token IDs discovered by
+Gamma; stale or missing quotes fall back to the existing REST CLOB book fetch.
+The authenticated user WebSocket is enabled only in live mode with API
+credentials present and logs order/trade events for candidate condition IDs.
+
+Default streaming and safety settings:
+
+```powershell
+$env:POLYMARKET_MARKET_WS_ENABLED="true"
+$env:POLYMARKET_USER_WS_ENABLED="true"
+$env:POLYMARKET_WS_MARKET_STALE_SECONDS="20"
+$env:POLYMARKET_WS_MARKET_MAX_TOKENS="200"
+$env:POLYMARKET_WS_MARKET_WARMUP_SECONDS="1.5"
+$env:SAFETY_RECONCILE_INTERVAL_MINUTES="60"
+$env:SAFETY_RECONCILE_MIN_INTERVAL_SECONDS="300"
+```
+
+`POLYMARKET_WS_MARKET_MAX_TOKENS` caps the active token subscription set to
+stay bounded during broad scans. If the WebSocket disconnects and reconnects
+in live mode, the next bot cycle schedules REST reconciliation before trading;
+rapid reconnect loops are throttled by
+`SAFETY_RECONCILE_MIN_INTERVAL_SECONDS`.
+
 The effective cap is logged at startup as `max_position_usd=...` and shown in
 the dashboard runtime panel. Existing rows in `data/live_positions.json` keep
-the position size they were recorded with; old dry-run rows are not
-retroactively resized when you lower `MAX_POSITION_USD`.
+their recorded ledger size, but the dashboard reports old dry-run rows using
+the current capped size so validation exposure matches `MAX_POSITION_USD`.
+Live rows continue to show actual recorded exchange exposure.
 
 ## Dry-Run Commands
 
@@ -120,6 +146,13 @@ The bot saves `data/live_positions.json` after every dry-run or live entry, so
 the dashboard should show test entries during a long scan instead of waiting
 for `cycle_end`. If you run the bot and dashboard in separate shells, keep
 `WEATHER_ARB_DATA_DIR` and `WEATHER_ARB_LOG_DIR` identical in both shells.
+The dashboard also attempts to mark each position from the live CLOB book for
+per-position PnL. If a token has no two-sided book or the machine is offline,
+the PnL cell is left blank while the rest of the dashboard continues to load.
+When live credentials are set, the dashboard also shows the CLOB collateral
+balance and allowance. That account lookup is read-only and timeout-bounded;
+if credentials are missing or connectivity drops, the balance card reports the
+error while positions, logs, and PnL continue to render.
 
 ## Required Environment For Live Trading
 
@@ -152,6 +185,9 @@ $env:RECONCILE_ON_STARTUP="true"
 $env:MAX_POSITION_USD="2.50"
 $env:LIVE_MARKET_LIMIT="0"
 $env:ENABLE_NO_SIDE="true"
+$env:POLYMARKET_MARKET_WS_ENABLED="true"
+$env:POLYMARKET_USER_WS_ENABLED="true"
+$env:SAFETY_RECONCILE_INTERVAL_MINUTES="60"
 ```
 
 Run one live cycle first:
@@ -179,6 +215,11 @@ exchange exposure in an active weather market gets a local guard row in
 `data/live_positions.json`, so a cloud restart or lost local file does not
 blindly re-enter that market. If reconciliation cannot complete, continuous
 mode keeps retrying after `OFFLINE_RETRY_SECONDS` and does not trade.
+After startup, live mode repeats that REST reconciliation on
+`SAFETY_RECONCILE_INTERVAL_MINUTES`, reusing the current Gamma market list
+when available. Reconciliation remains the source of truth after WebSocket
+reconnects; streamed user order/trade messages are treated as live telemetry,
+not as authoritative position state.
 
 Before each live order, the bot refreshes CLOB collateral balance/allowance and
 blocks the order locally if either value is below `MAX_POSITION_USD` for that

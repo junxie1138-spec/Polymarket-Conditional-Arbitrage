@@ -45,12 +45,11 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
                     "m1": {
                         "market_id": "m1",
                         "token_id": "yes-token",
-                        "side": "YES",
                         "question": "Will NYC hit 80F?",
                         "city": "New York",
                         "target_date": "2026-04-27",
-                        "entry_price": 0.3,
-                        "shares": 166.67,
+                        "entry_price": 0.5,
+                        "shares": 100,
                         "position_usd": 50,
                         "forecast_prob": 0.8,
                         "edge": 0.5,
@@ -100,7 +99,18 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
         monkeypatch.delenv("POLYMARKET_API_PASSPHRASE", raising=False)
         monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
 
-        state = dashboard.build_dashboard_state(log_limit=10)
+        state = dashboard.build_dashboard_state(
+            log_limit=10,
+            mark_prices={"yes-token": 0.6, "no-token": 0.4},
+            account_snapshot={
+                "status": "ok",
+                "status_label": "Connected",
+                "balance_usd": 123.45,
+                "allowance_usd": 100.0,
+                "error": None,
+                "updated_at": "2026-04-25T08:00:03+00:00",
+            },
+        )
 
         summary = state["positions"]["summary"]
         assert summary["total"] == 2
@@ -110,14 +120,42 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
         assert summary["no_count"] == 1
         assert summary["unknown_posted"] == 1
         assert summary["manual_review"] == 1
-        assert summary["over_max_position_count"] == 1
-        assert summary["total_position_usd"] == 75
+        assert summary["total_position_usd"] == 50
+        assert summary["total_recorded_position_usd"] == 75
+        assert summary["pnl_count"] == 2
+        assert summary["total_pnl_usd"] == 0
+        assert state["positions"]["pnl_curve"] == [
+            {
+                "entry_time": "2026-04-25T08:00:00+00:00",
+                "market_id": "m1",
+                "question": "Will NYC hit 80F?",
+                "side": "YES",
+                "pnl_usd": 5,
+                "cumulative_pnl_usd": 5,
+            },
+            {
+                "entry_time": "2026-04-25T09:00:00+00:00",
+                "market_id": "m2",
+                "question": "Will Chicago stay below 70F?",
+                "side": "NO",
+                "pnl_usd": -5,
+                "cumulative_pnl_usd": 0,
+            },
+        ]
         assert state["positions"]["recent"][0]["market_id"] == "m2"
-        assert state["positions"]["recent"][0]["over_max_position"] is False
-        assert state["positions"]["recent"][1]["over_max_position"] is True
+        assert state["positions"]["recent"][0]["position_usd"] == 25
+        assert state["positions"]["recent"][0]["pnl_usd"] == -5
+        assert state["positions"]["recent"][1]["side"] == "YES"
+        assert state["positions"]["recent"][1]["position_usd"] == 25
+        assert state["positions"]["recent"][1]["recorded_position_usd"] == 50
+        assert state["positions"]["recent"][1]["shares"] == 50
+        assert state["positions"]["recent"][1]["pnl_usd"] == 5
+        assert "over_max_position" not in state["positions"]["recent"][1]
         assert state["logs"]["level_counts"]["WARNING"] == 1
         assert state["logs"]["last_cycle_end"] == "2026-04-25 08:00:02,000"
         assert state["environment"]["live_credentials_ready"] is False
+        assert state["account"]["balance_usd"] == 123.45
+        assert state["account"]["allowance_usd"] == 100.0
         assert "POLYMARKET_API_SECRET" in state["environment"]["missing_required"]
         assert "secret-api-key" not in json.dumps(state)
         assert any(
@@ -160,9 +198,60 @@ def test_parse_log_lines_keeps_unstructured_lines():
     assert parsed["entries"][1]["message"] == "partial line without formatter"
 
 
+def test_dashboard_account_fetch_can_be_disabled(monkeypatch):
+    positions_path, log_path, cleanup_paths = _patch_dashboard_paths(monkeypatch)
+    try:
+        called = False
+
+        def fail_fetch(_runtime):
+            nonlocal called
+            called = True
+            raise AssertionError("account fetch should not run")
+
+        monkeypatch.setattr(dashboard, "fetch_account_snapshot", fail_fetch)
+        state = dashboard.build_dashboard_state(include_account=False)
+
+        assert called is False
+        assert state["account"]["status"] == "disabled"
+        assert state["account"]["balance_usd"] is None
+    finally:
+        for path in [positions_path, log_path, *cleanup_paths]:
+            path.unlink(missing_ok=True)
+
+
+def test_dashboard_account_fetch_uses_snapshot(monkeypatch):
+    positions_path, log_path, cleanup_paths = _patch_dashboard_paths(monkeypatch)
+    try:
+        expected = {
+            "status": "ok",
+            "status_label": "Connected",
+            "balance_usd": 77.0,
+            "allowance_usd": 50.0,
+            "error": None,
+            "updated_at": "2026-04-25T08:00:00+00:00",
+        }
+
+        def fake_fetch(_runtime):
+            return expected
+
+        monkeypatch.setattr(dashboard, "fetch_account_snapshot", fake_fetch)
+        state = dashboard.build_dashboard_state(include_account=True)
+
+        assert state["account"] == expected
+    finally:
+        for path in [positions_path, log_path, *cleanup_paths]:
+            path.unlink(missing_ok=True)
+
+
 def test_dashboard_html_uses_design_system_shell():
     assert "Polymarket Weather" in dashboard.DASHBOARD_HTML
     assert "kpi-grid" in dashboard.DASHBOARD_HTML
     assert "mode-dot" in dashboard.DASHBOARD_HTML
     assert "drawer-backdrop" in dashboard.DASHBOARD_HTML
     assert "tail / live_bot.log" in dashboard.DASHBOARD_HTML
+    assert "Cumulative PnL" in dashboard.DASHBOARD_HTML
+    assert "pnlChart" in dashboard.DASHBOARD_HTML
+    assert "Account balance" in dashboard.DASHBOARD_HTML
+    assert "accountDetails" in dashboard.DASHBOARD_HTML
+    assert "PnL" in dashboard.DASHBOARD_HTML
+    assert "Over max" not in dashboard.DASHBOARD_HTML

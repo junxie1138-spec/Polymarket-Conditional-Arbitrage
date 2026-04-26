@@ -76,6 +76,18 @@ ENSEMBLE_SIGMA_FLOOR_F = 1.5
 CLOB_V2_TEST_HOST = "https://clob-v2.polymarket.com"
 CLOB_PRODUCTION_HOST = "https://clob.polymarket.com"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+POLYMARKET_WS_BASE_URL = "wss://ws-subscriptions-clob.polymarket.com/ws"
+
+MARKET_WS_ENABLED = True
+USER_WS_ENABLED = True
+WS_HEARTBEAT_SECONDS = 10.0
+WS_RECONNECT_MIN_SECONDS = 5.0
+WS_RECONNECT_MAX_SECONDS = 60.0
+WS_MARKET_STALE_SECONDS = 20.0
+WS_MARKET_MAX_TOKENS = 200
+WS_MARKET_WARMUP_SECONDS = 1.5
+SAFETY_RECONCILE_INTERVAL_MINUTES = 60
+SAFETY_RECONCILE_MIN_INTERVAL_SECONDS = 300.0
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -97,6 +109,11 @@ def env_int(name: str, default: int) -> int:
     if value is None or value.strip() == "":
         return default
     return int(value)
+
+
+def env_nonnegative_float(name: str, default: float) -> float:
+    value = env_float(name, default)
+    return max(0.0, value)
 
 
 def enable_no_side() -> bool:
@@ -141,6 +158,53 @@ def live_market_limit() -> int | None:
     return value if value > 0 else None
 
 
+def polymarket_ws_base_url() -> str:
+    return os.getenv("POLYMARKET_WS_BASE_URL", POLYMARKET_WS_BASE_URL).rstrip("/")
+
+
+def market_ws_enabled() -> bool:
+    return env_bool("POLYMARKET_MARKET_WS_ENABLED", MARKET_WS_ENABLED)
+
+
+def user_ws_enabled() -> bool:
+    return env_bool("POLYMARKET_USER_WS_ENABLED", USER_WS_ENABLED)
+
+
+def ws_heartbeat_seconds() -> float:
+    return max(5.0, env_float("POLYMARKET_WS_HEARTBEAT_SECONDS", WS_HEARTBEAT_SECONDS))
+
+
+def ws_reconnect_min_seconds() -> float:
+    return max(1.0, env_float("POLYMARKET_WS_RECONNECT_MIN_SECONDS", WS_RECONNECT_MIN_SECONDS))
+
+
+def ws_reconnect_max_seconds() -> float:
+    return max(ws_reconnect_min_seconds(), env_float("POLYMARKET_WS_RECONNECT_MAX_SECONDS", WS_RECONNECT_MAX_SECONDS))
+
+
+def ws_market_stale_seconds() -> float:
+    return max(1.0, env_float("POLYMARKET_WS_MARKET_STALE_SECONDS", WS_MARKET_STALE_SECONDS))
+
+
+def ws_market_max_tokens() -> int:
+    return max(1, env_int("POLYMARKET_WS_MARKET_MAX_TOKENS", WS_MARKET_MAX_TOKENS))
+
+
+def ws_market_warmup_seconds() -> float:
+    return min(5.0, env_nonnegative_float("POLYMARKET_WS_MARKET_WARMUP_SECONDS", WS_MARKET_WARMUP_SECONDS))
+
+
+def safety_reconcile_interval_seconds() -> float:
+    minutes = env_float("SAFETY_RECONCILE_INTERVAL_MINUTES", SAFETY_RECONCILE_INTERVAL_MINUTES)
+    if minutes <= 0:
+        return 0.0
+    return max(60.0, minutes * 60.0)
+
+
+def safety_reconcile_min_interval_seconds() -> float:
+    return max(60.0, env_float("SAFETY_RECONCILE_MIN_INTERVAL_SECONDS", SAFETY_RECONCILE_MIN_INTERVAL_SECONDS))
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     dry_run: bool
@@ -152,6 +216,17 @@ class RuntimeConfig:
     enable_no_side: bool
     offline_retry_seconds: int
     reconcile_on_startup: bool
+    polymarket_ws_base_url: str
+    market_ws_enabled: bool
+    user_ws_enabled: bool
+    ws_heartbeat_seconds: float
+    ws_reconnect_min_seconds: float
+    ws_reconnect_max_seconds: float
+    ws_market_stale_seconds: float
+    ws_market_max_tokens: int
+    ws_market_warmup_seconds: float
+    safety_reconcile_interval_seconds: float
+    safety_reconcile_min_interval_seconds: float
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -165,4 +240,15 @@ def load_runtime_config() -> RuntimeConfig:
         enable_no_side=enable_no_side(),
         offline_retry_seconds=offline_retry_seconds(),
         reconcile_on_startup=reconcile_on_startup(),
+        polymarket_ws_base_url=polymarket_ws_base_url(),
+        market_ws_enabled=market_ws_enabled(),
+        user_ws_enabled=user_ws_enabled(),
+        ws_heartbeat_seconds=ws_heartbeat_seconds(),
+        ws_reconnect_min_seconds=ws_reconnect_min_seconds(),
+        ws_reconnect_max_seconds=ws_reconnect_max_seconds(),
+        ws_market_stale_seconds=ws_market_stale_seconds(),
+        ws_market_max_tokens=ws_market_max_tokens(),
+        ws_market_warmup_seconds=ws_market_warmup_seconds(),
+        safety_reconcile_interval_seconds=safety_reconcile_interval_seconds(),
+        safety_reconcile_min_interval_seconds=safety_reconcile_min_interval_seconds(),
     )

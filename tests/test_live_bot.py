@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from pathlib import Path
 
 import requests
@@ -9,6 +10,7 @@ from weather_arb_live.ledger import PositionLedger
 from weather_arb_live.live_bot import LiveBot
 from weather_arb_live.order_placer import BalancePreflightError, OrderResult, build_order_intent
 from weather_arb_live.strategy import TradePlan, Decision
+from weather_arb_live.ws_stream import unique_market_condition_ids, unique_market_token_ids
 
 
 class FakeFetcher:
@@ -421,3 +423,94 @@ def test_live_mode_blocks_cycle_until_startup_reconcile_succeeds(monkeypatch):
     bot.reconciler = FailingReconciler()
 
     assert bot.run_one_cycle() is False
+
+
+class RecordingMarketStream:
+    reconnect_count = 0
+
+    def __init__(self):
+        self.tokens: list[str] = []
+        self.warmups: list[float] = []
+
+    def set_market_candidates(self, markets):
+        self.tokens = unique_market_token_ids(markets)
+
+    def warmup(self, seconds):
+        self.warmups.append(seconds)
+
+
+class RecordingUserStream:
+    reconnect_count = 0
+
+    def __init__(self):
+        self.condition_ids: list[str] = []
+
+    def set_market_candidates(self, markets):
+        self.condition_ids = unique_market_condition_ids(markets)
+
+
+def test_sync_stream_subscriptions_uses_token_and_condition_ids(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
+    monkeypatch.setenv("POLYMARKET_WS_MARKET_WARMUP_SECONDS", "0")
+    logger = logging.getLogger("test_live_bot_stream_sync")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    market_stream = RecordingMarketStream()
+    user_stream = RecordingUserStream()
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=PositionLedger(Path("data/test_stream_sync_positions.json")).load(),
+        logger=logger,
+        market_stream=market_stream,
+        user_stream=user_stream,
+    )
+    markets = [
+        {
+            "id": "gamma-1",
+            "conditionId": "0xabc",
+            "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+        }
+    ]
+
+    bot._sync_stream_subscriptions(markets)
+
+    assert market_stream.tokens == ["yes-token", "no-token"]
+    assert user_stream.condition_ids == ["0xabc"]
+    assert market_stream.warmups == [0.0]
+
+
+class RecordingReconciler:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def reconcile(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+def test_periodic_safety_reconciliation_reuses_cycle_markets(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
+    monkeypatch.setenv("SAFETY_RECONCILE_INTERVAL_MINUTES", "60")
+    logger = logging.getLogger("test_live_bot_periodic_safety")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=PositionLedger(Path("data/test_periodic_safety_positions.json")).load(),
+        logger=logger,
+        market_stream=None,
+        user_stream=None,
+    )
+    reconciler = RecordingReconciler()
+    bot.reconciler = reconciler
+    bot._next_safety_reconcile_at = 0.0
+    markets = [{"id": "gamma-1", "conditionId": "0xabc"}]
+
+    assert bot._ensure_periodic_safety_reconcile(markets) is True
+
+    assert len(reconciler.calls) == 1
+    assert reconciler.calls[0]["active_markets"] is markets
+    assert reconciler.calls[0]["reason"] == "periodic_safety"

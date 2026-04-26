@@ -6,6 +6,7 @@ from typing import Iterable
 
 from . import config, network
 from .strategy import yes_token_from_market
+from .ws_stream import BestBidAskCache
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +53,20 @@ def midpoint_from_book(book: dict) -> float | None:
 
 
 class LiveFetcher:
-    def __init__(self, *, session=None, clob_host: str | None = None):
+    def __init__(
+        self,
+        *,
+        session=None,
+        clob_host: str | None = None,
+        price_cache: BestBidAskCache | None = None,
+        ws_stale_seconds: float | None = None,
+    ):
         self.session = session or network.get_session()
         self.clob_host = (clob_host or config.clob_host()).rstrip("/")
+        self.price_cache = price_cache
+        self.ws_stale_seconds = (
+            config.ws_market_stale_seconds() if ws_stale_seconds is None else ws_stale_seconds
+        )
 
     def fetch_active_events(self, *, tag_slug: str = "weather") -> list[dict]:
         events: list[dict] = []
@@ -118,6 +130,14 @@ class LiveFetcher:
         raise ValueError(f"unexpected order book response for token_id={token_id}")
 
     def fetch_midpoint(self, token_id: str) -> float | None:
+        if self.price_cache is not None:
+            midpoint = self.price_cache.midpoint(
+                token_id,
+                max_age_seconds=self.ws_stale_seconds,
+            )
+            if midpoint is not None:
+                logger.debug("price_cache_hit token_id=%s midpoint=%.4f", token_id, midpoint)
+                return midpoint
         return midpoint_from_book(self.fetch_order_book(token_id))
 
     def fetch_yes_midpoint(self, token_id: str) -> float | None:
