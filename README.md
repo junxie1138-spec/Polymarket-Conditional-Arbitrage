@@ -152,7 +152,11 @@ the PnL cell is left blank while the rest of the dashboard continues to load.
 When live credentials are set, the dashboard also shows the CLOB collateral
 balance and allowance. That account lookup is read-only and timeout-bounded;
 if credentials are missing or connectivity drops, the balance card reports the
-error while positions, logs, and PnL continue to render.
+error while positions, logs, and PnL continue to render. For proxy/funder
+wallets, the dashboard also reads the configured funder's Polygon USDC.e balance
+and uses that as the top-line account balance when the CLOB balance cache
+reports zero. The account details panel still shows the separate CLOB
+balance/allowance values so mismatches are visible.
 
 ## Required Environment For Live Trading
 
@@ -179,6 +183,8 @@ Optional:
 $env:POLYMARKET_CLOB_HOST="https://clob.polymarket.com"
 $env:POLYMARKET_SIGNATURE_TYPE="..."
 $env:POLYMARKET_FUNDER_ADDRESS="..."
+$env:POLYMARKET_WALLET_BALANCE_TTL_SECONDS="60"
+$env:POLYGON_RPC_URL="https://..."
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
 $env:RECONCILE_ON_STARTUP="true"

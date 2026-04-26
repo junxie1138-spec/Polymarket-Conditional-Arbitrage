@@ -1,7 +1,9 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 
 from weather_arb_live import dashboard
+from weather_arb_live.wallet_balance import WalletBalance
 
 
 def _patch_dashboard_paths(monkeypatch) -> tuple[Path, Path, list[Path]]:
@@ -241,6 +243,54 @@ def test_dashboard_account_fetch_uses_snapshot(monkeypatch):
     finally:
         for path in [positions_path, log_path, *cleanup_paths]:
             path.unlink(missing_ok=True)
+
+
+def test_dashboard_account_fetch_prefers_wallet_usdc_when_clob_balance_is_zero(monkeypatch):
+    captured = {}
+
+    class FakeClobClient:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def get_address(self):
+            return "0x2222222222222222222222222222222222222222"
+
+        def update_balance_allowance(self, _params):
+            return None
+
+        def get_balance_allowance(self, _params):
+            return {"balance": "0", "allowances": {"0xabc": "0"}}
+
+    monkeypatch.setenv("POLYMARKET_API_KEY", "api-key")
+    monkeypatch.setenv("POLYMARKET_API_SECRET", "api-secret")
+    monkeypatch.setenv("POLYMARKET_API_PASSPHRASE", "api-passphrase")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "private-key")
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", "0x1111111111111111111111111111111111111111")
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "2")
+    monkeypatch.setattr("py_clob_client_v2.ClobClient", FakeClobClient)
+    monkeypatch.setattr(
+        dashboard.wallet_balance,
+        "fetch_cached_erc20_balance",
+        lambda address, ttl_seconds: WalletBalance(
+            address=address,
+            token_address="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+            token_symbol="USDC.e",
+            balance=Decimal("83.376702"),
+            rpc_url="https://rpc.test",
+        ),
+    )
+
+    snapshot = dashboard._fetch_account_snapshot_once({"clob_host": "https://clob.example"})
+
+    assert captured["kwargs"]["funder"] == "0x1111111111111111111111111111111111111111"
+    assert captured["kwargs"]["signature_type"] == 2
+    assert snapshot["balance_usd"] == 83.38
+    assert snapshot["wallet_balance_usd"] == 83.38
+    assert snapshot["clob_balance_usd"] == 0.0
+    assert snapshot["balance_source"] == "wallet_usdc"
+    assert snapshot["funder_address"] == "0x1111...1111"
+    assert snapshot["signer_address"] == "0x2222...2222"
+    assert "CLOB balance endpoint reported 0" in snapshot["warning"]
 
 
 def test_dashboard_html_uses_design_system_shell():

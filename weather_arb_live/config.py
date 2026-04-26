@@ -88,6 +88,7 @@ WS_MARKET_MAX_TOKENS = 200
 WS_MARKET_WARMUP_SECONDS = 1.5
 SAFETY_RECONCILE_INTERVAL_MINUTES = 60
 SAFETY_RECONCILE_MIN_INTERVAL_SECONDS = 300.0
+WALLET_BALANCE_TTL_SECONDS = 60.0
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -205,6 +206,10 @@ def safety_reconcile_min_interval_seconds() -> float:
     return max(60.0, env_float("SAFETY_RECONCILE_MIN_INTERVAL_SECONDS", SAFETY_RECONCILE_MIN_INTERVAL_SECONDS))
 
 
+def wallet_balance_ttl_seconds() -> float:
+    return max(15.0, env_float("POLYMARKET_WALLET_BALANCE_TTL_SECONDS", WALLET_BALANCE_TTL_SECONDS))
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     dry_run: bool
@@ -227,6 +232,7 @@ class RuntimeConfig:
     ws_market_warmup_seconds: float
     safety_reconcile_interval_seconds: float
     safety_reconcile_min_interval_seconds: float
+    wallet_balance_ttl_seconds: float
 
 
 def load_runtime_config() -> RuntimeConfig:
@@ -251,4 +257,5 @@ def load_runtime_config() -> RuntimeConfig:
         ws_market_warmup_seconds=ws_market_warmup_seconds(),
         safety_reconcile_interval_seconds=safety_reconcile_interval_seconds(),
         safety_reconcile_min_interval_seconds=safety_reconcile_min_interval_seconds(),
+        wallet_balance_ttl_seconds=wallet_balance_ttl_seconds(),
     )

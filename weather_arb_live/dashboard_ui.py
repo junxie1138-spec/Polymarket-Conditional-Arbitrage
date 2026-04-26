@@ -1204,7 +1204,9 @@ DASHBOARD_HTML = """<!doctype html>
       setText(
         "accountSub",
         account.status === "ok"
-          ? `Allowance ${account.allowance_usd === null || account.allowance_usd === undefined ? "-" : formatMoney(account.allowance_usd)}`
+          ? account.balance_source === "wallet_usdc"
+            ? `${account.wallet_token || "Wallet"} / CLOB ${formatMoney(account.clob_balance_usd)}`
+            : `Allowance ${account.allowance_usd === null || account.allowance_usd === undefined ? "-" : formatMoney(account.allowance_usd)}`
           : account.error || account.status_label
       );
 
@@ -1233,6 +1235,7 @@ DASHBOARD_HTML = """<!doctype html>
       appendKv(el, "User WS", pill(runtime.user_ws_enabled ? "Enabled" : "Disabled", runtime.user_ws_enabled ? "status-live" : "status-dry"));
       appendKv(el, "Quote stale", `${runtime.ws_market_stale_seconds}s`, { mono: true });
       appendKv(el, "Safety check", `${runtime.safety_reconcile_interval_seconds}s`, { mono: true });
+      appendKv(el, "Wallet balance TTL", `${runtime.wallet_balance_ttl_seconds}s`, { mono: true });
       appendKv(el, "Data dir", shortPath(runtime.data_dir), { mono: true, small: true });
       appendKv(el, "Log dir", shortPath(runtime.log_dir), { mono: true, small: true });
     }
@@ -1246,10 +1249,20 @@ DASHBOARD_HTML = """<!doctype html>
       status.className = `pill ${statusKind}`;
       status.textContent = account.status_label || "-";
 
-      appendKv(el, "Collateral balance", formatMoney(account.balance_usd), { mono: true });
-      appendKv(el, "Collateral allowance", formatMoney(account.allowance_usd), { mono: true });
+      appendKv(el, "Account balance", formatMoney(account.balance_usd), { mono: true });
+      if (account.wallet_balance_usd !== null && account.wallet_balance_usd !== undefined) {
+        appendKv(el, `Wallet ${account.wallet_token || "USDC"}`, formatMoney(account.wallet_balance_usd), { mono: true });
+      }
+      appendKv(el, "CLOB balance", formatMoney(account.clob_balance_usd), { mono: true });
+      appendKv(el, "CLOB allowance", formatMoney(account.clob_allowance_usd), { mono: true });
+      appendKv(el, "Balance source", account.balance_source || "-", { mono: true });
+      if (account.funder_address) appendKv(el, "Funder", account.funder_address, { mono: true });
+      if (account.signer_address) appendKv(el, "Signer", account.signer_address, { mono: true });
+      if (account.signature_type) appendKv(el, "Signature type", account.signature_type, { mono: true });
       appendKv(el, "Status", account.status || "-", { mono: true });
       appendKv(el, "Updated", formatCompactDate(account.updated_at));
+      if (account.warning) appendKv(el, "Warning", account.warning, { small: true });
+      if (account.wallet_error) appendKv(el, "Wallet error", account.wallet_error, { small: true });
       if (account.error) appendKv(el, "Error", account.error, { small: true });
     }
 
