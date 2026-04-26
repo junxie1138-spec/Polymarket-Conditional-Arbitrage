@@ -2,7 +2,7 @@
 
 Standalone live bot for the fixed_v1_no (Combined) Polymarket weather arbitrage strategy. It is intentionally separated from the backtesting repository and carries only the runtime strategy/model code needed to poll active weather markets, compute fixed_v1_no entries, and place dry-run or live CLOB orders.
 
-The model evaluates YES first using fixed_v1 gates. If YES does not qualify on price, probability, edge, or calibration, it evaluates the NO token with `1 - P(YES)`, mirrored fixed_v1 gates, and a `0.75` maximum NO entry price. It records one side per market.
+The model evaluates YES first using fixed_v1 gates. If YES does not qualify on price, probability, edge, calibration, or because the YES token does not have a two-sided live book, it evaluates the NO token with `1 - P(YES)`, mirrored fixed_v1 gates, and a `0.75` maximum NO entry price. It records one side per market.
 
 ## Safety Defaults
 
@@ -120,6 +120,11 @@ Then open `http://127.0.0.1:8765`. The dashboard reads local runtime state from
 and the seeded model artifacts. It reports whether live credentials are present
 without exposing credential values.
 
+The bot saves `data/live_positions.json` after every dry-run or live entry, so
+the dashboard should show test entries during a long scan instead of waiting
+for `cycle_end`. If you run the bot and dashboard in separate shells, keep
+`WEATHER_ARB_DATA_DIR` and `WEATHER_ARB_LOG_DIR` identical in both shells.
+
 ## Required Environment For Live Trading
 
 Set these only after dry-run validation passes:
@@ -219,4 +224,4 @@ Large backtest/raw/runtime files are intentionally ignored.
 
 ## Current CLOB SDK
 
-This implementation uses Polymarket CLOB v2 SDK conventions. Polymarket's docs state V2 is testable at `https://clob-v2.polymarket.com` before the April 28, 2026 cutover, and production moves to `https://clob.polymarket.com` after that. The bot chooses the default host dynamically unless `POLYMARKET_CLOB_HOST` is set.
+This implementation uses Polymarket CLOB v2 SDK conventions. The live bot defaults to `https://clob.polymarket.com` because Gamma active markets are production markets and the v2 test host can have sparse or empty books. Set `POLYMARKET_CLOB_HOST=https://clob-v2.polymarket.com` only when you intentionally want to validate against the test host.

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +38,6 @@ ENSEMBLE_SIGMA_FLOOR_F = 1.5
 
 CLOB_V2_TEST_HOST = "https://clob-v2.polymarket.com"
 CLOB_PRODUCTION_HOST = "https://clob.polymarket.com"
-CLOB_V2_CUTOVER_UTC = datetime(2026, 4, 28, 11, 0, tzinfo=timezone.utc)
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
 
@@ -68,10 +66,9 @@ def enable_no_side() -> bool:
     return env_bool("ENABLE_NO_SIDE", ENABLE_NO_SIDE)
 
 
-def default_clob_host(now: datetime | None = None) -> str:
-    current = now or datetime.now(timezone.utc)
-    if current < CLOB_V2_CUTOVER_UTC:
-        return CLOB_V2_TEST_HOST
+def default_clob_host(now=None) -> str:
+    # Gamma returns production markets, so the live bot should read production books
+    # unless a caller explicitly opts into the v2 test host.
     return CLOB_PRODUCTION_HOST
 
 

@@ -82,6 +82,48 @@ def test_run_one_cycle_records_dry_run_position(monkeypatch):
             path.unlink()
 
 
+def test_record_entry_saves_position_immediately(monkeypatch):
+    path = Path("data/test_bot_immediate_positions.json")
+    if path.exists():
+        path.unlink()
+    plan = TradePlan(
+        market_id="m1",
+        token_id="yes-token",
+        side="YES",
+        question="Q",
+        city="New York",
+        target_date="2026-04-27",
+        market_price=0.30,
+        entry_price=0.3015,
+        shares=165.837,
+        position_usd=50.0,
+        forecast_prob=0.80,
+        edge=0.50,
+        lead_days=3,
+        entry_time=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+    monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
+
+    logger = logging.getLogger("test_live_bot_immediate")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=PositionLedger(path).load(),
+        logger=logger,
+    )
+
+    try:
+        bot._record_entry(Decision.enter(plan), {})
+
+        loaded = PositionLedger(path).load()
+        assert loaded.positions["m1"]["dry_run"] is True
+    finally:
+        if path.exists():
+            path.unlink()
+
+
 class FakeNoSideFetcher:
     def fetch_active_markets(self, **_kwargs):
         return [{"id": "m2", "conditionId": "c2"}]
@@ -151,6 +193,74 @@ def test_run_one_cycle_falls_back_to_no_side(monkeypatch):
         assert "m2" in bot.ledger.positions
         assert bot.ledger.positions["m2"]["side"] == "NO"
         assert bot.ledger.positions["m2"]["token_id"] == "no-token"
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+class FakeMissingYesBookFetcher:
+    def __init__(self):
+        self.tokens: list[str] = []
+
+    def fetch_active_markets(self, **_kwargs):
+        return [{"id": "m2", "conditionId": "c2"}]
+
+    def fetch_midpoint(self, token_id):
+        self.tokens.append(token_id)
+        return {"yes-token": None, "no-token": 0.30}[token_id]
+
+
+def test_run_one_cycle_falls_back_to_no_side_when_yes_book_missing(monkeypatch):
+    path = Path("data/test_bot_missing_yes_book_positions.json")
+    if path.exists():
+        path.unlink()
+    no_plan = TradePlan(
+        market_id="m2",
+        token_id="no-token",
+        side="NO",
+        question="Q",
+        city="New York",
+        target_date="2026-04-27",
+        market_price=0.30,
+        entry_price=0.3015,
+        shares=165.837,
+        position_usd=50.0,
+        forecast_prob=0.80,
+        edge=0.4985,
+        lead_days=3,
+        entry_time=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+    def fake_evaluate(_market, current_price, **kwargs):
+        side = kwargs.get("side", "YES")
+        if current_price is None:
+            token_id = "yes-token" if side == "YES" else "no-token"
+            return Decision.skip("missing_live_price", market_id="m2", token_id=token_id, side=side)
+        if side == "YES":
+            raise AssertionError("YES should not be evaluated after a missing book")
+        return Decision.enter(no_plan)
+
+    monkeypatch.setattr("weather_arb_live.live_bot.evaluate_market", fake_evaluate)
+    monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
+
+    logger = logging.getLogger("test_live_bot_missing_yes_book")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    fetcher = FakeMissingYesBookFetcher()
+    bot = LiveBot(
+        fetcher=fetcher,
+        order_placer=FakeNoSideOrderPlacer(),
+        ledger=PositionLedger(path).load(),
+        logger=logger,
+    )
+    bot.calibration = None
+
+    try:
+        bot.run_one_cycle()
+
+        assert fetcher.tokens == ["yes-token", "no-token"]
+        assert "m2" in bot.ledger.positions
+        assert bot.ledger.positions["m2"]["side"] == "NO"
     finally:
         if path.exists():
             path.unlink()

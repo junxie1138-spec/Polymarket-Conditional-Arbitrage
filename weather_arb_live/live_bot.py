@@ -22,6 +22,7 @@ YES_TO_NO_FALLBACK_REASONS = frozenset(
         "below_min_forecast_probability",
         "below_min_edge",
         "calibration_rejected",
+        "missing_two_sided_book",
     }
 )
 
@@ -308,6 +309,7 @@ class LiveBot:
             order_response=result.response,
         )
         entered_positions[plan.market_id] = row
+        self.ledger.save()
         self.logger.info(
             "decision_enter market_id=%s side=%s token_id=%s price=%.4f entry=%.4f "
             "shares=%.4f position_usd=%.2f forecast_prob=%.4f edge=%.4f posted=%s",
