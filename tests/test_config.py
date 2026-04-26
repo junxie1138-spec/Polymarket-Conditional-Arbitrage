@@ -62,3 +62,9 @@ def test_max_position_usd_rejects_non_positive_env(monkeypatch):
         assert "MAX_POSITION_USD" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_event_snapshot_interval_uses_minutes_with_one_minimum(monkeypatch):
+    monkeypatch.setenv("EVENT_SNAPSHOT_INTERVAL_MINUTES", "0.5")
+
+    assert config.event_snapshot_interval_seconds() == 60.0

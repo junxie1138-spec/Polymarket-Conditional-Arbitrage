@@ -93,6 +93,7 @@ $env:POLYMARKET_WS_MARKET_MAX_TOKENS="200"
 $env:POLYMARKET_WS_MARKET_WARMUP_SECONDS="1.5"
 $env:SAFETY_RECONCILE_INTERVAL_MINUTES="60"
 $env:SAFETY_RECONCILE_MIN_INTERVAL_SECONDS="300"
+$env:EVENT_SNAPSHOT_INTERVAL_MINUTES="5"
 ```
 
 `POLYMARKET_WS_MARKET_MAX_TOKENS` caps the active token subscription set to
@@ -213,7 +214,36 @@ uv run python -m weather_arb_live.live_bot
 
 - `logs/live_bot.log` contains startup, skip, enter, and order logs.
 - `data/live_positions.json` tracks entered markets across restarts.
+- `data/live_events.jsonl` is an append-only structured event log for bot
+  actions such as `signal_generated`, `order_submitted`,
+  `order_acknowledged`, `order_partially_filled`, `order_filled`,
+  `order_cancelled`, `position_closed`, and `market_resolved`.
+- `data/market_snapshots.jsonl` and `data/forecast_snapshots.jsonl` append
+  periodic snapshots for only markets the bot has touched through a signal,
+  order, position, or reconciliation guard. The default cadence is controlled
+  by `EVENT_SNAPSHOT_INTERVAL_MINUTES=5`.
 - `data/weather_cache.json` caches Open-Meteo forecast responses.
+
+The JSONL event rows include UTC timestamps and the PnL-explanatory fields
+needed for post-live analysis: market/city/date/bracket, side, model
+probability, intended edge, bid/ask/mid, submitted limit, fill price and size,
+fees, queue/cancel timing when available, realized or mark-to-market PnL, and
+final payout when a market resolution message is observed. Unknown values are
+kept as `null` so later report code can distinguish missing telemetry from
+zero-valued outcomes.
+
+Create a daily Excel report from those append-only files with:
+
+```powershell
+uv run python -m weather_arb_live.daily_report --date 2026-04-26
+```
+
+If `--date` is omitted, the command uses today's UTC date. Reports are written
+to `reports/daily_report_YYYY-MM-DD.xlsx` and can be generated while the bot is
+running. The reader skips any incomplete JSONL line it sees during a concurrent
+append, so the bot does not need to stop for daily review. The workbook includes
+summary metrics, event counts, market-quality rows, signal-review flags, latest
+market and forecast snapshots, and raw events.
 
 When `DRY_RUN=false` and `RECONCILE_ON_STARTUP=true`, the bot queries CLOB
 open orders and Polymarket Data API positions before trading. Any live

@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from . import config, network
+from .event_log import first_float
 from .ledger import PositionLedger
 from .live_fetcher import LiveFetcher
+from .market_parser import _parse_end_date, parse_market_question
 from .order_placer import OrderPlacer
 from .strategy import token_ids_from_market
 
@@ -236,12 +238,14 @@ class Reconciler:
         ledger: PositionLedger,
         session=None,
         logger_: logging.Logger | None = None,
+        event_log=None,
     ):
         self.fetcher = fetcher
         self.order_placer = order_placer
         self.ledger = ledger
         self.session = session or network.get_session()
         self.logger = logger_ or logger
+        self.event_log = event_log
 
     def reconcile(
         self,
@@ -281,6 +285,16 @@ class Reconciler:
                     key,
                     row.get("token_id"),
                 )
+                self._emit_event_once(
+                    row,
+                    "position_closed",
+                    {
+                        **_event_payload_from_row(row),
+                        "source": "reconciliation",
+                        "requires_manual_review": True,
+                    },
+                    key=f"position_closed:{row.get('token_id') or key}",
+                )
                 continue
             matched_local += 1
             row["reconciliation"] = {
@@ -289,6 +303,7 @@ class Reconciler:
                 "reconciled_at": now.isoformat(),
                 "exchange": exposure.raw,
             }
+            self._emit_exchange_lifecycle(row=row, exposure=exposure, market=None)
 
         added_guards = 0
         for exposure in exposures:
@@ -394,14 +409,15 @@ class Reconciler:
     ) -> None:
         market_id = _market_key(market) if market else exposure.condition_id or exposure.token_id
         condition_id = _market_condition_id(market) if market else exposure.condition_id
+        parsed = _parsed_market_metadata(market)
         row = {
             "market_id": market_id,
             "condition_id": condition_id,
             "token_id": exposure.token_id,
             "side": _outcome_side_for_exposure(exposure, market),
             "question": (market or {}).get("question") or exposure.title or "",
-            "city": None,
-            "target_date": None,
+            "city": parsed.get("city"),
+            "target_date": parsed.get("target_date"),
             "market_price": exposure.price,
             "entry_price": exposure.price,
             "shares": exposure.size,
@@ -410,6 +426,10 @@ class Reconciler:
             "edge": None,
             "lead_days": None,
             "entry_time": reconciled_at.isoformat(),
+            "bracket_low": parsed.get("bracket_low"),
+            "bracket_high": parsed.get("bracket_high"),
+            "bracket_unit": parsed.get("bracket_unit"),
+            "metric": parsed.get("metric"),
             "dry_run": False,
             "order_response": {
                 "posted": "reconciled",
@@ -431,3 +451,151 @@ class Reconciler:
             exposure.token_id,
             exposure.source,
         )
+        self._emit_exchange_lifecycle(row=row, exposure=exposure, market=market)
+
+    def _emit_exchange_lifecycle(
+        self,
+        *,
+        row: dict[str, Any],
+        exposure: ExchangeExposure,
+        market: dict | None,
+    ) -> None:
+        payload = {
+            **_event_payload_from_row(row),
+            "source": "reconciliation",
+            "exchange_source": exposure.source,
+            "filled_price": exposure.price if exposure.source == "position" else None,
+            "fill_quantity": exposure.size if exposure.source == "position" else None,
+            "mark_to_market_pnl": first_float(exposure.raw, ("cashPnl", "cash_pnl")),
+            "raw": exposure.raw,
+        }
+        if market is not None:
+            payload.update(_event_payload_from_market(market, side=row.get("side")))
+
+        if exposure.source == "position":
+            key = f"order_filled:{exposure.token_id}:{exposure.size}:{exposure.price}"
+            self._emit_event_once(row, "order_filled", payload, key=key)
+            return
+
+        if exposure.source == "open_order":
+            acknowledged_key = f"order_acknowledged:{exposure.token_id}:{exposure.size}:{exposure.price}"
+            self._emit_event_once(
+                row,
+                "order_acknowledged",
+                {
+                    **payload,
+                    "submitted_limit_price": exposure.price,
+                    "remaining_quantity": exposure.size,
+                },
+                key=acknowledged_key,
+            )
+            original = first_float(exposure.raw, ("original_size",))
+            remaining = first_float(exposure.raw, ("remaining_size", "size"))
+            if original is not None and remaining is not None and 0 < remaining < original:
+                partial_key = f"order_partially_filled:{exposure.token_id}:{remaining}:{original}"
+                self._emit_event_once(
+                    row,
+                    "order_partially_filled",
+                    {
+                        **payload,
+                        "submitted_limit_price": exposure.price,
+                        "fill_quantity": original - remaining,
+                        "remaining_quantity": remaining,
+                    },
+                    key=partial_key,
+                )
+
+    def _emit_event_once(
+        self,
+        row: dict[str, Any],
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        key: str,
+    ) -> None:
+        if self.event_log is None:
+            return
+        metadata = row.setdefault("event_log", {})
+        emitted = metadata.setdefault("emitted", [])
+        if key in emitted:
+            return
+        try:
+            self.event_log.append_event(event_type, payload)
+        except Exception as exc:
+            self.logger.warning("reconcile_event_log_failed event_type=%s error=%s", event_type, exc)
+            return
+        emitted.append(key)
+
+
+def _parsed_market_metadata(market: dict | None) -> dict[str, Any]:
+    if not market:
+        return {}
+    question = market.get("question") or ""
+    end_date_hint = _parse_end_date(market.get("endDate") or market.get("_event_endDate"))
+    parsed = parse_market_question(question, end_date_hint=end_date_hint)
+    if not parsed:
+        return {}
+    return {
+        "city": parsed.get("city"),
+        "target_date": parsed.get("date").isoformat() if parsed.get("date") else None,
+        "bracket_low": parsed.get("bracket_low"),
+        "bracket_high": parsed.get("bracket_high"),
+        "bracket_unit": parsed.get("unit"),
+        "metric": parsed.get("metric"),
+    }
+
+
+def _bracket_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    bracket = row.get("bracket")
+    if isinstance(bracket, dict):
+        return bracket
+    if not any(row.get(key) is not None for key in ("bracket_low", "bracket_high", "bracket_unit", "metric")):
+        return None
+    return {
+        "low": row.get("bracket_low"),
+        "high": row.get("bracket_high"),
+        "unit": row.get("bracket_unit"),
+        "metric": row.get("metric"),
+    }
+
+
+def _event_payload_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    exchange = {}
+    order_response = row.get("order_response") if isinstance(row.get("order_response"), dict) else {}
+    if isinstance(order_response.get("exchange"), dict):
+        exchange = order_response["exchange"]
+    return {
+        "market_id": row.get("market_id"),
+        "condition_id": row.get("condition_id"),
+        "token_id": row.get("token_id"),
+        "city": row.get("city"),
+        "target_date": row.get("target_date"),
+        "bracket": _bracket_from_row(row),
+        "side": row.get("side"),
+        "model_probability": row.get("forecast_prob"),
+        "intended_edge": row.get("edge"),
+        "submitted_limit_price": row.get("entry_price"),
+        "filled_price": first_float(row, ("filled_price", "avgPrice", "price")) or first_float(exchange, ("avgPrice", "price")),
+        "fill_quantity": first_float(row, ("fill_quantity", "shares", "size")) or first_float(exchange, ("size",)),
+        "realized_pnl": first_float(row, ("realized_pnl", "cashPnl", "cash_pnl")) or first_float(exchange, ("cashPnl", "cash_pnl")),
+        "mark_to_market_pnl": first_float(row, ("mark_to_market_pnl", "cashPnl", "cash_pnl")) or first_float(exchange, ("cashPnl", "cash_pnl")),
+    }
+
+
+def _event_payload_from_market(market: dict, *, side: Any = None) -> dict[str, Any]:
+    metadata = _parsed_market_metadata(market)
+    return {
+        "market_id": _market_key(market),
+        "condition_id": _market_condition_id(market) or None,
+        "city": metadata.get("city"),
+        "target_date": metadata.get("target_date"),
+        "bracket": {
+            "low": metadata.get("bracket_low"),
+            "high": metadata.get("bracket_high"),
+            "unit": metadata.get("bracket_unit"),
+            "metric": metadata.get("metric"),
+        }
+        if metadata
+        else None,
+        "side": side,
+    }

@@ -18,6 +18,16 @@ class LiveMarketSnapshot:
     yes_midpoint: float
 
 
+@dataclass(frozen=True)
+class LiveQuote:
+    token_id: str
+    best_bid: float | None
+    best_ask: float | None
+    midpoint: float | None
+    source: str
+    updated_at: float | None = None
+
+
 def _as_float(value) -> float | None:
     try:
         return float(value)
@@ -50,6 +60,24 @@ def midpoint_from_book(book: dict) -> float | None:
     if best_bid <= 0.0 or best_ask >= 1.0 or best_bid > best_ask:
         return None
     return round((best_bid + best_ask) / 2.0, 10)
+
+
+def quote_from_book(book: dict, *, token_id: str, source: str = "rest_book") -> LiveQuote | None:
+    bids = _prices_from_side(book.get("bids") or book.get("buy") or [])
+    asks = _prices_from_side(book.get("asks") or book.get("sell") or [])
+    if not bids or not asks:
+        return None
+    best_bid = max(bids)
+    best_ask = min(asks)
+    if best_bid <= 0.0 or best_ask >= 1.0 or best_bid > best_ask:
+        return None
+    return LiveQuote(
+        token_id=token_id,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        midpoint=round((best_bid + best_ask) / 2.0, 10),
+        source=source,
+    )
 
 
 class LiveFetcher:
@@ -129,16 +157,27 @@ class LiveFetcher:
             return data
         raise ValueError(f"unexpected order book response for token_id={token_id}")
 
-    def fetch_midpoint(self, token_id: str) -> float | None:
+    def fetch_quote(self, token_id: str) -> LiveQuote | None:
         if self.price_cache is not None:
-            midpoint = self.price_cache.midpoint(
+            quote = self.price_cache.quote(
                 token_id,
                 max_age_seconds=self.ws_stale_seconds,
             )
-            if midpoint is not None:
-                logger.debug("price_cache_hit token_id=%s midpoint=%.4f", token_id, midpoint)
-                return midpoint
-        return midpoint_from_book(self.fetch_order_book(token_id))
+            if quote is not None and quote.midpoint is not None:
+                logger.debug("price_cache_hit token_id=%s midpoint=%.4f", token_id, quote.midpoint)
+                return LiveQuote(
+                    token_id=quote.token_id,
+                    best_bid=quote.best_bid,
+                    best_ask=quote.best_ask,
+                    midpoint=quote.midpoint,
+                    source=quote.source,
+                    updated_at=quote.updated_at,
+                )
+        return quote_from_book(self.fetch_order_book(token_id), token_id=token_id)
+
+    def fetch_midpoint(self, token_id: str) -> float | None:
+        quote = self.fetch_quote(token_id)
+        return None if quote is None else quote.midpoint
 
     def fetch_yes_midpoint(self, token_id: str) -> float | None:
         return self.fetch_midpoint(token_id)

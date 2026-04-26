@@ -22,11 +22,18 @@ def test_order_intent_uses_slippage_and_position_cap():
 
 def test_dry_run_order_does_not_require_credentials():
     placer = OrderPlacer(dry_run=True, clob_host="https://example.invalid")
+    attempts = []
 
-    result = placer.place_yes_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+    result = placer.place_order(
+        token_id="yes-token",
+        market_price=0.40,
+        position_usd=1.0,
+        on_submit_attempt=lambda intent, attempt: attempts.append((attempt, intent.dry_run)),
+    )
 
     assert result.posted is False
     assert result.response == {"dry_run": True}
+    assert attempts == [(0, True)]
 
 
 def test_live_order_retries_retryable_http_error(monkeypatch):
@@ -124,12 +131,19 @@ def test_live_order_uses_lowest_allowance_from_allowance_map():
 
 def test_live_order_posts_after_successful_balance_preflight():
     placer = BalanceGuardPlacer({"balance": "100", "allowance": "100"})
+    attempts = []
 
-    result = placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+    result = placer.place_order(
+        token_id="yes-token",
+        market_price=0.40,
+        position_usd=1.0,
+        on_submit_attempt=lambda intent, attempt: attempts.append((attempt, intent.limit_price)),
+    )
 
     assert placer.posted is True
     assert result.posted is True
     assert result.response == {"success": True}
+    assert attempts == [(1, 0.40 * 1.005)]
 
 
 def test_live_order_rejects_error_response_without_marking_posted():

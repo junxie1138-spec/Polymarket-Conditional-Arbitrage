@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 from . import config, network
+from .event_log import market_resolved_payload, order_lifecycle_events_from_payload
 from .strategy import token_ids_from_market
 
 
@@ -544,11 +545,13 @@ class PolymarketMarketStream:
         base_url: str | None = None,
         logger_: logging.Logger | None = None,
         max_tokens: int | None = None,
+        event_log=None,
     ):
         self.cache = cache
         self.max_tokens = max_tokens if max_tokens is not None else config.ws_market_max_tokens()
         stream_url = f"{(base_url or config.polymarket_ws_base_url()).rstrip('/')}/market"
         self._logger = logger_ or logger
+        self._event_log = event_log
         self._stream = _SubscriptionStream(
             name="market",
             url=stream_url,
@@ -610,6 +613,16 @@ class PolymarketMarketStream:
                 payload.get("event_type"),
                 payload.get("market") or payload.get("condition_id") or payload.get("id"),
             )
+            if payload.get("event_type") == "market_resolved":
+                self._record_market_resolved(payload)
+
+    def _record_market_resolved(self, payload: dict[str, Any]) -> None:
+        if self._event_log is None:
+            return
+        try:
+            self._event_log.append_event("market_resolved", market_resolved_payload(payload))
+        except Exception as exc:
+            self._logger.warning("market_resolved_event_log_failed error=%s", exc)
 
 
 class RecentUserEvents:
@@ -633,10 +646,12 @@ class PolymarketUserStream:
         base_url: str | None = None,
         logger_: logging.Logger | None = None,
         events: RecentUserEvents | None = None,
+        event_log=None,
     ):
         self.events = events or RecentUserEvents()
         stream_url = f"{(base_url or config.polymarket_ws_base_url()).rstrip('/')}/user"
         self._logger = logger_ or logger
+        self._event_log = event_log
         self._stream = _SubscriptionStream(
             name="user",
             url=stream_url,
@@ -720,3 +735,13 @@ class PolymarketUserStream:
             payload.get("id"),
             payload.get("status"),
         )
+        self._record_user_event(payload)
+
+    def _record_user_event(self, payload: dict[str, Any]) -> None:
+        if self._event_log is None:
+            return
+        try:
+            for event_type, event_payload in order_lifecycle_events_from_payload(payload):
+                self._event_log.append_event(event_type, event_payload)
+        except Exception as exc:
+            self._logger.warning("user_ws_event_log_failed error=%s", exc)
