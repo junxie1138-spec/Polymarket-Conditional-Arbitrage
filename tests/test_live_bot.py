@@ -40,6 +40,7 @@ def _jsonl(path: Path):
 
 
 def test_run_one_cycle_records_dry_run_position(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_positions.json")
     if path.exists():
         path.unlink()
@@ -91,6 +92,7 @@ def test_run_one_cycle_records_dry_run_position(monkeypatch):
 
 
 def test_record_entry_saves_position_immediately(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_immediate_positions.json")
     if path.exists():
         path.unlink()
@@ -225,6 +227,7 @@ class FakeNoSideOrderPlacer:
 
 
 def test_run_one_cycle_falls_back_to_no_side(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_no_positions.json")
     if path.exists():
         path.unlink()
@@ -292,6 +295,7 @@ class FakeMissingYesBookFetcher:
 
 
 def test_run_one_cycle_falls_back_to_no_side_when_yes_book_missing(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "true")
     path = Path("data/test_bot_missing_yes_book_positions.json")
     if path.exists():
         path.unlink()

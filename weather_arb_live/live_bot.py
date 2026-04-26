@@ -171,6 +171,15 @@ class LiveBot:
             },
         )
         self._log_artifact_status()
+        if not self.runtime.dry_run and hasattr(self.order_placer, "ensure_api_credentials"):
+            try:
+                self.order_placer.ensure_api_credentials()
+            except Exception as exc:
+                self.logger.exception("startup_auth_error error=%s", exc)
+                self.event_log.append_event(
+                    "startup_auth_failed",
+                    {"error": str(exc)},
+                )
         if self.runtime.reconcile_on_startup and not self.runtime.dry_run:
             self._ensure_reconciled()
 
