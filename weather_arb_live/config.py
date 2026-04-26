@@ -50,6 +50,7 @@ SIGMA_CACHE_PATH = DATA_DIR / "sigma_cache.json"
 RESIDUALS_CACHE_PATH = DATA_DIR / "empirical_residuals.json"
 CALIBRATION_PATH = DATA_DIR / "calibration_table.json"
 POSITIONS_PATH = DATA_DIR / "live_positions.json"
+PNL_HISTORY_PATH = DATA_DIR / "pnl_history.json"
 
 DATA_API_BASE_URL = "https://data-api.polymarket.com"
 MIN_EDGE = 0.12

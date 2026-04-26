@@ -17,6 +17,7 @@ def _patch_dashboard_paths(monkeypatch) -> tuple[Path, Path, list[Path]]:
     sigma_path = data_dir / "test_dashboard_sigma_cache.json"
     calibration_path = data_dir / "test_dashboard_calibration_table.json"
     patched_positions_path = data_dir / "test_dashboard_live_positions.json"
+    patched_pnl_history_path = data_dir / "test_dashboard_pnl_history.json"
     patched_log_path = log_dir / "test_dashboard_live_bot.log"
 
     monkeypatch.setattr(dashboard.config, "DATA_DIR", data_dir)
@@ -27,12 +28,14 @@ def _patch_dashboard_paths(monkeypatch) -> tuple[Path, Path, list[Path]]:
     monkeypatch.setattr(dashboard.config, "SIGMA_CACHE_PATH", sigma_path)
     monkeypatch.setattr(dashboard.config, "CALIBRATION_PATH", calibration_path)
     monkeypatch.setattr(dashboard, "LOG_PATH", patched_log_path)
+    monkeypatch.setattr(dashboard.config, "PNL_HISTORY_PATH", patched_pnl_history_path)
     cleanup_paths = [
         weather_cache_path,
         residuals_path,
         sigma_path,
         calibration_path,
         patched_positions_path,
+        patched_pnl_history_path,
         patched_log_path,
     ]
     return patched_positions_path, patched_log_path, cleanup_paths
@@ -126,6 +129,11 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
         assert summary["total_recorded_position_usd"] == 75
         assert summary["pnl_count"] == 2
         assert summary["total_pnl_usd"] == 0
+        assert summary["win_count"] == 1
+        assert summary["loss_count"] == 1
+        assert summary["flat_count"] == 0
+        assert summary["win_rate_count"] == 2
+        assert summary["win_rate"] == 0.5
         assert state["positions"]["pnl_curve"] == [
             {
                 "entry_time": "2026-04-25T08:00:00+00:00",
@@ -144,6 +152,10 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
                 "cumulative_pnl_usd": 0,
             },
         ]
+        assert state["positions"]["pnl_history"][-1]["pnl_usd"] == 0
+        assert state["positions"]["pnl_history"][-1]["position_usd"] == 50
+        assert state["positions"]["pnl_history"][-1]["position_count"] == 2
+        assert state["positions"]["pnl_history"][-1]["source"] == "live_marks"
         assert state["positions"]["recent"][0]["market_id"] == "m2"
         assert state["positions"]["recent"][0]["position_usd"] == 25
         assert state["positions"]["recent"][0]["pnl_usd"] == -5
@@ -299,8 +311,13 @@ def test_dashboard_html_uses_design_system_shell():
     assert "mode-dot" in dashboard.DASHBOARD_HTML
     assert "drawer-backdrop" in dashboard.DASHBOARD_HTML
     assert "tail / live_bot.log" in dashboard.DASHBOARD_HTML
-    assert "Cumulative PnL" in dashboard.DASHBOARD_HTML
+    assert "PnL History" in dashboard.DASHBOARD_HTML
     assert "pnlChart" in dashboard.DASHBOARD_HTML
+    assert "pnlRange" in dashboard.DASHBOARD_HTML
+    assert "data-pnl-range" in dashboard.DASHBOARD_HTML
+    assert "pnlChartReadout" in dashboard.DASHBOARD_HTML
+    assert "Win rate" in dashboard.DASHBOARD_HTML
+    assert "winRateMetric" in dashboard.DASHBOARD_HTML
     assert "Account balance" in dashboard.DASHBOARD_HTML
     assert "accountDetails" in dashboard.DASHBOARD_HTML
     assert "PnL" in dashboard.DASHBOARD_HTML
