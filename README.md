@@ -44,9 +44,9 @@ uv run pytest -p no:cacheprovider
 
 ## Environment Variables
 
-The bot reads environment variables from the current process. PowerShell does
-not automatically load `.env`, so either set variables directly in the shell or
-load them before running the bot.
+The bot and dashboard automatically load simple `KEY=value` settings from the
+repo-root `.env` file. Variables already set in the shell take precedence over
+`.env`, which is useful for one-off validation overrides.
 
 Start by creating a local env file from the example:
 
@@ -62,7 +62,7 @@ $env:DRY_RUN="true"
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
 $env:RECONCILE_ON_STARTUP="true"
-$env:MAX_POSITION_USD="50"
+$env:MAX_POSITION_USD="2.50"
 $env:ENABLE_NO_SIDE="true"
 ```
 
@@ -75,15 +75,10 @@ $env:LIVE_MARKET_LIMIT="10"
 Use `LIVE_MARKET_LIMIT=10` for bounded validation. Use `0` or leave it unset
 for the full live weather market scan.
 
-To load simple `KEY=value` lines from `.env` into the current PowerShell
-session:
-
-```powershell
-Get-Content .env | Where-Object { $_ -and -not $_.StartsWith("#") } | ForEach-Object {
-    $name, $value = $_ -split "=", 2
-    Set-Item -Path "Env:$name" -Value $value
-}
-```
+The effective cap is logged at startup as `max_position_usd=...` and shown in
+the dashboard runtime panel. Existing rows in `data/live_positions.json` keep
+the position size they were recorded with; old dry-run rows are not
+retroactively resized when you lower `MAX_POSITION_USD`.
 
 ## Dry-Run Commands
 
@@ -153,7 +148,7 @@ $env:POLYMARKET_FUNDER_ADDRESS="..."
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
 $env:RECONCILE_ON_STARTUP="true"
-$env:MAX_POSITION_USD="50"
+$env:MAX_POSITION_USD="2.50"
 $env:LIVE_MARKET_LIMIT="0"
 $env:ENABLE_NO_SIDE="true"
 ```

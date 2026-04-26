@@ -48,6 +48,23 @@ def test_enter_when_fixed_v1_gates_pass():
     assert decision.plan.lead_days == 3
 
 
+def test_enter_uses_configured_max_position_when_not_overridden(monkeypatch):
+    monkeypatch.setenv("MAX_POSITION_USD", "2.50")
+
+    decision = evaluate_market(
+        market(),
+        0.30,
+        as_of=AS_OF,
+        entered_positions={},
+        forecast_probability_fn=forecast(0.80),
+    )
+
+    assert decision.action == "ENTER"
+    assert decision.plan is not None
+    assert decision.plan.position_usd == 2.5
+    assert decision.plan.shares == pytest.approx(2.5 / decision.plan.entry_price)
+
+
 def test_skip_already_entered_market():
     decision = evaluate_market(
         market(),

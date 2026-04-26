@@ -77,7 +77,8 @@ class LiveBot:
         self.calibration = load_calibration()
         self.logger.info(
             "startup model=%s variant=%s no_side=%s dry_run=%s clob_host=%s "
-            "poll_interval_seconds=%s offline_retry_seconds=%s reconcile_on_startup=%s positions=%s",
+            "poll_interval_seconds=%s offline_retry_seconds=%s reconcile_on_startup=%s "
+            "max_position_usd=%.2f positions=%s",
             self.runtime.model_name,
             self.runtime.model_variant,
             self.runtime.enable_no_side,
@@ -86,6 +87,7 @@ class LiveBot:
             self.runtime.poll_interval_seconds,
             self.runtime.offline_retry_seconds,
             self.runtime.reconcile_on_startup,
+            self.runtime.max_position_usd,
             len(self.ledger.positions),
         )
         self._log_artifact_status()

@@ -94,7 +94,11 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
         )
         monkeypatch.setenv("DRY_RUN", "false")
         monkeypatch.setenv("POLL_INTERVAL_MINUTES", "10")
+        monkeypatch.setenv("MAX_POSITION_USD", "25")
         monkeypatch.setenv("POLYMARKET_API_KEY", "secret-api-key")
+        monkeypatch.delenv("POLYMARKET_API_SECRET", raising=False)
+        monkeypatch.delenv("POLYMARKET_API_PASSPHRASE", raising=False)
+        monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
 
         state = dashboard.build_dashboard_state(log_limit=10)
 
@@ -106,8 +110,11 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
         assert summary["no_count"] == 1
         assert summary["unknown_posted"] == 1
         assert summary["manual_review"] == 1
+        assert summary["over_max_position_count"] == 1
         assert summary["total_position_usd"] == 75
         assert state["positions"]["recent"][0]["market_id"] == "m2"
+        assert state["positions"]["recent"][0]["over_max_position"] is False
+        assert state["positions"]["recent"][1]["over_max_position"] is True
         assert state["logs"]["level_counts"]["WARNING"] == 1
         assert state["logs"]["last_cycle_end"] == "2026-04-25 08:00:02,000"
         assert state["environment"]["live_credentials_ready"] is False
@@ -115,6 +122,10 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
         assert "secret-api-key" not in json.dumps(state)
         assert any(
             variable["name"] == "POLYMARKET_API_KEY" and variable["present"]
+            for variable in state["environment"]["variables"]
+        )
+        assert any(
+            variable["name"] == "MAX_POSITION_USD" and variable["present"]
             for variable in state["environment"]["variables"]
         )
     finally:

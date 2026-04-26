@@ -1,10 +1,47 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DOTENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _decode_dotenv_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    comment_start = value.find(" #")
+    if comment_start != -1:
+        value = value[:comment_start].rstrip()
+    return value
+
+
+def load_dotenv(path: str | Path = DOTENV_PATH, *, override: bool = False) -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        name, raw_value = line.split("=", 1)
+        name = name.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            continue
+        if override or name not in os.environ:
+            os.environ[name] = _decode_dotenv_value(raw_value)
+
+
+load_dotenv()
+
 DATA_DIR = Path(os.getenv("WEATHER_ARB_DATA_DIR", PROJECT_ROOT / "data"))
 LOG_DIR = Path(os.getenv("WEATHER_ARB_LOG_DIR", PROJECT_ROOT / "logs"))
 
@@ -93,7 +130,10 @@ def reconcile_on_startup() -> bool:
 
 
 def max_position_usd() -> float:
-    return min(MAX_POSITION_USD, env_float("MAX_POSITION_USD", MAX_POSITION_USD))
+    value = env_float("MAX_POSITION_USD", MAX_POSITION_USD)
+    if value <= 0:
+        raise ValueError("MAX_POSITION_USD must be greater than 0")
+    return min(MAX_POSITION_USD, value)
 
 
 def live_market_limit() -> int | None:
