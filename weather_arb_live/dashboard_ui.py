@@ -268,7 +268,7 @@ DASHBOARD_HTML = """<!doctype html>
 
     .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-template-columns: repeat(7, minmax(0, 1fr));
       gap: var(--s-5);
       margin-bottom: var(--s-7);
     }
@@ -513,6 +513,52 @@ DASHBOARD_HTML = """<!doctype html>
       padding: 16px;
     }
 
+    .chart-toolbar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: var(--s-5);
+      padding: 10px 12px;
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-card);
+      background: var(--panel-2);
+    }
+
+    .chart-control {
+      display: grid;
+      gap: 4px;
+      min-width: 112px;
+    }
+
+    .chart-control span,
+    .chart-toggle span {
+      color: var(--muted);
+      font-size: var(--fs-microlabel);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .chart-select {
+      min-width: 112px;
+      background: var(--panel);
+    }
+
+    .chart-range {
+      height: 32px;
+    }
+
+    .chart-range button {
+      min-width: 44px;
+      padding: 0 10px;
+    }
+
+    .chart-toggle {
+      align-self: end;
+      height: 32px;
+      margin-left: auto;
+    }
+
     .pnl-chart-stats {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -586,6 +632,97 @@ DASHBOARD_HTML = """<!doctype html>
       vector-effect: non-scaling-stroke;
     }
     .pnl-chart-point.neg { stroke: var(--red); }
+    .pnl-chart-hit {
+      fill: transparent;
+      cursor: crosshair;
+    }
+    .pnl-chart-axis {
+      fill: var(--muted);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+      pointer-events: none;
+    }
+    .pnl-chart-label {
+      fill: var(--ink-2);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+      paint-order: stroke;
+      pointer-events: none;
+      stroke: var(--panel-2);
+      stroke-linejoin: round;
+      stroke-width: 4px;
+    }
+    .pnl-chart-crosshair {
+      stroke: var(--teal);
+      stroke-dasharray: 3 3;
+      stroke-width: 1;
+      opacity: 0.78;
+      pointer-events: none;
+      vector-effect: non-scaling-stroke;
+    }
+    .pnl-chart-focus {
+      fill: var(--panel);
+      stroke: var(--ink);
+      stroke-width: 2;
+      pointer-events: none;
+      vector-effect: non-scaling-stroke;
+    }
+    .pnl-chart-tooltip {
+      position: absolute;
+      z-index: 2;
+      min-width: 170px;
+      max-width: min(280px, calc(100% - 20px));
+      border: 1px solid var(--line);
+      border-radius: var(--r-card);
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: var(--e3);
+      color: var(--ink);
+      font-size: var(--fs-small);
+      line-height: 1.35;
+      padding: 8px 10px;
+      pointer-events: none;
+    }
+    .pnl-chart-tooltip strong {
+      display: block;
+      margin-bottom: 4px;
+      overflow-wrap: anywhere;
+      font-size: var(--fs-body);
+      font-weight: 600;
+    }
+    .pnl-chart-readout {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--s-5);
+      min-height: 58px;
+    }
+    .readout-item {
+      min-width: 0;
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-card);
+      background: var(--panel-2);
+      padding: 8px 10px;
+    }
+    .readout-item span {
+      display: block;
+      color: var(--muted);
+      font-family: var(--font-ui);
+      font-size: var(--fs-microlabel);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .readout-item strong {
+      display: block;
+      min-width: 0;
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+      color: var(--ink);
+      font-size: var(--fs-small);
+      font-weight: 500;
+      line-height: 1.25;
+    }
     .pnl-chart-empty {
       position: absolute;
       inset: 0;
@@ -818,6 +955,10 @@ DASHBOARD_HTML = """<!doctype html>
       .card-head-r { width: 100%; justify-content: flex-start; }
       .card-head-r .input { flex: 1 1 140px; }
       .pnl-chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .chart-control { flex: 1 1 132px; }
+      .chart-select { width: 100%; }
+      .chart-toggle { margin-left: 0; }
+      .pnl-chart-readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .kv { grid-template-columns: 1fr; gap: var(--s-2); }
       .log-row { grid-template-columns: 1fr; gap: var(--s-2); }
       .drawer-stat-grid { grid-template-columns: 1fr; }
@@ -868,6 +1009,11 @@ DASHBOARD_HTML = """<!doctype html>
         <div id="exposureSub" class="kpi-sub">-</div>
       </div>
       <div class="kpi">
+        <div class="kpi-label">Win rate</div>
+        <div id="winRateMetric" class="kpi-value">-</div>
+        <div id="winRateSub" class="kpi-sub">-</div>
+      </div>
+      <div class="kpi">
         <div class="kpi-label">Manual review</div>
         <div id="reviewMetric" class="kpi-value">-</div>
         <div id="reviewSub" class="kpi-sub">-</div>
@@ -889,22 +1035,41 @@ DASHBOARD_HTML = """<!doctype html>
         <section class="card">
           <div class="card-head">
             <div class="card-head-l">
-              <h2>Cumulative PnL</h2>
-              <span id="pnlChartMeta" class="muted card-head-meta">0 marked positions</span>
+              <h2>PnL History</h2>
+              <span id="pnlChartMeta" class="muted card-head-meta">0 PnL samples</span>
             </div>
             <div class="card-head-r"><span id="pnlChartBadge" class="pill status-dry">-</span></div>
           </div>
           <div class="pnl-chart-body">
             <div class="pnl-chart-stats">
               <div class="chart-stat"><span>Latest</span><strong id="pnlChartLatest">-</strong></div>
-              <div class="chart-stat"><span>High water</span><strong id="pnlChartHigh">-</strong></div>
-              <div class="chart-stat"><span>Low water</span><strong id="pnlChartLow">-</strong></div>
-              <div class="chart-stat"><span>Marked</span><strong id="pnlChartMarked">-</strong></div>
+              <div class="chart-stat"><span id="pnlChartHighLabel">High water</span><strong id="pnlChartHigh">-</strong></div>
+              <div class="chart-stat"><span id="pnlChartLowLabel">Low water</span><strong id="pnlChartLow">-</strong></div>
+              <div class="chart-stat"><span>Samples</span><strong id="pnlChartMarked">-</strong></div>
+            </div>
+            <div class="chart-toolbar" aria-label="PnL chart controls">
+              <label class="chart-control">
+                <span>Timeframe</span>
+                <div id="pnlRange" class="seg chart-range" role="group" aria-label="PnL timeframe">
+                  <button type="button" data-pnl-range="1h">1H</button>
+                  <button type="button" data-pnl-range="6h">6H</button>
+                  <button type="button" data-pnl-range="24h">24H</button>
+                  <button type="button" data-pnl-range="7d">7D</button>
+                  <button type="button" data-pnl-range="30d">30D</button>
+                  <button type="button" data-pnl-range="all" class="on">All</button>
+                </div>
+              </label>
+              <label class="toggle chart-toggle">
+                <input id="pnlPointLabels" type="checkbox">
+                <span>Values</span>
+              </label>
             </div>
             <div class="pnl-chart-frame">
-              <svg id="pnlChart" class="pnl-chart" viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="Cumulative PnL chart"></svg>
-              <div id="pnlChartEmpty" class="pnl-chart-empty">No marked PnL yet.</div>
+              <svg id="pnlChart" class="pnl-chart" viewBox="0 0 720 240" preserveAspectRatio="none" role="img" aria-label="PnL history chart"></svg>
+              <div id="pnlChartTooltip" class="pnl-chart-tooltip" hidden></div>
+              <div id="pnlChartEmpty" class="pnl-chart-empty">No PnL history yet.</div>
             </div>
+            <div id="pnlChartReadout" class="pnl-chart-readout"></div>
           </div>
         </section>
 
@@ -1029,6 +1194,8 @@ DASHBOARD_HTML = """<!doctype html>
       side: "all",
       sortBy: "entry_time",
       sortDir: "desc",
+      chartRange: "all",
+      chartLockedPointKey: null,
     };
     const $ = (id) => document.getElementById(id);
 
@@ -1195,6 +1362,12 @@ DASHBOARD_HTML = """<!doctype html>
       setText("positionsSub", `${positions.dry_run} dry run / ${positions.live} live`);
       setText("exposureMetric", formatMoney(positions.total_position_usd));
       setText("exposureSub", `${positions.yes_count} YES / ${positions.no_count} NO / PnL ${positions.pnl_count ? formatSignedMoney(positions.total_pnl_usd) : "-"}`);
+      const winRateCount = Number(positions.win_rate_count || 0);
+      const winCount = Number(positions.win_count || 0);
+      const lossCount = Number(positions.loss_count || 0);
+      const flatCount = Number(positions.flat_count || 0);
+      setText("winRateMetric", winRateCount ? formatPct(positions.win_rate) : "-");
+      setText("winRateSub", `${winCount}W / ${lossCount}L${flatCount ? ` / ${flatCount} flat` : ""}`);
       setText("reviewMetric", positions.manual_review);
       setText("reviewSub", `${positions.unknown_posted} unknown posted`);
       setText("activityMetric", health.activity_label);
@@ -1211,6 +1384,10 @@ DASHBOARD_HTML = """<!doctype html>
       );
 
       updateMetricClass("reviewMetric", positions.manual_review > 0 ? "is-bad" : "");
+      updateMetricClass(
+        "winRateMetric",
+        !winRateCount ? "" : Number(positions.win_rate) >= 0.5 ? "is-good" : "is-warn"
+      );
       updateMetricClass("activityMetric", health.activity === "stale" ? "is-warn" : "");
       updateMetricClass(
         "accountMetric",
@@ -1392,49 +1569,227 @@ DASHBOARD_HTML = """<!doctype html>
       return points.map((point, index) => `${index ? "L" : "M"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
     }
 
+    const CHART_RANGES = {
+      all: null,
+      "1h": 60 * 60 * 1000,
+      "6h": 6 * 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+      "30d": 30 * 24 * 60 * 60 * 1000,
+      "90d": 90 * 24 * 60 * 60 * 1000,
+    };
+
+    const CHART_RANGE_LABELS = {
+      all: "All",
+      "1h": "1H",
+      "6h": "6H",
+      "24h": "24H",
+      "7d": "7D",
+      "30d": "30D",
+      "90d": "90D",
+    };
+
+    function parseTimestampMs(value) {
+      if (!value) return null;
+      const ms = Date.parse(value);
+      return Number.isNaN(ms) ? null : ms;
+    }
+
+    function normalizePnlHistory(data) {
+      const summary = data.positions.summary || {};
+      const rawHistory = Array.isArray(data.positions.pnl_history) ? data.positions.pnl_history : [];
+      const points = rawHistory
+        .map((point, index) => {
+          const timestamp = point.timestamp || point.generated_at || point.time;
+          const timeMs = parseTimestampMs(timestamp);
+          const pnl = Number(point.pnl_usd);
+          const positionUsd = Number(point.position_usd);
+          return {
+            sourceIndex: index,
+            key: `${timestamp || ""}|${index}`,
+            timestamp,
+            timeMs,
+            pnl: Number.isNaN(pnl) ? null : pnl,
+            positionUsd: Number.isNaN(positionUsd) ? null : positionUsd,
+            positionCount: Number(point.position_count || 0),
+            pnlCount: Number(point.pnl_count || 0),
+            markCount: Number(point.mark_count || 0),
+            source: point.source || "dashboard",
+          };
+        })
+        .filter((point) => point.pnl !== null && Number.isFinite(point.timeMs));
+
+      if (!points.length && summary.pnl_count) {
+        const pnl = Number(summary.total_pnl_usd);
+        if (!Number.isNaN(pnl)) {
+          const timestamp = data.generated_at;
+          points.push({
+            sourceIndex: 0,
+            key: `${timestamp || ""}|summary`,
+            timestamp,
+            timeMs: parseTimestampMs(timestamp),
+            pnl,
+            positionUsd: Number(summary.total_position_usd || 0),
+            positionCount: Number(summary.total || 0),
+            pnlCount: Number(summary.pnl_count || 0),
+            markCount: Number(data.positions.mark_count || 0),
+            source: data.positions.mark_count ? "live_marks" : "ledger",
+          });
+        }
+      }
+
+      return points
+        .filter((point) => Number.isFinite(point.timeMs))
+        .sort((left, right) => left.timeMs - right.timeMs);
+    }
+
+    function filterPnlHistoryByRange(curve) {
+      const windowMs = CHART_RANGES[state.chartRange];
+      if (!windowMs) return curve;
+      const times = curve.map((point) => point.timeMs).filter((value) => Number.isFinite(value));
+      if (!times.length) return curve;
+      const cutoff = Math.max(...times) - windowMs;
+      const filtered = curve.filter((point) => Number.isFinite(point.timeMs) && point.timeMs >= cutoff);
+      return filtered.length ? filtered : curve.slice(-1);
+    }
+
+    function formatAxisMoney(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      const number = Number(value);
+      const sign = number < 0 ? "-" : number > 0 ? "+" : "";
+      const abs = Math.abs(number);
+      if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(abs >= 10000 ? 0 : 1)}k`;
+      if (abs >= 10) return `${sign}$${abs.toFixed(0)}`;
+      return `${sign}$${abs.toFixed(2)}`;
+    }
+
+    function chartXDisplay(point) {
+      return formatCompactDate(point.timestamp);
+    }
+
+    function appendReadoutItem(parent, label, value) {
+      const item = document.createElement("div");
+      item.className = "readout-item";
+      const labelEl = document.createElement("span");
+      labelEl.textContent = label;
+      const valueEl = document.createElement("strong");
+      valueEl.textContent = value === null || value === undefined || value === "" ? "-" : String(value);
+      item.append(labelEl, valueEl);
+      parent.append(item);
+    }
+
+    function renderChartReadout(point) {
+      const readout = $("pnlChartReadout");
+      clearNode(readout);
+      if (!point) {
+        appendReadoutItem(readout, "Time", "-");
+        appendReadoutItem(readout, "PnL", "-");
+        appendReadoutItem(readout, "Exposure", "-");
+        appendReadoutItem(readout, "Positions", "-");
+        return;
+      }
+      appendReadoutItem(readout, "Time", chartXDisplay(point));
+      appendReadoutItem(readout, "PnL", formatSignedMoney(point.pnl));
+      appendReadoutItem(readout, "Exposure", formatMoney(point.positionUsd));
+      appendReadoutItem(readout, "Positions", point.positionCount);
+      appendReadoutItem(readout, "Marks", point.markCount);
+    }
+
+    function appendTooltipLine(parent, label, value) {
+      const line = document.createElement("div");
+      line.textContent = `${label}: ${value === null || value === undefined || value === "" ? "-" : value}`;
+      parent.append(line);
+    }
+
+    function showChartTooltip(point, width, height) {
+      const tooltip = $("pnlChartTooltip");
+      clearNode(tooltip);
+      const title = document.createElement("strong");
+      title.textContent = "PnL sample";
+      tooltip.append(title);
+      appendTooltipLine(tooltip, "Time", chartXDisplay(point));
+      appendTooltipLine(tooltip, "PnL", formatSignedMoney(point.pnl));
+      appendTooltipLine(tooltip, "Exposure", formatMoney(point.positionUsd));
+      appendTooltipLine(tooltip, "Positions", point.positionCount);
+      appendTooltipLine(tooltip, "Marks", point.markCount);
+      appendTooltipLine(tooltip, "Source", point.source);
+      tooltip.hidden = false;
+
+      const svg = $("pnlChart");
+      const frame = tooltip.parentElement;
+      const svgRect = svg.getBoundingClientRect();
+      const frameRect = frame.getBoundingClientRect();
+      const pointLeft = svgRect.left - frameRect.left + (point.x / width) * svgRect.width;
+      const pointTop = svgRect.top - frameRect.top + (point.y / height) * svgRect.height;
+      let left = pointLeft + 12;
+      let top = pointTop - 8;
+      const maxLeft = Math.max(10, frameRect.width - tooltip.offsetWidth - 10);
+      const maxTop = Math.max(10, frameRect.height - tooltip.offsetHeight - 10);
+      if (left > maxLeft) left = Math.max(10, pointLeft - tooltip.offsetWidth - 12);
+      tooltip.style.left = `${Math.max(10, Math.min(maxLeft, left))}px`;
+      tooltip.style.top = `${Math.max(10, Math.min(maxTop, top))}px`;
+    }
+
     function renderPnlChart(data) {
-      const curve = (data.positions.pnl_curve || [])
-        .map((point) => ({
-          ...point,
-          value: Number(point.cumulative_pnl_usd),
-          pnl: Number(point.pnl_usd),
-        }))
-        .filter((point) => !Number.isNaN(point.value));
       const svg = $("pnlChart");
       const empty = $("pnlChartEmpty");
+      const tooltip = $("pnlChartTooltip");
       const badge = $("pnlChartBadge");
+      const fullCurve = normalizePnlHistory(data);
+      const rangedCurve = filterPnlHistoryByRange(fullCurve);
+      const curve = rangedCurve
+        .map((point, index) => ({
+          ...point,
+          visibleIndex: index,
+          yValue: point.pnl,
+        }))
+        .filter((point) => point.yValue !== null && !Number.isNaN(Number(point.yValue)));
+
       clearNode(svg);
+      tooltip.hidden = true;
+      svg.onmousemove = null;
+      svg.onclick = null;
+      svg.onmouseleave = null;
 
       if (!curve.length) {
-        setText("pnlChartMeta", "0 marked positions");
+        setText("pnlChartMeta", "0 PnL samples");
         setText("pnlChartLatest", "-");
+        setText("pnlChartHighLabel", "High water");
         setText("pnlChartHigh", "-");
+        setText("pnlChartLowLabel", "Low water");
         setText("pnlChartLow", "-");
         setText("pnlChartMarked", "0");
         badge.className = "pill status-dry";
         badge.textContent = "No PnL";
+        empty.textContent = data.positions.pnl_history_error || (fullCurve.length ? "No chartable PnL for selected timeframe." : "No PnL history yet.");
         empty.hidden = false;
+        renderChartReadout(null);
         return;
       }
 
-      const values = curve.map((point) => point.value);
-      const latest = curve[curve.length - 1].value;
+      const values = curve.map((point) => point.yValue);
+      const latest = curve[curve.length - 1].yValue;
       const high = Math.max(...values);
       const low = Math.min(...values);
       const first = curve[0];
       const last = curve[curve.length - 1];
-      setText("pnlChartMeta", `${curve.length} marked positions / ${formatCompactDate(first.entry_time)} to ${formatCompactDate(last.entry_time)}`);
+      const countLabel = curve.length === fullCurve.length ? `${curve.length} samples` : `${curve.length} of ${fullCurve.length} samples`;
+      const rangeLabel = CHART_RANGE_LABELS[state.chartRange] || "All";
+      setText("pnlChartMeta", `${countLabel} / ${rangeLabel} / ${formatCompactDate(first.timestamp)} to ${formatCompactDate(last.timestamp)}`);
       setText("pnlChartLatest", formatSignedMoney(latest));
+      setText("pnlChartHighLabel", "High water");
       setText("pnlChartHigh", formatSignedMoney(high));
+      setText("pnlChartLowLabel", "Low water");
       setText("pnlChartLow", formatSignedMoney(low));
-      setText("pnlChartMarked", curve.length);
+      setText("pnlChartMarked", curve.length === fullCurve.length ? curve.length : `${curve.length}/${fullCurve.length}`);
       badge.className = `pill ${latest >= 0 ? "status-live" : "status-review"}`;
       badge.textContent = formatSignedMoney(latest);
+      empty.textContent = "No PnL history yet.";
       empty.hidden = true;
 
-      const width = 640;
-      const height = 220;
-      const pad = { left: 16, right: 16, top: 16, bottom: 18 };
+      const width = 720;
+      const height = 240;
+      const pad = { left: 72, right: 20, top: 18, bottom: 30 };
       let minY = Math.min(0, low);
       let maxY = Math.max(0, high);
       if (minY === maxY) {
@@ -1447,16 +1802,43 @@ DASHBOARD_HTML = """<!doctype html>
       }
       const innerW = width - pad.left - pad.right;
       const innerH = height - pad.top - pad.bottom;
-      const xFor = (index) => curve.length === 1 ? width / 2 : pad.left + (index / (curve.length - 1)) * innerW;
+      const times = curve.map((point) => point.timeMs).filter((value) => Number.isFinite(value));
+      const minX = times.length ? Math.min(...times) : null;
+      const maxX = times.length ? Math.max(...times) : null;
+      const xFor = (point, index) => {
+        if (curve.length === 1) return pad.left + innerW / 2;
+        if (minX !== null && maxX !== null && minX !== maxX && Number.isFinite(point.timeMs)) {
+          return pad.left + ((point.timeMs - minX) / (maxX - minX)) * innerW;
+        }
+        return pad.left + (index / (curve.length - 1)) * innerW;
+      };
       const yFor = (value) => pad.top + ((maxY - value) / (maxY - minY)) * innerH;
-      const coords = curve.map((point, index) => ({ ...point, x: xFor(index), y: yFor(point.value) }));
+      const coords = curve.map((point, index) => ({ ...point, x: xFor(point, index), y: yFor(point.yValue) }));
       const zeroY = Math.max(pad.top, Math.min(height - pad.bottom, yFor(0)));
 
-      [0.25, 0.5, 0.75].forEach((fraction) => {
-        const y = pad.top + fraction * innerH;
+      [maxY, (maxY + minY) / 2, minY].forEach((value) => {
+        const y = yFor(value);
         svg.append(svgNode("line", { class: "pnl-chart-grid", x1: pad.left, y1: y, x2: width - pad.right, y2: y }));
+        const label = svgNode("text", { class: "pnl-chart-axis", x: pad.left - 8, y: y + 3, "text-anchor": "end" });
+        label.textContent = formatAxisMoney(value);
+        svg.append(label);
       });
       svg.append(svgNode("line", { class: "pnl-chart-zero", x1: pad.left, y1: zeroY, x2: width - pad.right, y2: zeroY }));
+
+      const xLabelPoints = coords.length === 1
+        ? [coords[0]]
+        : [coords[0], coords[Math.floor((coords.length - 1) / 2)], coords[coords.length - 1]];
+      const usedXLabels = new Set();
+      xLabelPoints.forEach((point, index) => {
+        const labelText = chartXDisplay(point);
+        if (usedXLabels.has(`${labelText}|${Math.round(point.x)}`)) return;
+        usedXLabels.add(`${labelText}|${Math.round(point.x)}`);
+        const anchor = index === 0 ? "start" : index === xLabelPoints.length - 1 ? "end" : "middle";
+        const x = index === 0 ? pad.left : index === xLabelPoints.length - 1 ? width - pad.right : point.x;
+        const label = svgNode("text", { class: "pnl-chart-axis", x, y: height - 7, "text-anchor": anchor });
+        label.textContent = labelText;
+        svg.append(label);
+      });
 
       if (coords.length > 1) {
         const lineD = chartPath(coords);
@@ -1466,20 +1848,119 @@ DASHBOARD_HTML = """<!doctype html>
       }
 
       const pointStep = Math.max(1, Math.ceil(coords.length / 80));
-      coords.forEach((point, index) => {
-        const isLast = index === coords.length - 1;
-        if (!isLast && index % pointStep !== 0) return;
+      const shouldDrawPoint = (index) => {
+        return index === coords.length - 1 || index % pointStep === 0;
+      };
+      const renderedPoints = coords.filter((_, index) => shouldDrawPoint(index));
+      renderedPoints.forEach((point) => {
+        const isLast = point.visibleIndex === coords.length - 1;
         const circle = svgNode("circle", {
-          class: `pnl-chart-point ${point.value < 0 ? "neg" : ""}`.trim(),
+          class: `pnl-chart-point ${point.yValue < 0 ? "neg" : ""}`.trim(),
           cx: point.x.toFixed(2),
           cy: point.y.toFixed(2),
           r: isLast ? 4 : 2.5,
         });
         const title = svgNode("title");
-        title.textContent = `${formatCompactDate(point.entry_time)} / ${point.market_id || "-"} / ${formatSignedMoney(point.pnl)} / cum ${formatSignedMoney(point.value)}`;
+        title.textContent = `${formatCompactDate(point.timestamp)} / ${formatSignedMoney(point.pnl)}`;
         circle.append(title);
         svg.append(circle);
       });
+
+      if ($("pnlPointLabels").checked) {
+        const labelStep = Math.max(1, Math.ceil(renderedPoints.length / 28));
+        renderedPoints.forEach((point, index) => {
+          const isLast = point.visibleIndex === coords.length - 1;
+          if (!isLast && index % labelStep !== 0) return;
+          const label = svgNode("text", {
+            class: "pnl-chart-label",
+            x: point.x.toFixed(2),
+            y: (point.y < pad.top + 18 ? point.y + 15 : point.y - 8).toFixed(2),
+            "text-anchor": point.x > width - pad.right - 70 ? "end" : point.x < pad.left + 70 ? "start" : "middle",
+          });
+          label.textContent = formatSignedMoney(point.yValue);
+          svg.append(label);
+        });
+      }
+
+      coords.forEach((point) => {
+        const hit = svgNode("circle", {
+          class: "pnl-chart-hit",
+          cx: point.x.toFixed(2),
+          cy: point.y.toFixed(2),
+          r: 10,
+        });
+        hit.addEventListener("mouseenter", () => setActivePoint(point, true));
+        hit.addEventListener("click", (event) => {
+          event.stopPropagation();
+          state.chartLockedPointKey = point.key;
+          setActivePoint(point, true);
+        });
+        svg.append(hit);
+      });
+
+      const crosshair = svgNode("line", {
+        class: "pnl-chart-crosshair",
+        x1: coords[coords.length - 1].x.toFixed(2),
+        y1: pad.top,
+        x2: coords[coords.length - 1].x.toFixed(2),
+        y2: height - pad.bottom,
+        visibility: "hidden",
+      });
+      const crosshairY = svgNode("line", {
+        class: "pnl-chart-crosshair",
+        x1: pad.left,
+        y1: coords[coords.length - 1].y.toFixed(2),
+        x2: width - pad.right,
+        y2: coords[coords.length - 1].y.toFixed(2),
+        visibility: "hidden",
+      });
+      const focus = svgNode("circle", {
+        class: "pnl-chart-focus",
+        cx: coords[coords.length - 1].x.toFixed(2),
+        cy: coords[coords.length - 1].y.toFixed(2),
+        r: 5,
+        visibility: "hidden",
+      });
+      svg.append(crosshair, crosshairY, focus);
+
+      function nearestPointForEvent(event) {
+        const rect = svg.getBoundingClientRect();
+        const x = ((event.clientX - rect.left) / rect.width) * width;
+        return coords.reduce((best, point) => {
+          const distance = Math.abs(point.x - x);
+          return !best || distance < best.distance ? { point, distance } : best;
+        }, null).point;
+      }
+
+      function setActivePoint(point, showTooltip) {
+        crosshair.setAttribute("x1", point.x.toFixed(2));
+        crosshair.setAttribute("x2", point.x.toFixed(2));
+        crosshair.setAttribute("visibility", "visible");
+        crosshairY.setAttribute("y1", point.y.toFixed(2));
+        crosshairY.setAttribute("y2", point.y.toFixed(2));
+        crosshairY.setAttribute("visibility", "visible");
+        focus.setAttribute("cx", point.x.toFixed(2));
+        focus.setAttribute("cy", point.y.toFixed(2));
+        focus.setAttribute("visibility", "visible");
+        renderChartReadout(point);
+        if (showTooltip) showChartTooltip(point, width, height);
+        else tooltip.hidden = true;
+      }
+
+      svg.onmousemove = (event) => setActivePoint(nearestPointForEvent(event), true);
+      svg.onclick = (event) => {
+        const point = nearestPointForEvent(event);
+        state.chartLockedPointKey = point.key;
+        setActivePoint(point, true);
+      };
+      svg.onmouseleave = () => {
+        tooltip.hidden = true;
+        const locked = coords.find((point) => point.key === state.chartLockedPointKey);
+        setActivePoint(locked || coords[coords.length - 1], false);
+      };
+
+      const initialPoint = coords.find((point) => point.key === state.chartLockedPointKey) || coords[coords.length - 1];
+      setActivePoint(initialPoint, false);
     }
 
     function renderPositions(data) {
@@ -1685,6 +2166,19 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     $("refreshButton").addEventListener("click", refresh);
+    document.querySelectorAll("[data-pnl-range]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.chartRange = button.dataset.pnlRange || "all";
+        state.chartLockedPointKey = null;
+        document.querySelectorAll("[data-pnl-range]").forEach((rangeButton) => {
+          rangeButton.classList.toggle("on", rangeButton.dataset.pnlRange === state.chartRange);
+        });
+        if (state.data) renderPnlChart(state.data);
+      });
+    });
+    $("pnlPointLabels").addEventListener("change", () => {
+      if (state.data) renderPnlChart(state.data);
+    });
     $("positionSearch").addEventListener("input", () => state.data && renderPositions(state.data));
     $("positionMode").addEventListener("change", () => state.data && renderPositions(state.data));
     $("logLevel").addEventListener("change", () => state.data && renderLogs(state.data));

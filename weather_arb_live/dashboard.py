@@ -71,6 +71,8 @@ MARK_FETCH_TOTAL_TIMEOUT_SECONDS = 5.0
 MARK_FETCH_WORKERS = 8
 MARK_FETCH_MAX_TOKENS = 100
 ACCOUNT_FETCH_TOTAL_TIMEOUT_SECONDS = 5.0
+PNL_HISTORY_MAX_POINTS = 10000
+PNL_HISTORY_MIN_INTERVAL_SECONDS = 10.0
 
 
 def utc_now_iso() -> str:
@@ -477,6 +479,109 @@ def _read_json(path: Path) -> tuple[Any, str | None]:
         return None, str(exc)
 
 
+def _nonnegative_int(value: Any) -> int:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return 0
+    return max(0, int(parsed))
+
+
+def _normalize_pnl_history_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    timestamp = entry.get("timestamp") or entry.get("generated_at") or entry.get("time")
+    parsed_timestamp = _parse_timestamp(timestamp)
+    pnl_usd = _safe_float(entry.get("pnl_usd"))
+    if parsed_timestamp is None or pnl_usd is None:
+        return None
+    position_usd = _safe_float(entry.get("position_usd"))
+    return {
+        "timestamp": parsed_timestamp.astimezone(timezone.utc).isoformat(),
+        "pnl_usd": round(pnl_usd, 2),
+        "position_usd": round(position_usd, 2) if position_usd is not None else 0.0,
+        "position_count": _nonnegative_int(entry.get("position_count")),
+        "pnl_count": _nonnegative_int(entry.get("pnl_count")),
+        "mark_count": _nonnegative_int(entry.get("mark_count")),
+        "source": str(entry.get("source") or "dashboard"),
+    }
+
+
+def read_pnl_history(path: Path | None = None) -> tuple[list[dict[str, Any]], str | None]:
+    history_path = path or config.PNL_HISTORY_PATH
+    payload, error = _read_json(history_path)
+    if payload is None:
+        return [], error
+    raw_entries = payload.get("points") if isinstance(payload, dict) else payload
+    if not isinstance(raw_entries, list):
+        return [], "pnl history file is not a JSON list"
+    history = [
+        normalized
+        for entry in raw_entries
+        if (normalized := _normalize_pnl_history_entry(entry)) is not None
+    ]
+    history.sort(key=lambda entry: _parse_timestamp(entry["timestamp"]) or datetime.min.replace(tzinfo=timezone.utc))
+    return history[-PNL_HISTORY_MAX_POINTS:], error
+
+
+def _same_pnl_snapshot_values(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    keys = ("pnl_usd", "position_usd", "position_count", "pnl_count", "mark_count", "source")
+    return all(left.get(key) == right.get(key) for key in keys)
+
+
+def record_pnl_history_snapshot(
+    position_summary: dict[str, Any],
+    *,
+    generated_at: str,
+    mark_count: int,
+    path: Path | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    history_path = path or config.PNL_HISTORY_PATH
+    history, error = read_pnl_history(history_path)
+    snapshot = _normalize_pnl_history_entry(
+        {
+            "timestamp": generated_at,
+            "pnl_usd": position_summary.get("total_pnl_usd"),
+            "position_usd": position_summary.get("total_position_usd"),
+            "position_count": position_summary.get("total"),
+            "pnl_count": position_summary.get("pnl_count"),
+            "mark_count": mark_count,
+            "source": "live_marks" if mark_count else "ledger",
+        }
+    )
+    if snapshot is None:
+        return history, error
+
+    if snapshot["position_count"] == 0 and snapshot["pnl_count"] == 0:
+        return history, error
+
+    should_append = True
+    if history:
+        last = history[-1]
+        last_time = _parse_timestamp(last.get("timestamp"))
+        current_time = _parse_timestamp(snapshot.get("timestamp"))
+        elapsed = (
+            (current_time - last_time).total_seconds()
+            if current_time is not None and last_time is not None
+            else PNL_HISTORY_MIN_INTERVAL_SECONDS
+        )
+        should_append = elapsed >= PNL_HISTORY_MIN_INTERVAL_SECONDS or not _same_pnl_snapshot_values(last, snapshot)
+
+    if should_append:
+        history = [*history, snapshot][-PNL_HISTORY_MAX_POINTS:]
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = history_path.with_suffix(f"{history_path.suffix}.tmp")
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(history, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            tmp_path.replace(history_path)
+            error = None
+        except Exception as exc:
+            return history, f"pnl history write failed: {exc}"
+
+    return history, error
+
+
 def tail_lines(path: Path, limit: int) -> tuple[list[str], str | None]:
     if limit <= 0 or not path.exists():
         return [], None
@@ -556,6 +661,9 @@ def summarize_positions(
     total_recorded_position_usd = 0.0
     total_pnl_usd = 0.0
     pnl_count = 0
+    win_count = 0
+    loss_count = 0
+    flat_count = 0
     marks = mark_prices or {}
 
     for key, value in positions.items():
@@ -606,6 +714,13 @@ def summarize_positions(
         if pnl_usd is not None:
             total_pnl_usd += pnl_usd
             pnl_count += 1
+            rounded_pnl_usd = round(pnl_usd, 2)
+            if rounded_pnl_usd > 0:
+                win_count += 1
+            elif rounded_pnl_usd < 0:
+                loss_count += 1
+            else:
+                flat_count += 1
 
         rows.append(
             {
@@ -659,6 +774,7 @@ def summarize_positions(
         )
 
     rows.sort(key=sort_key, reverse=True)
+    win_rate_count = win_count + loss_count
 
     return {
         "total": len(rows),
@@ -672,6 +788,11 @@ def summarize_positions(
         "total_recorded_position_usd": round(total_recorded_position_usd, 2),
         "total_pnl_usd": round(total_pnl_usd, 2),
         "pnl_count": pnl_count,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "flat_count": flat_count,
+        "win_rate_count": win_rate_count,
+        "win_rate": round(win_count / win_rate_count, 4) if win_rate_count else None,
         "pnl_curve": pnl_curve,
         "recent": rows,
     }
@@ -745,6 +866,7 @@ def artifacts_payload() -> list[dict[str, Any]]:
         ("empirical_residuals", config.RESIDUALS_CACHE_PATH),
         ("sigma_cache", config.SIGMA_CACHE_PATH),
         ("calibration_table", config.CALIBRATION_PATH),
+        ("pnl_history", config.PNL_HISTORY_PATH),
     )
     return [{"name": name, **_file_status(path)} for name, path in artifacts]
 
@@ -797,8 +919,7 @@ def build_dashboard_state(
         if account_snapshot is not None
         else fetch_account_snapshot(runtime) if include_account else account_disabled_payload()
     )
-    artifacts = artifacts_payload()
-    log_status = next(item for item in artifacts if item["name"] == "live_bot_log")
+    log_status = _file_status(LOG_PATH)
 
     positions_data, positions_error = _read_json(config.POSITIONS_PATH)
     if positions_data is None:
@@ -833,9 +954,16 @@ def build_dashboard_state(
     )
     recent_positions = position_summary.pop("recent")
     pnl_curve = position_summary.pop("pnl_curve")
+    generated_at = utc_now_iso()
+    pnl_history, pnl_history_error = record_pnl_history_snapshot(
+        position_summary,
+        generated_at=generated_at,
+        mark_count=len(live_mark_prices),
+    )
+    artifacts = artifacts_payload()
 
     return {
-        "generated_at": utc_now_iso(),
+        "generated_at": generated_at,
         "version": __version__,
         "runtime": runtime,
         "environment": environment,
@@ -849,6 +977,8 @@ def build_dashboard_state(
             "mark_count": len(live_mark_prices),
             "summary": position_summary,
             "pnl_curve": pnl_curve,
+            "pnl_history": pnl_history,
+            "pnl_history_error": pnl_history_error,
             "recent": recent_positions,
         },
         "logs": {

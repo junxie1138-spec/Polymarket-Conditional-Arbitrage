@@ -18,5 +18,6 @@ data/raw_events.json
 data/weather_cache.json
 data/price_cache/
 data/live_positions.json
+data/pnl_history.json
 data/test_*.json
 data/*.tmp
