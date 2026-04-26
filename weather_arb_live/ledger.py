@@ -9,6 +9,10 @@ from . import config
 from .strategy import TradePlan
 
 
+class LedgerLoadError(RuntimeError):
+    pass
+
+
 class PositionLedger:
     def __init__(self, path: str | Path = config.POSITIONS_PATH):
         self.path = Path(path)
@@ -21,9 +25,23 @@ class PositionLedger:
         try:
             with self.path.open(encoding="utf-8") as f:
                 data = json.load(f)
-            self.positions = data if isinstance(data, dict) else {}
-        except Exception:
-            self.positions = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LedgerLoadError(f"failed to load position ledger {self.path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise LedgerLoadError(
+                f"position ledger {self.path} must contain a JSON object, "
+                f"got {type(data).__name__}"
+            )
+        invalid_keys = [
+            key for key, value in data.items()
+            if not isinstance(key, str) or not isinstance(value, dict)
+        ]
+        if invalid_keys:
+            raise LedgerLoadError(
+                f"position ledger {self.path} contains invalid position rows: "
+                f"{invalid_keys[:3]}"
+            )
+        self.positions = data
         return self
 
     def save(self) -> None:

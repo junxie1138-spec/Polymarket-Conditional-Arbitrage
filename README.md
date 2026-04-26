@@ -267,7 +267,9 @@ not as authoritative position state.
 Before each live order, the bot refreshes CLOB collateral balance/allowance and
 blocks the order locally if either value is below `MAX_POSITION_USD` for that
 entry. A balance preflight failure does not create an `unknown` ledger row,
-because no order has been submitted yet.
+because no order has been submitted yet. Live submissions use FOK orders, so an
+unfilled signal cancels immediately instead of resting on the book for a later
+stale fill.
 
 If your internet drops while the bot is running continuously, the bot logs the
 failed fetch, leaves existing positions untouched, and retries after

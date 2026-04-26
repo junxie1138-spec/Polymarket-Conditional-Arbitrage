@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from weather_arb_live.ledger import PositionLedger
+import pytest
+
+from weather_arb_live.ledger import LedgerLoadError, PositionLedger
 from weather_arb_live.strategy import TradePlan
 
 
@@ -39,6 +41,32 @@ def test_ledger_persists_and_reloads():
         assert loaded.positions["m1"]["token_id"] == "yes-token"
         assert loaded.entered_positions(include_dry_run=True)
         assert loaded.entered_positions(include_dry_run=False) == {}
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def test_ledger_load_fails_closed_on_corrupt_file():
+    path = Path("data/test_corrupt_live_positions.json")
+    try:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("{not-json", encoding="utf-8")
+
+        with pytest.raises(LedgerLoadError, match="failed to load position ledger"):
+            PositionLedger(path).load()
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def test_ledger_load_fails_closed_on_wrong_shape():
+    path = Path("data/test_wrong_shape_live_positions.json")
+    try:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("[]", encoding="utf-8")
+
+        with pytest.raises(LedgerLoadError, match="must contain a JSON object"):
+            PositionLedger(path).load()
     finally:
         if path.exists():
             path.unlink()
