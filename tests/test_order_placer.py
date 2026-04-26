@@ -1,6 +1,7 @@
 import os
 import requests
 import pytest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from weather_arb_live.order_placer import (
     OrderPostRejectedError,
     build_order_intent,
 )
+from weather_arb_live.wallet_balance import WalletBalance
 
 
 class FakeAuthError(Exception):
@@ -280,6 +282,9 @@ class BalanceClient:
     def get_balance_allowance(self, _params):
         return self.response
 
+    def get_address(self):
+        return "0x2222222222222222222222222222222222222222"
+
 
 class BalanceGuardPlacer(OrderPlacer):
     def __init__(self, response):
@@ -303,6 +308,40 @@ def test_live_order_blocks_when_collateral_balance_is_too_low():
 
     assert placer.client.updated is True
     assert placer.posted is False
+
+
+def test_live_order_uses_wallet_balance_fallback_for_zero_clob_balance(monkeypatch):
+    funder = "0x1111111111111111111111111111111111111111"
+    calls = []
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", funder)
+
+    def fake_fetch(address, *, token_address, token_symbol, ttl_seconds, timeout_seconds=4.0):
+        calls.append((address, token_address, token_symbol, ttl_seconds, timeout_seconds))
+        return WalletBalance(
+            address=address,
+            token_address=token_address,
+            token_symbol=token_symbol,
+            balance=Decimal("83.376702"),
+            rpc_url="https://rpc.test",
+        )
+
+    monkeypatch.setattr(order_placer.wallet_balance, "fetch_cached_erc20_balance", fake_fetch)
+    placer = BalanceGuardPlacer(
+        {
+            "balance": "0",
+            "allowances": {
+                "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E": "100",
+            },
+        }
+    )
+
+    result = placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert result.posted is True
+    assert placer.posted is True
+    assert calls[0][0] == funder
+    assert calls[0][1] == order_placer.wallet_balance.BRIDGED_USDC_TOKEN
+    assert calls[0][2] == "USDC.e"
 
 
 def test_live_order_blocks_when_collateral_allowance_is_too_low():

@@ -172,7 +172,7 @@ def _fetch_wallet_balance_payload(address: str | None) -> tuple[wallet_balance.W
         return None, None
     try:
         return (
-            wallet_balance.fetch_cached_erc20_balance(
+            wallet_balance.fetch_cached_collateral_balance(
                 address,
                 ttl_seconds=config.wallet_balance_ttl_seconds(),
             ),
@@ -218,7 +218,7 @@ def _fetch_account_snapshot_once(runtime: dict[str, Any]) -> dict[str, Any]:
         display_balance = wallet_snapshot.balance
         balance_source = "wallet_usdc"
         if clob_balance == 0:
-            warning = "CLOB balance endpoint reported 0; showing wallet USDC.e balance"
+            warning = f"CLOB balance endpoint reported 0; showing wallet {wallet_snapshot.token_symbol} balance"
 
     return _account_payload(
         status="ok",
