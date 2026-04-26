@@ -171,6 +171,13 @@ $env:POLYMARKET_API_PASSPHRASE="..."
 $env:POLYMARKET_PRIVATE_KEY="..."
 ```
 
+On live startup, the bot validates the CLOB API key triplet with an
+authenticated read. If Polymarket returns `401 Unauthorized/Invalid api key`,
+the bot derives fresh CLOB API credentials from `POLYMARKET_PRIVATE_KEY`, keeps
+them in memory, and updates the existing repo-root `.env` file by default. Set
+`POLYMARKET_AUTH_WRITE_DOTENV=false` to keep the repaired credentials only in
+the current process.
+
 If you use a proxy/funder wallet, set the reconciliation address to the wallet
 that Polymarket's Data API shows as holding positions:
 
@@ -182,7 +189,7 @@ Optional:
 
 ```powershell
 $env:POLYMARKET_CLOB_HOST="https://clob.polymarket.com"
-$env:POLYMARKET_SIGNATURE_TYPE="..."
+$env:POLYMARKET_SIGNATURE_TYPE="2" # 0=EOA, 1=POLY_PROXY/Magic, 2=GNOSIS_SAFE
 $env:POLYMARKET_FUNDER_ADDRESS="..."
 $env:POLYMARKET_WALLET_BALANCE_TTL_SECONDS="60"
 $env:POLYGON_RPC_URL="https://..."

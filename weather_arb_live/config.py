@@ -71,6 +71,7 @@ ENABLE_NO_SIDE = True
 MAX_NO_ENTRY_PRICE = 0.75
 OFFLINE_RETRY_SECONDS = 60
 RECONCILE_ON_STARTUP = True
+POLYMARKET_AUTH_WRITE_DOTENV = True
 
 MAX_LEAD_DAYS = 7
 DEFAULT_MODEL = "gfs_seamless"
@@ -150,6 +151,10 @@ def offline_retry_seconds() -> int:
 
 def reconcile_on_startup() -> bool:
     return env_bool("RECONCILE_ON_STARTUP", RECONCILE_ON_STARTUP)
+
+
+def polymarket_auth_write_dotenv() -> bool:
+    return env_bool("POLYMARKET_AUTH_WRITE_DOTENV", POLYMARKET_AUTH_WRITE_DOTENV)
 
 
 def max_position_usd() -> float:
