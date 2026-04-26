@@ -15,6 +15,7 @@ NATIVE_USDC_TOKEN = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 PUSD_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 USDC_DECIMALS = Decimal(10**6)
 BALANCE_OF_SELECTOR = "0x70a08231"
+ALLOWANCE_SELECTOR = "0xdd62ed3e"
 
 POLYMARKET_COLLATERAL_TOKENS = (
     ("pUSD", PUSD_TOKEN),
@@ -39,7 +40,18 @@ class WalletBalance:
     rpc_url: str
 
 
+@dataclass(frozen=True)
+class WalletAllowance:
+    owner_address: str
+    spender_address: str
+    token_address: str
+    token_symbol: str
+    allowance: Decimal
+    rpc_url: str
+
+
 _CACHE: dict[tuple[str, str], tuple[float, WalletBalance]] = {}
+_ALLOWANCE_CACHE: dict[tuple[str, str, str], tuple[float, WalletAllowance]] = {}
 _CACHE_LOCK = threading.Lock()
 
 
@@ -68,6 +80,12 @@ def _clean_address(address: str) -> str:
 
 def _balance_call_data(address: str) -> str:
     return BALANCE_OF_SELECTOR + _clean_address(address).lower().removeprefix("0x").rjust(64, "0")
+
+
+def _allowance_call_data(owner_address: str, spender_address: str) -> str:
+    owner = _clean_address(owner_address).lower().removeprefix("0x").rjust(64, "0")
+    spender = _clean_address(spender_address).lower().removeprefix("0x").rjust(64, "0")
+    return ALLOWANCE_SELECTOR + owner + spender
 
 
 def _eth_call(
@@ -129,6 +147,37 @@ def fetch_erc20_balance(
     raise RuntimeError(f"wallet balance RPC failed: {last_error}") from last_error
 
 
+def fetch_erc20_allowance(
+    owner_address: str,
+    spender_address: str,
+    *,
+    token_address: str = BRIDGED_USDC_TOKEN,
+    token_symbol: str = "USDC.e",
+    timeout_seconds: float = 4.0,
+) -> WalletAllowance:
+    last_error: Exception | None = None
+    call_data = _allowance_call_data(owner_address, spender_address)
+    for rpc_url in rpc_urls():
+        try:
+            raw_allowance = _eth_call(
+                rpc_url=rpc_url,
+                token_address=token_address,
+                call_data=call_data,
+                timeout_seconds=timeout_seconds,
+            )
+            return WalletAllowance(
+                owner_address=_clean_address(owner_address),
+                spender_address=_clean_address(spender_address),
+                token_address=token_address,
+                token_symbol=token_symbol,
+                allowance=Decimal(raw_allowance) / USDC_DECIMALS,
+                rpc_url=rpc_url,
+            )
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"wallet allowance RPC failed: {last_error}") from last_error
+
+
 def fetch_cached_erc20_balance(
     address: str,
     *,
@@ -153,6 +202,38 @@ def fetch_cached_erc20_balance(
     with _CACHE_LOCK:
         _CACHE[key] = (now, balance)
     return balance
+
+
+def fetch_cached_erc20_allowance(
+    owner_address: str,
+    spender_address: str,
+    *,
+    token_address: str = BRIDGED_USDC_TOKEN,
+    token_symbol: str = "USDC.e",
+    ttl_seconds: float = 60.0,
+    timeout_seconds: float = 4.0,
+) -> WalletAllowance:
+    key = (
+        _clean_address(owner_address).lower(),
+        _clean_address(spender_address).lower(),
+        token_address.lower(),
+    )
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        cached = _ALLOWANCE_CACHE.get(key)
+        if cached and now - cached[0] <= ttl_seconds:
+            return cached[1]
+
+    allowance = fetch_erc20_allowance(
+        owner_address,
+        spender_address,
+        token_address=token_address,
+        token_symbol=token_symbol,
+        timeout_seconds=timeout_seconds,
+    )
+    with _CACHE_LOCK:
+        _ALLOWANCE_CACHE[key] = (now, allowance)
+    return allowance
 
 
 def fetch_cached_collateral_balance(

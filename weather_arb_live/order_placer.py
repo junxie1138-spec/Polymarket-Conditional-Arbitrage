@@ -48,6 +48,15 @@ class OrderResult:
     response: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class CollateralPreflightContext:
+    token_symbol: str
+    token_address: str
+    spender_address: str
+    order_version: int
+    neg_risk: bool
+
+
 OrderSubmitCallback = Callable[[OrderIntent, int], None]
 
 POLYMARKET_API_ENV_VARS = (
@@ -62,9 +71,13 @@ V1_COLLATERAL_SPENDERS = {
     "0xc5d563a36ae78145c45a50134d48a1215220f80a",
     "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296",
 }
+V1_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+V1_NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+V2_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+V2_NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
 V2_COLLATERAL_SPENDERS = {
-    "0xe111180000d2663c0091e4f400237545b87b996b",
-    "0xe2222d279d744050d28e00520010520000310f59",
+    V2_EXCHANGE.lower(),
+    V2_NEG_RISK_EXCHANGE.lower(),
     "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
 }
 
@@ -246,6 +259,15 @@ def _preferred_wallet_collateral_token(response: Any) -> tuple[str, str] | None:
         return "pUSD", wallet_balance.PUSD_TOKEN
     if spenders & V1_COLLATERAL_SPENDERS:
         return "USDC.e", wallet_balance.BRIDGED_USDC_TOKEN
+    return None
+
+
+def _version_from_balance_response(response: Any) -> int | None:
+    spenders = _allowance_spenders(response)
+    if spenders & V2_COLLATERAL_SPENDERS:
+        return 2
+    if spenders & V1_COLLATERAL_SPENDERS:
+        return 1
     return None
 
 
@@ -468,6 +490,70 @@ class OrderPlacer:
             )
             return None
 
+    def _collateral_preflight_context(
+        self,
+        client,
+        intent: OrderIntent,
+        response: Any,
+    ) -> CollateralPreflightContext:
+        try:
+            order_version = int(client.get_version())
+        except Exception:
+            order_version = _version_from_balance_response(response) or 1
+
+        try:
+            neg_risk = bool(client.get_neg_risk(intent.token_id))
+        except Exception:
+            neg_risk = False
+
+        if order_version == 2:
+            return CollateralPreflightContext(
+                token_symbol="pUSD",
+                token_address=wallet_balance.PUSD_TOKEN,
+                spender_address=V2_NEG_RISK_EXCHANGE if neg_risk else V2_EXCHANGE,
+                order_version=order_version,
+                neg_risk=neg_risk,
+            )
+        return CollateralPreflightContext(
+            token_symbol="USDC.e",
+            token_address=wallet_balance.BRIDGED_USDC_TOKEN,
+            spender_address=V1_NEG_RISK_EXCHANGE if neg_risk else V1_EXCHANGE,
+            order_version=1,
+            neg_risk=neg_risk,
+        )
+
+    def _fetch_wallet_collateral_allowance_for_preflight(
+        self,
+        client,
+        intent: OrderIntent,
+        response: Any,
+    ) -> wallet_balance.WalletAllowance | None:
+        if not _wallet_balance_preflight_fallback_enabled():
+            return None
+
+        owner_address = os.getenv("POLYMARKET_FUNDER_ADDRESS") or str(client.get_address())
+        context = self._collateral_preflight_context(client, intent, response)
+        try:
+            return wallet_balance.fetch_cached_erc20_allowance(
+                owner_address,
+                context.spender_address,
+                token_address=context.token_address,
+                token_symbol=context.token_symbol,
+                ttl_seconds=config.wallet_balance_ttl_seconds(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "wallet_allowance_preflight_fallback_unavailable owner=%s spender=%s "
+                "token=%s order_version=%s neg_risk=%s error=%s",
+                _mask_address(owner_address),
+                _mask_address(context.spender_address),
+                context.token_symbol,
+                context.order_version,
+                context.neg_risk,
+                exc,
+            )
+            return None
+
     def _ensure_sufficient_collateral(self, client, intent: OrderIntent) -> None:
         from py_clob_client_v2 import AssetType, BalanceAllowanceParams
 
@@ -503,9 +589,26 @@ class OrderPlacer:
             )
             balance = wallet_snapshot.balance
         if allowance is not None and allowance < required:
-            raise InsufficientBalanceError(
-                f"insufficient Polymarket collateral allowance: required={required} available={allowance}"
+            wallet_allowance = self._fetch_wallet_collateral_allowance_for_preflight(
+                client,
+                intent,
+                response,
+            ) if allowance == 0 else None
+            if wallet_allowance is None or wallet_allowance.allowance < required:
+                raise InsufficientBalanceError(
+                    f"insufficient Polymarket collateral allowance: required={required} available={allowance}"
+                )
+            logger.warning(
+                "allowance_preflight_wallet_fallback required_usd=%s clob_allowance=%s "
+                "wallet_allowance=%s wallet_token=%s owner=%s spender=%s",
+                required,
+                allowance,
+                wallet_allowance.allowance,
+                wallet_allowance.token_symbol,
+                _mask_address(wallet_allowance.owner_address),
+                _mask_address(wallet_allowance.spender_address),
             )
+            allowance = wallet_allowance.allowance
         logger.info(
             "balance_preflight_ok required_usd=%s collateral_balance=%s collateral_allowance=%s",
             required,
