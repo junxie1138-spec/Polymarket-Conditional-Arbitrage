@@ -147,3 +147,11 @@ def test_parse_log_lines_keeps_unstructured_lines():
     assert parsed["entries"][0]["level"] == "INFO"
     assert parsed["last_cycle_start"] == "2026-04-25 08:00:00,000"
     assert parsed["entries"][1]["message"] == "partial line without formatter"
+
+
+def test_dashboard_html_uses_design_system_shell():
+    assert "Polymarket Weather" in dashboard.DASHBOARD_HTML
+    assert "kpi-grid" in dashboard.DASHBOARD_HTML
+    assert "mode-dot" in dashboard.DASHBOARD_HTML
+    assert "drawer-backdrop" in dashboard.DASHBOARD_HTML
+    assert "tail / live_bot.log" in dashboard.DASHBOARD_HTML
