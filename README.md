@@ -268,9 +268,9 @@ not as authoritative position state.
 
 Before each live order, the bot refreshes CLOB collateral balance/allowance and
 blocks the order locally if either value is below `MAX_POSITION_USD` for that
-entry. If the CLOB balance cache reports exactly zero for a proxy/funder wallet,
-the bot can fall back to a read-only on-chain collateral balance check for the
-configured funder while still requiring the CLOB allowance check to pass. Set
+entry. If the CLOB balance or allowance cache reports exactly zero for a
+proxy/funder wallet, the bot can fall back to read-only on-chain collateral
+balance and allowance checks for the configured funder. Set
 `POLYMARKET_WALLET_BALANCE_PREFLIGHT_FALLBACK=false` to disable that fallback.
 A balance preflight failure does not create an `unknown` ledger row, because no
 order has been submitted yet. Live submissions use FOK orders, so an unfilled

@@ -13,7 +13,7 @@ from weather_arb_live.order_placer import (
     OrderPostRejectedError,
     build_order_intent,
 )
-from weather_arb_live.wallet_balance import WalletBalance
+from weather_arb_live.wallet_balance import WalletAllowance, WalletBalance
 
 
 class FakeAuthError(Exception):
@@ -351,6 +351,42 @@ def test_live_order_blocks_when_collateral_allowance_is_too_low():
         placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
 
     assert placer.posted is False
+
+
+def test_live_order_uses_wallet_allowance_fallback_for_zero_clob_allowance(monkeypatch):
+    funder = "0x1111111111111111111111111111111111111111"
+    calls = []
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", funder)
+
+    def fake_fetch(owner_address, spender_address, *, token_address, token_symbol, ttl_seconds, timeout_seconds=4.0):
+        calls.append((owner_address, spender_address, token_address, token_symbol, ttl_seconds, timeout_seconds))
+        return WalletAllowance(
+            owner_address=owner_address,
+            spender_address=spender_address,
+            token_address=token_address,
+            token_symbol=token_symbol,
+            allowance=Decimal("100"),
+            rpc_url="https://rpc.test",
+        )
+
+    class AllowanceFallbackClient(BalanceClient):
+        def get_version(self):
+            return 1
+
+        def get_neg_risk(self, _token_id):
+            return True
+
+    monkeypatch.setattr(order_placer.wallet_balance, "fetch_cached_erc20_allowance", fake_fetch)
+    placer = BalanceGuardPlacer({"balance": "100", "allowance": "0"})
+    placer.client = AllowanceFallbackClient({"balance": "100", "allowance": "0"})
+
+    result = placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert result.posted is True
+    assert calls[0][0] == funder
+    assert calls[0][1] == order_placer.V1_NEG_RISK_EXCHANGE
+    assert calls[0][2] == order_placer.wallet_balance.BRIDGED_USDC_TOKEN
+    assert calls[0][3] == "USDC.e"
 
 
 def test_live_order_uses_lowest_allowance_from_allowance_map():

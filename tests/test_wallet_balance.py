@@ -74,3 +74,24 @@ def test_fetch_cached_collateral_balance_returns_first_positive_token(monkeypatc
 
     assert balance.balance == Decimal("83.376702")
     assert balance.token_symbol == "USDC.e"
+
+
+def test_fetch_erc20_allowance_reads_usdc_units(monkeypatch):
+    calls = []
+
+    def fake_post(url, *, json, headers, timeout):
+        calls.append((url, json, headers, timeout))
+        return FakeResponse({"result": hex(50_000_000)})
+
+    monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.test")
+    monkeypatch.setattr(wallet_balance.requests, "post", fake_post)
+
+    allowance = wallet_balance.fetch_erc20_allowance(
+        "0x1111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222",
+    )
+
+    assert allowance.allowance == Decimal("50")
+    assert allowance.token_symbol == "USDC.e"
+    assert allowance.rpc_url == "https://rpc.test"
+    assert calls[0][1]["params"][0]["data"].startswith(wallet_balance.ALLOWANCE_SELECTOR)
