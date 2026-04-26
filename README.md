@@ -154,7 +154,8 @@ When live credentials are set, the dashboard also shows the CLOB collateral
 balance and allowance. That account lookup is read-only and timeout-bounded;
 if credentials are missing or connectivity drops, the balance card reports the
 error while positions, logs, and PnL continue to render. For proxy/funder
-wallets, the dashboard also reads the configured funder's Polygon USDC.e balance
+wallets, the dashboard also reads the configured funder's Polygon collateral
+balance, preferring pUSD and falling back to USDC.e/native USDC when present,
 and uses that as the top-line account balance when the CLOB balance cache
 reports zero. The account details panel still shows the separate CLOB
 balance/allowance values so mismatches are visible.
@@ -192,6 +193,7 @@ $env:POLYMARKET_CLOB_HOST="https://clob.polymarket.com"
 $env:POLYMARKET_SIGNATURE_TYPE="2" # 0=EOA, 1=POLY_PROXY/Magic, 2=GNOSIS_SAFE
 $env:POLYMARKET_FUNDER_ADDRESS="..."
 $env:POLYMARKET_WALLET_BALANCE_TTL_SECONDS="60"
+$env:POLYMARKET_WALLET_BALANCE_PREFLIGHT_FALLBACK="true"
 $env:POLYGON_RPC_URL="https://..."
 $env:POLL_INTERVAL_MINUTES="15"
 $env:OFFLINE_RETRY_SECONDS="60"
@@ -266,10 +268,14 @@ not as authoritative position state.
 
 Before each live order, the bot refreshes CLOB collateral balance/allowance and
 blocks the order locally if either value is below `MAX_POSITION_USD` for that
-entry. A balance preflight failure does not create an `unknown` ledger row,
-because no order has been submitted yet. Live submissions use FOK orders, so an
-unfilled signal cancels immediately instead of resting on the book for a later
-stale fill.
+entry. If the CLOB balance cache reports exactly zero for a proxy/funder wallet,
+the bot can fall back to a read-only on-chain collateral balance check for the
+configured funder while still requiring the CLOB allowance check to pass. Set
+`POLYMARKET_WALLET_BALANCE_PREFLIGHT_FALLBACK=false` to disable that fallback.
+A balance preflight failure does not create an `unknown` ledger row, because no
+order has been submitted yet. Live submissions use FOK orders, so an unfilled
+signal cancels immediately instead of resting on the book for a later stale
+fill.
 
 If your internet drops while the bot is running continuously, the bot logs the
 failed fetch, leaves existing positions untouched, and retries after

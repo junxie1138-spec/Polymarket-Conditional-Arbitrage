@@ -50,3 +50,27 @@ def test_fetch_erc20_balance_tries_rpc_fallback(monkeypatch):
 
     assert balance.balance == Decimal("0")
     assert attempts[:2] == ["https://primary.test", "https://fallback.test"]
+
+
+def test_fetch_cached_collateral_balance_returns_first_positive_token(monkeypatch):
+    responses = {
+        wallet_balance.PUSD_TOKEN.lower(): "0x0",
+        wallet_balance.BRIDGED_USDC_TOKEN.lower(): hex(83_376_702),
+        wallet_balance.NATIVE_USDC_TOKEN.lower(): "0x0",
+    }
+
+    def fake_post(url, *, json, headers, timeout):
+        token = json["params"][0]["to"].lower()
+        return FakeResponse({"result": responses[token]})
+
+    with wallet_balance._CACHE_LOCK:
+        wallet_balance._CACHE.clear()
+    monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.test")
+    monkeypatch.setattr(wallet_balance.requests, "post", fake_post)
+
+    balance = wallet_balance.fetch_cached_collateral_balance(
+        "0x1111111111111111111111111111111111111111"
+    )
+
+    assert balance.balance == Decimal("83.376702")
+    assert balance.token_symbol == "USDC.e"

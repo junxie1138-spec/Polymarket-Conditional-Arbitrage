@@ -282,7 +282,7 @@ def test_dashboard_account_fetch_prefers_wallet_usdc_when_clob_balance_is_zero(m
     monkeypatch.setattr("py_clob_client_v2.ClobClient", FakeClobClient)
     monkeypatch.setattr(
         dashboard.wallet_balance,
-        "fetch_cached_erc20_balance",
+        "fetch_cached_collateral_balance",
         lambda address, ttl_seconds: WalletBalance(
             address=address,
             token_address="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",

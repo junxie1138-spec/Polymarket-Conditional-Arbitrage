@@ -12,8 +12,15 @@ import requests
 
 BRIDGED_USDC_TOKEN = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 NATIVE_USDC_TOKEN = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+PUSD_TOKEN = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 USDC_DECIMALS = Decimal(10**6)
 BALANCE_OF_SELECTOR = "0x70a08231"
+
+POLYMARKET_COLLATERAL_TOKENS = (
+    ("pUSD", PUSD_TOKEN),
+    ("USDC.e", BRIDGED_USDC_TOKEN),
+    ("USDC", NATIVE_USDC_TOKEN),
+)
 
 DEFAULT_RPC_URLS = (
     "https://polygon-bor-rpc.publicnode.com",
@@ -146,3 +153,33 @@ def fetch_cached_erc20_balance(
     with _CACHE_LOCK:
         _CACHE[key] = (now, balance)
     return balance
+
+
+def fetch_cached_collateral_balance(
+    address: str,
+    *,
+    preferred_token_symbol: str | None = None,
+    ttl_seconds: float = 60.0,
+    timeout_seconds: float = 4.0,
+) -> WalletBalance:
+    tokens = list(POLYMARKET_COLLATERAL_TOKENS)
+    if preferred_token_symbol:
+        preferred = preferred_token_symbol.strip().lower()
+        tokens.sort(key=lambda item: 0 if item[0].lower() == preferred else 1)
+
+    first_snapshot: WalletBalance | None = None
+    for token_symbol, token_address in tokens:
+        snapshot = fetch_cached_erc20_balance(
+            address,
+            token_address=token_address,
+            token_symbol=token_symbol,
+            ttl_seconds=ttl_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+        if first_snapshot is None:
+            first_snapshot = snapshot
+        if snapshot.balance > 0:
+            return snapshot
+
+    assert first_snapshot is not None
+    return first_snapshot
