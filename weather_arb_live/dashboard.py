@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, config, network
+from . import __version__, config, network, wallet_balance
 from .dashboard_ui import DASHBOARD_HTML
 from .live_fetcher import midpoint_from_book
 
@@ -51,6 +51,9 @@ OPTIONAL_RUNTIME_ENV = (
     "POLYMARKET_WS_MARKET_WARMUP_SECONDS",
     "SAFETY_RECONCILE_INTERVAL_MINUTES",
     "SAFETY_RECONCILE_MIN_INTERVAL_SECONDS",
+    "POLYMARKET_WALLET_BALANCE_TTL_SECONDS",
+    "POLYGON_RPC_URL",
+    "POLYGON_RPC_FALLBACK_URLS",
     "WEATHER_ARB_DATA_DIR",
     "WEATHER_ARB_LOG_DIR",
     "POLYMARKET_RECONCILE_USER_ADDRESS",
@@ -91,8 +94,9 @@ def _account_payload(
     allowance_usd: float | None = None,
     error: str | None = None,
     updated_at: str | None = None,
+    **extra: Any,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "status": status,
         "status_label": status_label,
         "balance_usd": balance_usd,
@@ -100,6 +104,8 @@ def _account_payload(
         "error": error,
         "updated_at": updated_at,
     }
+    payload.update(extra)
+    return payload
 
 
 def account_disabled_payload() -> dict[str, Any]:
@@ -141,8 +147,36 @@ def _decimal_to_float(value: Decimal | None) -> float | None:
     return None if value is None else float(value)
 
 
+def _round_decimal_usd(value: Decimal | None) -> float | None:
+    return round(_decimal_to_float(value), 2) if value is not None else None
+
+
+def _mask_address(value: str | None) -> str | None:
+    if not value:
+        return None
+    address = value.strip()
+    if len(address) <= 10:
+        return address
+    return f"{address[:6]}...{address[-4:]}"
+
+
 def _missing_live_credentials() -> list[str]:
     return [name for name in REQUIRED_LIVE_CREDENTIALS if not os.getenv(name)]
+
+
+def _fetch_wallet_balance_payload(address: str | None) -> tuple[wallet_balance.WalletBalance | None, str | None]:
+    if not address:
+        return None, None
+    try:
+        return (
+            wallet_balance.fetch_cached_erc20_balance(
+                address,
+                ttl_seconds=config.wallet_balance_ttl_seconds(),
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, f"wallet balance unavailable: {exc}"
 
 
 def _fetch_account_snapshot_once(runtime: dict[str, Any]) -> dict[str, Any]:
@@ -167,16 +201,40 @@ def _fetch_account_snapshot_once(runtime: dict[str, Any]) -> dict[str, Any]:
         kwargs["funder"] = funder
 
     client = ClobClient(**kwargs)
+    signer_address = str(client.get_address())
     params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
     client.update_balance_allowance(params)
     response = client.get_balance_allowance(params)
-    balance, allowance = _parse_account_balance_allowance(response)
+    clob_balance, clob_allowance = _parse_account_balance_allowance(response)
+    wallet_address = funder or signer_address
+    wallet_snapshot, wallet_error = _fetch_wallet_balance_payload(wallet_address)
+    display_balance = clob_balance
+    balance_source = "clob"
+    warning = None
+    if wallet_snapshot is not None and wallet_snapshot.balance > clob_balance:
+        display_balance = wallet_snapshot.balance
+        balance_source = "wallet_usdc"
+        if clob_balance == 0:
+            warning = "CLOB balance endpoint reported 0; showing wallet USDC.e balance"
+
     return _account_payload(
         status="ok",
         status_label="Connected",
-        balance_usd=round(_decimal_to_float(balance) or 0.0, 2),
-        allowance_usd=round(_decimal_to_float(allowance), 2) if allowance is not None else None,
+        balance_usd=_round_decimal_usd(display_balance) or 0.0,
+        allowance_usd=_round_decimal_usd(clob_allowance),
         updated_at=utc_now_iso(),
+        balance_source=balance_source,
+        clob_balance_usd=_round_decimal_usd(clob_balance) or 0.0,
+        clob_allowance_usd=_round_decimal_usd(clob_allowance),
+        wallet_balance_usd=_round_decimal_usd(wallet_snapshot.balance) if wallet_snapshot else None,
+        wallet_token=wallet_snapshot.token_symbol if wallet_snapshot else None,
+        wallet_address=_mask_address(wallet_address),
+        wallet_rpc_url=wallet_snapshot.rpc_url if wallet_snapshot else None,
+        signer_address=_mask_address(signer_address),
+        funder_address=_mask_address(funder),
+        signature_type=os.getenv("POLYMARKET_SIGNATURE_TYPE") or "0",
+        warning=warning,
+        wallet_error=wallet_error,
     )
 
 
@@ -643,6 +701,7 @@ def runtime_payload() -> dict[str, Any]:
         "ws_market_warmup_seconds": runtime.ws_market_warmup_seconds,
         "safety_reconcile_interval_seconds": runtime.safety_reconcile_interval_seconds,
         "safety_reconcile_min_interval_seconds": runtime.safety_reconcile_min_interval_seconds,
+        "wallet_balance_ttl_seconds": runtime.wallet_balance_ttl_seconds,
         "data_dir": str(config.DATA_DIR),
         "log_dir": str(config.LOG_DIR),
     }
