@@ -177,6 +177,85 @@ def test_live_client_rejects_invalid_signature_type(monkeypatch):
         placer._get_client()
 
 
+def _proxy_runtime_code(implementation: str) -> str:
+    return (
+        "0x"
+        + order_placer.POLYMARKET_PROXY_RUNTIME_PREFIX
+        + implementation.lower().removeprefix("0x")
+        + order_placer.POLYMARKET_PROXY_RUNTIME_SUFFIX
+    )
+
+
+def test_wallet_configuration_rejects_proxy_wallet_with_safe_signature_type(monkeypatch):
+    signer = "0x0000000000000000000000000000000000000001"
+    implementation = "0x44e999d5c2f66ef08613b5c27311b18c26a0e74d"
+    funder = order_placer._derive_polymarket_proxy_funder(signer, implementation)
+
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", funder)
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "2")
+    monkeypatch.setattr(
+        order_placer.wallet_balance,
+        "fetch_contract_code",
+        lambda *_args, **_kwargs: (_proxy_runtime_code(implementation), "https://rpc.example"),
+    )
+
+    class FakeClient:
+        def get_address(self):
+            return signer
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+
+    with pytest.raises(MissingCredentialsError, match="POLYMARKET_SIGNATURE_TYPE must be 1"):
+        placer._ensure_wallet_configuration_valid(FakeClient())
+
+
+def test_wallet_configuration_rejects_proxy_wallet_signer_mismatch(monkeypatch):
+    signer = "0x0000000000000000000000000000000000000001"
+    implementation = "0x44e999d5c2f66ef08613b5c27311b18c26a0e74d"
+    wrong_funder = "0x0000000000000000000000000000000000000002"
+
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", wrong_funder)
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "1")
+    monkeypatch.setattr(
+        order_placer.wallet_balance,
+        "fetch_contract_code",
+        lambda *_args, **_kwargs: (_proxy_runtime_code(implementation), "https://rpc.example"),
+    )
+
+    class FakeClient:
+        def get_address(self):
+            return signer
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+
+    with pytest.raises(MissingCredentialsError, match="does not control"):
+        placer._ensure_wallet_configuration_valid(FakeClient())
+
+
+def test_wallet_configuration_accepts_matching_proxy_wallet(monkeypatch):
+    signer = "0x0000000000000000000000000000000000000001"
+    implementation = "0x44e999d5c2f66ef08613b5c27311b18c26a0e74d"
+    funder = order_placer._derive_polymarket_proxy_funder(signer, implementation)
+
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", funder)
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "1")
+    monkeypatch.setattr(
+        order_placer.wallet_balance,
+        "fetch_contract_code",
+        lambda *_args, **_kwargs: (_proxy_runtime_code(implementation), "https://rpc.example"),
+    )
+
+    class FakeClient:
+        def get_address(self):
+            return signer
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+
+    placer._ensure_wallet_configuration_valid(FakeClient())
+
+    assert placer._wallet_configuration_checked is True
+
+
 def test_balance_preflight_refreshes_api_credentials_once_after_401(monkeypatch):
     monkeypatch.setenv("POLYMARKET_AUTH_WRITE_DOTENV", "false")
 

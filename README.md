@@ -206,6 +206,13 @@ $env:POLYMARKET_USER_WS_ENABLED="true"
 $env:SAFETY_RECONCILE_INTERVAL_MINUTES="60"
 ```
 
+For proxy wallets, the private key must be the signer for the configured
+`POLYMARKET_FUNDER_ADDRESS`. On startup and before live orders, the bot checks
+Polymarket Proxy wallet clones by deriving the expected proxy from the signer;
+if the signer derives a different proxy, it stops before submitting an order
+with a `POLYMARKET_PRIVATE_KEY does not control ...` error. Use signature type
+`1` for Polymarket Proxy/Magic wallets and `2` for Gnosis Safe/browser wallets.
+
 Run one live cycle first:
 
 ```powershell
