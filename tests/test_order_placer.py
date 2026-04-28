@@ -369,6 +369,60 @@ def test_balance_preflight_refreshes_api_credentials_once_after_401(monkeypatch)
     assert os.environ["POLYMARKET_API_KEY"] == "new-key"
 
 
+def test_balance_preflight_refresh_derives_before_create_after_401(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_AUTH_WRITE_DOTENV", "false")
+
+    class RefreshingClient:
+        def __init__(self):
+            self.update_calls = 0
+            self.derive_calls = 0
+            self.create_calls = 0
+
+        def update_balance_allowance(self, _params):
+            self.update_calls += 1
+            if self.update_calls == 1:
+                raise FakeAuthError()
+
+        def get_balance_allowance(self, _params):
+            return {"balance": "100", "allowance": "100"}
+
+        def derive_api_key(self):
+            self.derive_calls += 1
+            return SimpleNamespace(
+                api_key="derived-key",
+                api_secret="derived-secret",
+                api_passphrase="derived-passphrase",
+            )
+
+        def create_api_key(self):
+            self.create_calls += 1
+            raise AssertionError("refresh after 401 should derive before creating")
+
+        def set_api_creds(self, creds):
+            self.creds = creds
+
+    class RefreshingPlacer(OrderPlacer):
+        def __init__(self):
+            super().__init__(dry_run=False, clob_host="https://example.invalid")
+            self.client = RefreshingClient()
+
+        def _get_client(self):
+            return self.client
+
+        def _post_order(self, _client, _intent):
+            return {"success": True}
+
+    placer = RefreshingPlacer()
+
+    result = placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert result.posted is True
+    assert placer.client.update_calls == 2
+    assert placer.client.derive_calls == 1
+    assert placer.client.create_calls == 0
+    assert placer.client.creds.api_key == "derived-key"
+
+
 def test_fetch_open_orders_refreshes_api_credentials_after_401(monkeypatch):
     monkeypatch.setenv("POLYMARKET_AUTH_WRITE_DOTENV", "false")
 

@@ -169,6 +169,35 @@ def _set_api_creds_env(creds) -> None:
             os.environ[name] = value
 
 
+def _refresh_should_derive_first(reason: str) -> bool:
+    return reason != "missing_api_credentials"
+
+
+def _create_or_derive_api_credentials(client, *, reason: str):
+    if _refresh_should_derive_first(reason) and hasattr(client, "derive_api_key"):
+        try:
+            return client.derive_api_key()
+        except Exception as derive_exc:
+            if hasattr(client, "create_api_key"):
+                try:
+                    return client.create_api_key()
+                except Exception as create_exc:
+                    raise derive_exc from create_exc
+            raise
+
+    if hasattr(client, "create_or_derive_api_key"):
+        return client.create_or_derive_api_key()
+    if hasattr(client, "create_api_key"):
+        try:
+            return client.create_api_key()
+        except Exception:
+            if not hasattr(client, "derive_api_key"):
+                raise
+    if hasattr(client, "derive_api_key"):
+        return client.derive_api_key()
+    raise MissingCredentialsError("CLOB client cannot create or derive API credentials")
+
+
 def _signature_type_from_env() -> int | str | None:
     value = os.getenv("POLYMARKET_SIGNATURE_TYPE")
     if not value:
@@ -550,7 +579,7 @@ class OrderPlacer:
     def _refresh_api_credentials(self, client=None, *, reason: str):
         if client is None:
             client = self._get_client()
-        creds = client.create_or_derive_api_key()
+        creds = _create_or_derive_api_credentials(client, reason=reason)
         client.set_api_creds(creds)
         _set_api_creds_env(creds)
         dotenv_updated = _replace_dotenv_creds(config.DOTENV_PATH, creds)
