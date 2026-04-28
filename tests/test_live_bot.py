@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -591,6 +592,54 @@ def test_sync_stream_subscriptions_uses_token_and_condition_ids(monkeypatch, iso
 
     assert market_stream.tokens == ["yes-token", "no-token"]
     assert user_stream.condition_ids == ["0xabc"]
+    assert market_stream.warmups == [0.0]
+
+
+def test_market_stream_subscription_prioritizes_tradeable_candidates(monkeypatch, isolated_event_log):
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
+    monkeypatch.setenv("POLYMARKET_WS_MARKET_WARMUP_SECONDS", "0")
+    monkeypatch.setenv("POLYMARKET_WS_MARKET_MAX_TOKENS", "2")
+    logger = logging.getLogger("test_live_bot_stream_priority")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    market_stream = RecordingMarketStream()
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=PositionLedger(Path("data/test_stream_priority_positions.json")).load(),
+        logger=logger,
+        market_stream=market_stream,
+        user_stream=False,
+        event_log=isolated_event_log,
+    )
+    markets = [
+        {
+            "id": "off-topic",
+            "conditionId": "0xoff",
+            "question": "Who will win the championship?",
+            "volumeNum": "100000",
+            "endDate": "2026-04-28T12:00:00Z",
+            "clobTokenIds": json.dumps(["off-yes", "off-no"]),
+        },
+        {
+            "id": "weather-tradeable",
+            "conditionId": "0xweather",
+            "question": "Will the highest temperature in New York be above 70F on April 27, 2026?",
+            "volumeNum": "1000",
+            "endDate": "2026-04-28T12:00:00Z",
+            "clobTokenIds": json.dumps(["weather-yes", "weather-no"]),
+        },
+    ]
+
+    bot._sync_stream_subscriptions(
+        markets,
+        entered_positions={},
+        as_of=datetime(2026, 4, 24, 12, tzinfo=timezone.utc),
+    )
+
+    assert bot._last_market_stream_tokens == ("weather-yes", "weather-no")
+    assert market_stream.tokens[:2] == ["weather-yes", "weather-no"]
     assert market_stream.warmups == [0.0]
 
 

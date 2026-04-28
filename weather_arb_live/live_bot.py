@@ -258,12 +258,16 @@ class LiveBot:
 
         self.logger.info("cycle_markets count=%s", len(markets))
         self._last_active_markets = markets
-        self._sync_stream_subscriptions(markets)
+        entered_positions = self.ledger.entered_positions(include_dry_run=self.runtime.dry_run)
+        self._sync_stream_subscriptions(
+            markets,
+            entered_positions=entered_positions,
+            as_of=cycle_started,
+        )
         if not self._ensure_periodic_safety_reconcile(markets):
             return False
         if not self._ensure_reconciled_after_stream_reconnect(markets):
             return False
-        entered_positions = self.ledger.entered_positions(include_dry_run=self.runtime.dry_run)
         self._touch_existing_position_markets(markets, entered_positions)
         for market in markets:
             market_id = str(market.get("id") or market.get("conditionId") or "")
@@ -356,19 +360,34 @@ class LiveBot:
         interval = self.runtime.safety_reconcile_interval_seconds
         self._next_safety_reconcile_at = time.monotonic() + interval if interval > 0 else float("inf")
 
-    def _sync_stream_subscriptions(self, markets: list[dict]) -> None:
-        token_signature = tuple(
-            unique_market_token_ids(markets, max_tokens=self.runtime.ws_market_max_tokens)
-        )
-        if self.market_stream is not None and (token_signature or self._last_market_stream_tokens):
-            changed = token_signature != self._last_market_stream_tokens
-            try:
-                self.market_stream.set_market_candidates(markets)
-                if changed:
-                    self.market_stream.warmup(self.runtime.ws_market_warmup_seconds)
-                self._last_market_stream_tokens = token_signature
-            except Exception as exc:
-                self.logger.warning("market_ws_subscription_error error=%s", exc)
+    def _sync_stream_subscriptions(
+        self,
+        markets: list[dict],
+        *,
+        entered_positions: dict | None = None,
+        as_of: datetime | None = None,
+    ) -> None:
+        if self.market_stream is not None:
+            market_stream_markets = self._prioritize_market_stream_candidates(
+                markets,
+                entered_positions=entered_positions,
+                as_of=as_of,
+            )
+            token_signature = tuple(
+                unique_market_token_ids(
+                    market_stream_markets,
+                    max_tokens=self.runtime.ws_market_max_tokens,
+                )
+            )
+            if token_signature or self._last_market_stream_tokens:
+                changed = token_signature != self._last_market_stream_tokens
+                try:
+                    self.market_stream.set_market_candidates(market_stream_markets)
+                    if changed:
+                        self.market_stream.warmup(self.runtime.ws_market_warmup_seconds)
+                    self._last_market_stream_tokens = token_signature
+                except Exception as exc:
+                    self.logger.warning("market_ws_subscription_error error=%s", exc)
 
         condition_signature = tuple(unique_market_condition_ids(markets))
         if (
@@ -381,6 +400,65 @@ class LiveBot:
                 self._last_user_stream_markets = condition_signature
             except Exception as exc:
                 self.logger.warning("user_ws_subscription_error error=%s", exc)
+
+    def _prioritize_market_stream_candidates(
+        self,
+        markets: list[dict],
+        *,
+        entered_positions: dict | None = None,
+        as_of: datetime | None = None,
+    ) -> list[dict]:
+        if not markets:
+            return markets
+
+        now = as_of or datetime.now(timezone.utc)
+        scored: list[tuple[tuple[int, float, float, int], dict]] = []
+        static_candidates = 0
+        position_candidates = 0
+        for index, market in enumerate(markets):
+            has_position = entered_position_for_market(market, entered_positions) is not None
+            is_static_candidate = self._market_stream_static_candidate(market, as_of=now)
+            if has_position:
+                position_candidates += 1
+            elif is_static_candidate:
+                static_candidates += 1
+            bucket = 0 if has_position else 1 if is_static_candidate else 2
+            resolution_ts = self._market_resolution_sort_ts(market)
+            scored.append(((bucket, -market_volume_usd(market), resolution_ts, index), market))
+
+        scored.sort(key=lambda item: item[0])
+        prioritized = [market for _key, market in scored]
+        if position_candidates or static_candidates:
+            self.logger.info(
+                "market_ws_subscription_prioritized position_markets=%s static_candidate_markets=%s total_markets=%s",
+                position_candidates,
+                static_candidates,
+                len(markets),
+            )
+        return prioritized
+
+    def _market_stream_static_candidate(self, market: dict, *, as_of: datetime) -> bool:
+        for side in self._market_stream_candidate_sides():
+            decision = evaluate_market(
+                market,
+                None,
+                side=side,
+                as_of=as_of,
+                entered_positions=None,
+                calibration=self.calibration,
+                max_position_usd=self.runtime.max_position_usd,
+            )
+            if decision.reason == "missing_live_price":
+                return True
+        return False
+
+    def _market_stream_candidate_sides(self) -> tuple[str, ...]:
+        return ("YES", "NO") if self.runtime.enable_no_side else ("YES",)
+
+    @staticmethod
+    def _market_resolution_sort_ts(market: dict) -> float:
+        resolved_at = resolution_datetime(market)
+        return resolved_at.timestamp() if resolved_at is not None else float("inf")
 
     def _ensure_periodic_safety_reconcile(self, markets: list[dict]) -> bool:
         if self.runtime.dry_run or self.runtime.safety_reconcile_interval_seconds <= 0:
