@@ -118,6 +118,41 @@ def _eth_call(
     return int(result, 16)
 
 
+def fetch_contract_code(
+    address: str,
+    *,
+    timeout_seconds: float = 4.0,
+) -> tuple[str, str]:
+    last_error: Exception | None = None
+    clean_address = _clean_address(address)
+    for rpc_url in rpc_urls():
+        try:
+            response = requests.post(
+                rpc_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_getCode",
+                    "params": [clean_address, "latest"],
+                },
+                headers={"User-Agent": "weather-arb-live"},
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            payload: Any = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"unexpected RPC response: {type(payload).__name__}")
+            if payload.get("error"):
+                raise ValueError(f"RPC error: {payload['error']}")
+            result = payload.get("result")
+            if not isinstance(result, str) or not result.startswith("0x"):
+                raise ValueError(f"RPC response missing hex result: {payload!r}")
+            return result, rpc_url
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"contract code RPC failed: {last_error}") from last_error
+
+
 def fetch_erc20_balance(
     address: str,
     *,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -66,6 +67,7 @@ POLYMARKET_API_ENV_VARS = (
 )
 VALID_SIGNATURE_TYPES = {0, 1, 2}
 LIVE_ORDER_TYPE = "FOK"
+BYTES32_ZERO = "0x" + "0" * 64
 V1_COLLATERAL_SPENDERS = {
     "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
     "0xc5d563a36ae78145c45a50134d48a1215220f80a",
@@ -75,11 +77,18 @@ V1_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 V1_NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 V2_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
 V2_NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
+V2_CTF_COLLATERAL_ADAPTER = "0xADa100874d00e3331D00F2007a9c336a65009718"
+V2_NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xAdA200001000ef00D07553cEE7006808F895c6F1"
 V2_COLLATERAL_SPENDERS = {
     V2_EXCHANGE.lower(),
     V2_NEG_RISK_EXCHANGE.lower(),
+    V2_CTF_COLLATERAL_ADAPTER.lower(),
+    V2_NEG_RISK_CTF_COLLATERAL_ADAPTER.lower(),
     "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
 }
+POLYMARKET_PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+POLYMARKET_PROXY_RUNTIME_PREFIX = "363d3d373d3d3d363d73"
+POLYMARKET_PROXY_RUNTIME_SUFFIX = "5af43d82803e903d91602b57fd5bf3"
 
 
 def build_order_intent(
@@ -127,6 +136,21 @@ def _is_api_key_auth_error(exc: Exception) -> bool:
     return False
 
 
+def _is_invalid_signature_error(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        error_msg = getattr(current, "error_msg", None)
+        if error_msg is not None:
+            message = f"{message} {error_msg}".lower()
+        if "invalid signature" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _is_retryable(exc: Exception) -> bool:
     return network.is_retryable_status(network.response_status(exc))
 
@@ -161,6 +185,78 @@ def _signature_type_from_env() -> int | str | None:
             f"(got {signature_type})"
         )
     return signature_type
+
+
+def _bytes32_from_env(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if not value:
+            continue
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if (
+            not normalized.startswith("0x")
+            or len(normalized) != len(BYTES32_ZERO)
+            or any(char not in "0123456789abcdefABCDEF" for char in normalized[2:])
+        ):
+            raise MissingCredentialsError(
+                f"{name} must be a 32-byte hex value like 0x{'0' * 64}"
+            )
+        return normalized
+    return None
+
+
+def _builder_config_from_env(builder_config_cls):
+    builder_code = _bytes32_from_env("POLY_BUILDER_CODE", "POLYMARKET_BUILDER_CODE")
+    if not builder_code or builder_code == BYTES32_ZERO:
+        return None
+
+    params = inspect.signature(builder_config_cls).parameters
+    if "builder_code" in params:
+        return builder_config_cls(builder_code=builder_code)
+    if "builderCode" in params:
+        return builder_config_cls(builderCode=builder_code)
+
+    config_obj = builder_config_cls()
+    setattr(config_obj, "builder_code", builder_code)
+    return config_obj
+
+
+def _clob_chain_kwarg(clob_client_cls) -> str:
+    params = inspect.signature(clob_client_cls).parameters
+    if "chain_id" in params:
+        return "chain_id"
+    if "chain" in params:
+        return "chain"
+    return "chain_id"
+
+
+def build_clob_client_kwargs(
+    clob_client_cls,
+    builder_config_cls,
+    *,
+    host: str,
+    key: str,
+    creds: Any | None = None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "host": host,
+        _clob_chain_kwarg(clob_client_cls): int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
+        "key": key,
+    }
+    if creds is not None:
+        kwargs["creds"] = creds
+    signature_type = _signature_type_from_env()
+    if signature_type is not None:
+        kwargs["signature_type"] = signature_type
+    funder = os.getenv("POLYMARKET_FUNDER_ADDRESS")
+    if funder:
+        kwargs["funder"] = funder
+    builder_config = _builder_config_from_env(builder_config_cls)
+    if builder_config is not None:
+        kwargs["builder_config"] = builder_config
+    return kwargs
 
 
 def _replace_dotenv_creds(path: str | Path, creds) -> bool:
@@ -271,6 +367,63 @@ def _version_from_balance_response(response: Any) -> int | None:
     return None
 
 
+def _clean_evm_address(address: str) -> str:
+    value = str(address or "").strip()
+    if not value.startswith("0x") or len(value) != 42:
+        raise ValueError(f"invalid EVM address: {address!r}")
+    return value
+
+
+def _evm_address_bytes(address: str) -> bytes:
+    return bytes.fromhex(_clean_evm_address(address).removeprefix("0x"))
+
+
+def _polymarket_proxy_implementation_from_runtime_code(code: str) -> str | None:
+    raw = str(code or "").lower().removeprefix("0x")
+    expected_len = (
+        len(POLYMARKET_PROXY_RUNTIME_PREFIX)
+        + 40
+        + len(POLYMARKET_PROXY_RUNTIME_SUFFIX)
+    )
+    if len(raw) != expected_len:
+        return None
+    if not raw.startswith(POLYMARKET_PROXY_RUNTIME_PREFIX):
+        return None
+    if not raw.endswith(POLYMARKET_PROXY_RUNTIME_SUFFIX):
+        return None
+    start = len(POLYMARKET_PROXY_RUNTIME_PREFIX)
+    return "0x" + raw[start : start + 40]
+
+
+def _polymarket_proxy_creation_code(factory: str, implementation: str) -> bytes:
+    from eth_utils import keccak
+
+    selector = keccak(text="cloneConstructor(bytes)")[:4]
+    empty_bytes_arg = selector + (32).to_bytes(32, "big") + (0).to_bytes(32, "big")
+    return (
+        bytes.fromhex("3d3d606380380380913d393d73")
+        + _evm_address_bytes(factory)
+        + bytes.fromhex("5af4602a57600080fd5b602d8060366000396000f3363d3d373d3d3d363d73")
+        + _evm_address_bytes(implementation)
+        + bytes.fromhex("5af43d82803e903d91602b57fd5bf3")
+        + empty_bytes_arg
+    )
+
+
+def _derive_polymarket_proxy_funder(signer_address: str, implementation: str) -> str:
+    from eth_utils import keccak, to_checksum_address
+
+    salt = keccak(_evm_address_bytes(signer_address))
+    creation_code = _polymarket_proxy_creation_code(POLYMARKET_PROXY_FACTORY, implementation)
+    raw_address = keccak(
+        b"\xff"
+        + _evm_address_bytes(POLYMARKET_PROXY_FACTORY)
+        + salt
+        + keccak(creation_code)
+    )[-20:]
+    return to_checksum_address(raw_address)
+
+
 def _raise_for_rejected_order_response(response: dict[str, Any]) -> None:
     error = response.get("error") or response.get("errorMsg") or response.get("error_msg")
     if error:
@@ -285,6 +438,7 @@ class OrderPlacer:
         self.dry_run = config.dry_run() if dry_run is None else dry_run
         network.install()
         self._client = None
+        self._wallet_configuration_checked = False
 
     def place_order(
         self,
@@ -307,6 +461,7 @@ class OrderPlacer:
             return OrderResult(intent=intent, posted=False, response={"dry_run": True})
 
         client = self._get_client()
+        self._ensure_wallet_configuration_valid(client)
         try:
             self._ensure_sufficient_collateral(client, intent)
         except BalancePreflightError as exc:
@@ -333,6 +488,15 @@ class OrderPlacer:
                     logger.warning("clob_auth_refresh reason=order_post_401")
                     client = self._refresh_api_credentials(client, reason="order_post_401")
                     continue
+                if _is_invalid_signature_error(exc):
+                    self._wallet_configuration_checked = False
+                    self._ensure_wallet_configuration_valid(client, force=True)
+                    raise OrderPostRejectedError(
+                        "Polymarket rejected the signed order as invalid. "
+                        "Check POLYMARKET_PRIVATE_KEY, POLYMARKET_SIGNATURE_TYPE, "
+                        "and POLYMARKET_FUNDER_ADDRESS; API credentials alone cannot "
+                        "fix a signer/funder mismatch."
+                    ) from exc
                 if attempt == 3 or not _is_retryable(exc):
                     raise
                 sleep_seconds = 2 ** (attempt - 1)
@@ -357,7 +521,7 @@ class OrderPlacer:
         if self._client is not None:
             return self._client
 
-        from py_clob_client_v2 import ApiCreds, ClobClient
+        from py_clob_client_v2 import ApiCreds, BuilderConfig, ClobClient
 
         api_key = os.getenv("POLYMARKET_API_KEY")
         api_secret = os.getenv("POLYMARKET_API_SECRET")
@@ -369,19 +533,13 @@ class OrderPlacer:
                 api_secret=api_secret,
                 api_passphrase=api_passphrase,
             )
-        kwargs: dict[str, Any] = {
-            "host": self.clob_host,
-            "chain_id": int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
-            "key": _required_env("POLYMARKET_PRIVATE_KEY"),
-        }
-        if creds is not None:
-            kwargs["creds"] = creds
-        signature_type = _signature_type_from_env()
-        if signature_type:
-            kwargs["signature_type"] = signature_type
-        funder = os.getenv("POLYMARKET_FUNDER_ADDRESS")
-        if funder:
-            kwargs["funder"] = funder
+        kwargs = build_clob_client_kwargs(
+            ClobClient,
+            BuilderConfig,
+            host=self.clob_host,
+            key=_required_env("POLYMARKET_PRIVATE_KEY"),
+            creds=creds,
+        )
 
         self._client = ClobClient(**kwargs)
         if creds is None:
@@ -399,6 +557,76 @@ class OrderPlacer:
         logger.info("clob_auth_refreshed reason=%s dotenv_updated=%s", reason, dotenv_updated)
         return client
 
+    def _ensure_wallet_configuration_valid(self, client, *, force: bool = False) -> None:
+        if self.dry_run:
+            return
+        if self._wallet_configuration_checked and not force:
+            return
+
+        funder = os.getenv("POLYMARKET_FUNDER_ADDRESS")
+        if not funder:
+            self._wallet_configuration_checked = True
+            return
+
+        signature_type = _signature_type_from_env()
+        try:
+            signer_address = str(client.get_address())
+        except Exception as exc:
+            logger.warning(
+                "wallet_configuration_check_unavailable funder=%s error=%s",
+                _mask_address(funder),
+                exc,
+            )
+            self._wallet_configuration_checked = True
+            return
+        try:
+            code, rpc_url = wallet_balance.fetch_contract_code(
+                funder,
+                timeout_seconds=4.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "wallet_configuration_check_unavailable signer=%s funder=%s error=%s",
+                _mask_address(signer_address),
+                _mask_address(funder),
+                exc,
+            )
+            self._wallet_configuration_checked = True
+            return
+
+        implementation = _polymarket_proxy_implementation_from_runtime_code(code)
+        if implementation is None:
+            self._wallet_configuration_checked = True
+            return
+
+        derived_funder = _derive_polymarket_proxy_funder(signer_address, implementation)
+        logger.info(
+            "wallet_configuration_check signer=%s funder=%s derived_proxy_funder=%s "
+            "wallet_type=polymarket_proxy signature_type=%s rpc=%s",
+            _mask_address(signer_address),
+            _mask_address(funder),
+            _mask_address(derived_funder),
+            signature_type if signature_type is not None else "unset",
+            rpc_url,
+        )
+
+        if signature_type != 1:
+            raise MissingCredentialsError(
+                "POLYMARKET_FUNDER_ADDRESS is a Polymarket Proxy wallet clone, "
+                f"so POLYMARKET_SIGNATURE_TYPE must be 1, got {signature_type!r}. "
+                "Restart the bot after changing .env."
+            )
+        if derived_funder.lower() != _clean_evm_address(funder).lower():
+            raise MissingCredentialsError(
+                "POLYMARKET_PRIVATE_KEY does not control the configured "
+                "POLYMARKET_FUNDER_ADDRESS. "
+                f"Signer {signer_address} derives proxy {derived_funder}, "
+                f"but .env funder is {funder}. Use the private key exported from "
+                "the Polymarket account that owns the funded proxy wallet, or move "
+                "funds to the derived proxy wallet."
+            )
+        self._wallet_configuration_checked = True
+
     def ensure_api_credentials(self) -> None:
         if self.dry_run:
             return
@@ -406,6 +634,7 @@ class OrderPlacer:
         from py_clob_client_v2 import AssetType, BalanceAllowanceParams
 
         client = self._get_client()
+        self._ensure_wallet_configuration_valid(client)
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         try:
             client.update_balance_allowance(params)

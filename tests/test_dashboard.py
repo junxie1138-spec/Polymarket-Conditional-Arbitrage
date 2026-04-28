@@ -257,7 +257,7 @@ def test_dashboard_account_fetch_uses_snapshot(monkeypatch):
             path.unlink(missing_ok=True)
 
 
-def test_dashboard_account_fetch_prefers_wallet_usdc_when_clob_balance_is_zero(monkeypatch):
+def test_dashboard_account_fetch_prefers_wallet_collateral_when_clob_balance_is_zero(monkeypatch):
     captured = {}
 
     class FakeClobClient:
@@ -299,7 +299,7 @@ def test_dashboard_account_fetch_prefers_wallet_usdc_when_clob_balance_is_zero(m
     assert snapshot["balance_usd"] == 83.38
     assert snapshot["wallet_balance_usd"] == 83.38
     assert snapshot["clob_balance_usd"] == 0.0
-    assert snapshot["balance_source"] == "wallet_usdc"
+    assert snapshot["balance_source"] == "wallet_collateral"
     assert snapshot["funder_address"] == "0x1111...1111"
     assert snapshot["signer_address"] == "0x2222...2222"
     assert "CLOB balance endpoint reported 0" in snapshot["warning"]

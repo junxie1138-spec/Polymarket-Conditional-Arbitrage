@@ -1377,7 +1377,7 @@ DASHBOARD_HTML = """<!doctype html>
       setText(
         "accountSub",
         account.status === "ok"
-          ? account.balance_source === "wallet_usdc"
+          ? account.balance_source === "wallet_collateral"
             ? `${account.wallet_token || "Wallet"} / CLOB ${formatMoney(account.clob_balance_usd)}`
             : `Allowance ${account.allowance_usd === null || account.allowance_usd === undefined ? "-" : formatMoney(account.allowance_usd)}`
           : account.error || account.status_label
@@ -1428,7 +1428,7 @@ DASHBOARD_HTML = """<!doctype html>
 
       appendKv(el, "Account balance", formatMoney(account.balance_usd), { mono: true });
       if (account.wallet_balance_usd !== null && account.wallet_balance_usd !== undefined) {
-        appendKv(el, `Wallet ${account.wallet_token || "USDC"}`, formatMoney(account.wallet_balance_usd), { mono: true });
+        appendKv(el, `Wallet ${account.wallet_token || "collateral"}`, formatMoney(account.wallet_balance_usd), { mono: true });
       }
       appendKv(el, "CLOB balance", formatMoney(account.clob_balance_usd), { mono: true });
       appendKv(el, "CLOB allowance", formatMoney(account.clob_allowance_usd), { mono: true });
