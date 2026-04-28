@@ -97,9 +97,11 @@ $env:EVENT_SNAPSHOT_INTERVAL_MINUTES="5"
 ```
 
 `POLYMARKET_WS_MARKET_MAX_TOKENS` caps the active token subscription set to
-stay bounded during broad scans. If the WebSocket disconnects and reconnects
-in live mode, the next bot cycle schedules REST reconciliation before trading;
-rapid reconnect loops are throttled by
+stay bounded during broad scans. When the scan has more tokens than the cap,
+the bot prioritizes existing positions and markets that pass static trade
+filters before applying the cap, then falls back to higher-volume markets. If
+the WebSocket disconnects and reconnects in live mode, the next bot cycle
+schedules REST reconciliation before trading; rapid reconnect loops are throttled by
 `SAFETY_RECONCILE_MIN_INTERVAL_SECONDS`.
 
 The effective cap is logged at startup as `max_position_usd=...` and shown in
