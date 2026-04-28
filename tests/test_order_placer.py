@@ -177,6 +177,65 @@ def test_live_client_rejects_invalid_signature_type(monkeypatch):
         placer._get_client()
 
 
+def test_live_client_passes_builder_code_to_v2_builder_config(monkeypatch):
+    builder_code = "0x" + "1" * 64
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "private-key")
+    monkeypatch.setenv("POLYMARKET_API_KEY", "api-key")
+    monkeypatch.setenv("POLYMARKET_API_SECRET", "api-secret")
+    monkeypatch.setenv("POLYMARKET_API_PASSPHRASE", "api-passphrase")
+    monkeypatch.setenv("POLY_BUILDER_CODE", builder_code)
+
+    captured = {}
+
+    class FakeClobClient:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("py_clob_client_v2.ClobClient", FakeClobClient)
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+    placer._get_client()
+
+    assert captured["kwargs"]["builder_config"].builder_code == builder_code
+
+
+def test_live_client_rejects_invalid_builder_code(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "private-key")
+    monkeypatch.setenv("POLYMARKET_API_KEY", "api-key")
+    monkeypatch.setenv("POLYMARKET_API_SECRET", "api-secret")
+    monkeypatch.setenv("POLYMARKET_API_PASSPHRASE", "api-passphrase")
+    monkeypatch.setenv("POLY_BUILDER_CODE", "not-bytes32")
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+
+    with pytest.raises(MissingCredentialsError, match="POLY_BUILDER_CODE"):
+        placer._get_client()
+
+
+def test_clob_client_kwargs_uses_chain_alias_when_sdk_exposes_chain(monkeypatch):
+    class ChainClient:
+        def __init__(self, host, chain, key):
+            pass
+
+    class BuilderConfig:
+        def __init__(self, builder_code=""):
+            self.builder_code = builder_code
+
+    monkeypatch.setenv("POLYMARKET_CHAIN_ID", "137")
+    monkeypatch.delenv("POLY_BUILDER_CODE", raising=False)
+    monkeypatch.delenv("POLYMARKET_BUILDER_CODE", raising=False)
+
+    kwargs = order_placer.build_clob_client_kwargs(
+        ChainClient,
+        BuilderConfig,
+        host="https://example.invalid",
+        key="private-key",
+    )
+
+    assert kwargs["chain"] == 137
+    assert "chain_id" not in kwargs
+
+
 def _proxy_runtime_code(implementation: str) -> str:
     return (
         "0x"
@@ -423,6 +482,39 @@ def test_live_order_uses_wallet_balance_fallback_for_zero_clob_balance(monkeypat
     assert calls[0][2] == "USDC.e"
 
 
+def test_live_order_uses_pusd_wallet_balance_fallback_for_v2_spenders(monkeypatch):
+    funder = "0x1111111111111111111111111111111111111111"
+    calls = []
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", funder)
+
+    def fake_fetch(address, *, token_address, token_symbol, ttl_seconds, timeout_seconds=4.0):
+        calls.append((address, token_address, token_symbol, ttl_seconds, timeout_seconds))
+        return WalletBalance(
+            address=address,
+            token_address=token_address,
+            token_symbol=token_symbol,
+            balance=Decimal("83.376702"),
+            rpc_url="https://rpc.test",
+        )
+
+    monkeypatch.setattr(order_placer.wallet_balance, "fetch_cached_erc20_balance", fake_fetch)
+    placer = BalanceGuardPlacer(
+        {
+            "balance": "0",
+            "allowances": {
+                order_placer.V2_CTF_COLLATERAL_ADAPTER: "100",
+            },
+        }
+    )
+
+    result = placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert result.posted is True
+    assert calls[0][0] == funder
+    assert calls[0][1] == order_placer.wallet_balance.PUSD_TOKEN
+    assert calls[0][2] == "pUSD"
+
+
 def test_live_order_blocks_when_collateral_allowance_is_too_low():
     placer = BalanceGuardPlacer({"balance": "100", "allowance": "0.50"})
 
@@ -466,6 +558,42 @@ def test_live_order_uses_wallet_allowance_fallback_for_zero_clob_allowance(monke
     assert calls[0][1] == order_placer.V1_NEG_RISK_EXCHANGE
     assert calls[0][2] == order_placer.wallet_balance.BRIDGED_USDC_TOKEN
     assert calls[0][3] == "USDC.e"
+
+
+def test_live_order_uses_pusd_v2_exchange_allowance_fallback(monkeypatch):
+    funder = "0x1111111111111111111111111111111111111111"
+    calls = []
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", funder)
+
+    def fake_fetch(owner_address, spender_address, *, token_address, token_symbol, ttl_seconds, timeout_seconds=4.0):
+        calls.append((owner_address, spender_address, token_address, token_symbol, ttl_seconds, timeout_seconds))
+        return WalletAllowance(
+            owner_address=owner_address,
+            spender_address=spender_address,
+            token_address=token_address,
+            token_symbol=token_symbol,
+            allowance=Decimal("100"),
+            rpc_url="https://rpc.test",
+        )
+
+    class AllowanceFallbackClient(BalanceClient):
+        def get_version(self):
+            return 2
+
+        def get_neg_risk(self, _token_id):
+            return True
+
+    monkeypatch.setattr(order_placer.wallet_balance, "fetch_cached_erc20_allowance", fake_fetch)
+    placer = BalanceGuardPlacer({"balance": "100", "allowance": "0"})
+    placer.client = AllowanceFallbackClient({"balance": "100", "allowance": "0"})
+
+    result = placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert result.posted is True
+    assert calls[0][0] == funder
+    assert calls[0][1] == order_placer.V2_NEG_RISK_EXCHANGE
+    assert calls[0][2] == order_placer.wallet_balance.PUSD_TOKEN
+    assert calls[0][3] == "pUSD"
 
 
 def test_live_order_uses_lowest_allowance_from_allowance_map():

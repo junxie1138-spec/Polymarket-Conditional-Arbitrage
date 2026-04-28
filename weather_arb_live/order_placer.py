@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -66,6 +67,7 @@ POLYMARKET_API_ENV_VARS = (
 )
 VALID_SIGNATURE_TYPES = {0, 1, 2}
 LIVE_ORDER_TYPE = "FOK"
+BYTES32_ZERO = "0x" + "0" * 64
 V1_COLLATERAL_SPENDERS = {
     "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
     "0xc5d563a36ae78145c45a50134d48a1215220f80a",
@@ -75,9 +77,13 @@ V1_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 V1_NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 V2_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
 V2_NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
+V2_CTF_COLLATERAL_ADAPTER = "0xADa100874d00e3331D00F2007a9c336a65009718"
+V2_NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xAdA200001000ef00D07553cEE7006808F895c6F1"
 V2_COLLATERAL_SPENDERS = {
     V2_EXCHANGE.lower(),
     V2_NEG_RISK_EXCHANGE.lower(),
+    V2_CTF_COLLATERAL_ADAPTER.lower(),
+    V2_NEG_RISK_CTF_COLLATERAL_ADAPTER.lower(),
     "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
 }
 POLYMARKET_PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
@@ -179,6 +185,78 @@ def _signature_type_from_env() -> int | str | None:
             f"(got {signature_type})"
         )
     return signature_type
+
+
+def _bytes32_from_env(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if not value:
+            continue
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if (
+            not normalized.startswith("0x")
+            or len(normalized) != len(BYTES32_ZERO)
+            or any(char not in "0123456789abcdefABCDEF" for char in normalized[2:])
+        ):
+            raise MissingCredentialsError(
+                f"{name} must be a 32-byte hex value like 0x{'0' * 64}"
+            )
+        return normalized
+    return None
+
+
+def _builder_config_from_env(builder_config_cls):
+    builder_code = _bytes32_from_env("POLY_BUILDER_CODE", "POLYMARKET_BUILDER_CODE")
+    if not builder_code or builder_code == BYTES32_ZERO:
+        return None
+
+    params = inspect.signature(builder_config_cls).parameters
+    if "builder_code" in params:
+        return builder_config_cls(builder_code=builder_code)
+    if "builderCode" in params:
+        return builder_config_cls(builderCode=builder_code)
+
+    config_obj = builder_config_cls()
+    setattr(config_obj, "builder_code", builder_code)
+    return config_obj
+
+
+def _clob_chain_kwarg(clob_client_cls) -> str:
+    params = inspect.signature(clob_client_cls).parameters
+    if "chain_id" in params:
+        return "chain_id"
+    if "chain" in params:
+        return "chain"
+    return "chain_id"
+
+
+def build_clob_client_kwargs(
+    clob_client_cls,
+    builder_config_cls,
+    *,
+    host: str,
+    key: str,
+    creds: Any | None = None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "host": host,
+        _clob_chain_kwarg(clob_client_cls): int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
+        "key": key,
+    }
+    if creds is not None:
+        kwargs["creds"] = creds
+    signature_type = _signature_type_from_env()
+    if signature_type is not None:
+        kwargs["signature_type"] = signature_type
+    funder = os.getenv("POLYMARKET_FUNDER_ADDRESS")
+    if funder:
+        kwargs["funder"] = funder
+    builder_config = _builder_config_from_env(builder_config_cls)
+    if builder_config is not None:
+        kwargs["builder_config"] = builder_config
+    return kwargs
 
 
 def _replace_dotenv_creds(path: str | Path, creds) -> bool:
@@ -443,7 +521,7 @@ class OrderPlacer:
         if self._client is not None:
             return self._client
 
-        from py_clob_client_v2 import ApiCreds, ClobClient
+        from py_clob_client_v2 import ApiCreds, BuilderConfig, ClobClient
 
         api_key = os.getenv("POLYMARKET_API_KEY")
         api_secret = os.getenv("POLYMARKET_API_SECRET")
@@ -455,19 +533,13 @@ class OrderPlacer:
                 api_secret=api_secret,
                 api_passphrase=api_passphrase,
             )
-        kwargs: dict[str, Any] = {
-            "host": self.clob_host,
-            "chain_id": int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
-            "key": _required_env("POLYMARKET_PRIVATE_KEY"),
-        }
-        if creds is not None:
-            kwargs["creds"] = creds
-        signature_type = _signature_type_from_env()
-        if signature_type:
-            kwargs["signature_type"] = signature_type
-        funder = os.getenv("POLYMARKET_FUNDER_ADDRESS")
-        if funder:
-            kwargs["funder"] = funder
+        kwargs = build_clob_client_kwargs(
+            ClobClient,
+            BuilderConfig,
+            host=self.clob_host,
+            key=_required_env("POLYMARKET_PRIVATE_KEY"),
+            creds=creds,
+        )
 
         self._client = ClobClient(**kwargs)
         if creds is None:

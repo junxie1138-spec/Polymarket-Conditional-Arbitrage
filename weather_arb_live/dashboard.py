@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__, config, network, wallet_balance
 from .dashboard_ui import DASHBOARD_HTML
 from .live_fetcher import midpoint_from_book
+from .order_placer import build_clob_client_kwargs
 
 
 LOG_PATH = config.LOG_DIR / "live_bot.log"
@@ -65,6 +66,8 @@ OPTIONAL_RUNTIME_ENV = (
     "POLYMARKET_SIGNATURE_TYPE",
     "POLYMARKET_AUTH_WRITE_DOTENV",
     "POLYMARKET_TICK_SIZE",
+    "POLY_BUILDER_CODE",
+    "POLYMARKET_BUILDER_CODE",
 )
 
 MARK_FETCH_TIMEOUT_SECONDS = 2.0
@@ -183,25 +186,21 @@ def _fetch_wallet_balance_payload(address: str | None) -> tuple[wallet_balance.W
 
 
 def _fetch_account_snapshot_once(runtime: dict[str, Any]) -> dict[str, Any]:
-    from py_clob_client_v2 import ApiCreds, AssetType, BalanceAllowanceParams, ClobClient
+    from py_clob_client_v2 import ApiCreds, AssetType, BalanceAllowanceParams, BuilderConfig, ClobClient
 
     creds = ApiCreds(
         api_key=os.environ["POLYMARKET_API_KEY"],
         api_secret=os.environ["POLYMARKET_API_SECRET"],
         api_passphrase=os.environ["POLYMARKET_API_PASSPHRASE"],
     )
-    kwargs: dict[str, Any] = {
-        "host": str(runtime.get("clob_host") or config.clob_host()).rstrip("/"),
-        "chain_id": int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
-        "key": os.environ["POLYMARKET_PRIVATE_KEY"],
-        "creds": creds,
-    }
-    signature_type = os.getenv("POLYMARKET_SIGNATURE_TYPE")
-    if signature_type:
-        kwargs["signature_type"] = int(signature_type) if signature_type.isdigit() else signature_type
     funder = os.getenv("POLYMARKET_FUNDER_ADDRESS")
-    if funder:
-        kwargs["funder"] = funder
+    kwargs = build_clob_client_kwargs(
+        ClobClient,
+        BuilderConfig,
+        host=str(runtime.get("clob_host") or config.clob_host()).rstrip("/"),
+        key=os.environ["POLYMARKET_PRIVATE_KEY"],
+        creds=creds,
+    )
 
     client = ClobClient(**kwargs)
     signer_address = str(client.get_address())
@@ -216,7 +215,7 @@ def _fetch_account_snapshot_once(runtime: dict[str, Any]) -> dict[str, Any]:
     warning = None
     if wallet_snapshot is not None and wallet_snapshot.balance > clob_balance:
         display_balance = wallet_snapshot.balance
-        balance_source = "wallet_usdc"
+        balance_source = "wallet_collateral"
         if clob_balance == 0:
             warning = f"CLOB balance endpoint reported 0; showing wallet {wallet_snapshot.token_symbol} balance"
 

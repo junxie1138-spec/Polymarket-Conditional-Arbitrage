@@ -192,6 +192,7 @@ Optional:
 $env:POLYMARKET_CLOB_HOST="https://clob.polymarket.com"
 $env:POLYMARKET_SIGNATURE_TYPE="2" # 0=EOA, 1=POLY_PROXY/Magic, 2=GNOSIS_SAFE
 $env:POLYMARKET_FUNDER_ADDRESS="..."
+$env:POLY_BUILDER_CODE="0x..." # optional V2 builder attribution bytes32
 $env:POLYMARKET_WALLET_BALANCE_TTL_SECONDS="60"
 $env:POLYMARKET_WALLET_BALANCE_PREFLIGHT_FALLBACK="true"
 $env:POLYGON_RPC_URL="https://..."
@@ -212,6 +213,9 @@ Polymarket Proxy wallet clones by deriving the expected proxy from the signer;
 if the signer derives a different proxy, it stops before submitting an order
 with a `POLYMARKET_PRIVATE_KEY does not control ...` error. Use signature type
 `1` for Polymarket Proxy/Magic wallets and `2` for Gnosis Safe/browser wallets.
+If you participate in the Builder Program, set `POLY_BUILDER_CODE` to the
+bytes32 code from your Builder Profile. V2 attaches that code directly to the
+signed order; the old builder HMAC order-signing headers are not used.
 
 Run one live cycle first:
 
