@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from weather_arb_live import config
 
 
@@ -62,6 +64,13 @@ def test_max_position_usd_rejects_non_positive_env(monkeypatch):
         assert "MAX_POSITION_USD" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_invalid_boolean_env_value_fails_closed(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "ture")
+
+    with pytest.raises(ValueError, match="DRY_RUN"):
+        config.dry_run()
 
 
 def test_event_snapshot_interval_uses_minutes_with_one_minimum(monkeypatch):

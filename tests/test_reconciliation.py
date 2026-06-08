@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from weather_arb_live.event_log import LiveEventLog
 from weather_arb_live.ledger import PositionLedger
 from weather_arb_live.reconciliation import Reconciler
@@ -165,6 +167,83 @@ def test_reconcile_matches_existing_unknown_order_guard():
         assert result.added_guards == 0
         assert ledger.positions["gamma-1"]["reconciliation"]["status"] == "matched_position"
         assert ledger.positions["gamma-1"]["reconciliation"]["requires_manual_review"] is False
+    finally:
+        _cleanup(ledger)
+
+
+def test_reconcile_matches_existing_ledger_row_outside_active_market_slice():
+    ledger = _ledger("test_reconcile_limited_market_slice.json")
+    ledger.positions["gamma-outside"] = {
+        "market_id": "gamma-outside",
+        "condition_id": "0xoutside",
+        "token_id": "outside-token",
+        "dry_run": False,
+        "order_response": {"posted": "unknown"},
+    }
+    reconciler = StaticPositionsReconciler(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=ledger,
+        positions=[
+            {
+                "asset": "outside-token",
+                "conditionId": "0xoutside",
+                "size": 10,
+                "avgPrice": 0.4,
+            }
+        ],
+    )
+
+    try:
+        result = reconciler.reconcile()
+
+        assert result.matched_local == 1
+        assert result.missing_local == 0
+        assert result.added_guards == 0
+        assert ledger.positions["gamma-outside"]["reconciliation"]["status"] == "matched_position"
+    finally:
+        _cleanup(ledger)
+
+
+def test_reconcile_does_not_add_guard_for_unrelated_exchange_position():
+    ledger = _ledger("test_reconcile_unrelated_position.json")
+    reconciler = StaticPositionsReconciler(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=ledger,
+        positions=[
+            {
+                "asset": "outside-token",
+                "conditionId": "0xoutside",
+                "size": 10,
+                "avgPrice": 0.4,
+            }
+        ],
+    )
+
+    try:
+        result = reconciler.reconcile()
+
+        assert result.added_guards == 0
+        assert ledger.positions == {}
+    finally:
+        _cleanup(ledger)
+
+
+def test_reconcile_rejects_address_override_that_differs_from_trading_funder(monkeypatch):
+    ledger = _ledger("test_reconcile_address_mismatch.json")
+    monkeypatch.setenv("POLYMARKET_RECONCILE_USER_ADDRESS", "0x0000000000000000000000000000000000000002")
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000001")
+    reconciler = StaticPositionsReconciler(
+        fetcher=FakeFetcher(),
+        order_placer=FakeOrderPlacer(),
+        ledger=ledger,
+        positions=[],
+    )
+
+    try:
+        with pytest.raises(ValueError, match="must match"):
+            reconciler.reconcile()
     finally:
         _cleanup(ledger)
 

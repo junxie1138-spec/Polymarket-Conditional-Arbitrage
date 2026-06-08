@@ -652,6 +652,8 @@ class PolymarketUserStream:
         stream_url = f"{(base_url or config.polymarket_ws_base_url()).rstrip('/')}/user"
         self._logger = logger_ or logger
         self._event_log = event_log
+        self._emitted_user_event_keys: set[tuple[Any, ...]] = set()
+        self._emitted_user_event_order: deque[tuple[Any, ...]] = deque()
         self._stream = _SubscriptionStream(
             name="user",
             url=stream_url,
@@ -742,6 +744,36 @@ class PolymarketUserStream:
             return
         try:
             for event_type, event_payload in order_lifecycle_events_from_payload(payload):
+                key = self._user_event_key(payload, event_type, event_payload)
+                if not self._remember_user_event_key(key):
+                    continue
                 self._event_log.append_event(event_type, event_payload)
         except Exception as exc:
             self._logger.warning("user_ws_event_log_failed error=%s", exc)
+
+    @staticmethod
+    def _user_event_key(
+        payload: dict[str, Any],
+        event_type: str,
+        event_payload: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        return (
+            event_type,
+            payload.get("order_id") or payload.get("orderID") or payload.get("id") or payload.get("hash"),
+            payload.get("market") or payload.get("conditionId") or payload.get("condition_id"),
+            payload.get("asset_id") or payload.get("asset") or payload.get("token_id") or payload.get("tokenId"),
+            payload.get("status"),
+            payload.get("timestamp"),
+            event_payload.get("fill_quantity"),
+            event_payload.get("filled_price"),
+            event_payload.get("remaining_quantity"),
+        )
+
+    def _remember_user_event_key(self, key: tuple[Any, ...]) -> bool:
+        if key in self._emitted_user_event_keys:
+            return False
+        self._emitted_user_event_keys.add(key)
+        self._emitted_user_event_order.append(key)
+        while len(self._emitted_user_event_order) > 1000:
+            self._emitted_user_event_keys.discard(self._emitted_user_event_order.popleft())
+        return True

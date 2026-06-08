@@ -185,6 +185,64 @@ def test_dashboard_state_summarizes_positions_and_hides_secret_values(monkeypatc
             path.unlink(missing_ok=True)
 
 
+def test_pnl_history_read_error_does_not_overwrite_file():
+    path = Path("data/test_dashboard_corrupt_pnl_history.json")
+    original = "{not-json"
+    path.write_text(original, encoding="utf-8")
+    try:
+        history, error = dashboard.record_pnl_history_snapshot(
+            {"total_pnl_usd": 1, "total_position_usd": 10, "total": 1, "pnl_count": 1},
+            generated_at="2026-04-25T08:00:00+00:00",
+            mark_count=0,
+            path=path,
+        )
+
+        assert history == []
+        assert error
+        assert path.read_text(encoding="utf-8") == original
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_pnl_history_preserves_points_envelope_metadata():
+    path = Path("data/test_dashboard_enveloped_pnl_history.json")
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "points": [
+                    {
+                        "timestamp": "2026-04-25T08:00:00+00:00",
+                        "pnl_usd": 0,
+                        "position_usd": 10,
+                        "position_count": 1,
+                        "pnl_count": 1,
+                        "mark_count": 0,
+                        "source": "ledger",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        history, error = dashboard.record_pnl_history_snapshot(
+            {"total_pnl_usd": 2, "total_position_usd": 10, "total": 1, "pnl_count": 1},
+            generated_at="2026-04-25T08:01:00+00:00",
+            mark_count=0,
+            path=path,
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        assert error is None
+        assert len(history) == 2
+        assert payload["schema_version"] == 1
+        assert len(payload["points"]) == 2
+        assert payload["points"][-1]["pnl_usd"] == 2
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def test_tail_lines_returns_only_requested_recent_lines():
     path = Path("logs/test_dashboard_tail.log")
     path.parent.mkdir(exist_ok=True)

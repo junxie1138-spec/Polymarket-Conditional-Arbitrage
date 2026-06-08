@@ -264,7 +264,7 @@ class Reconciler:
 
         open_orders = self.order_placer.fetch_open_orders()
         positions = self._fetch_user_positions(user_address)
-        exposures = self._exchange_exposures(open_orders, positions, by_token, by_condition)
+        exposures = self._exchange_exposures(open_orders, positions)
         now = datetime.now(timezone.utc)
 
         matched_local = 0
@@ -307,9 +307,9 @@ class Reconciler:
 
         added_guards = 0
         for exposure in exposures:
-            market = by_token.get(exposure.token_id)
-            if market is None and exposure.condition_id:
-                market = by_condition.get(exposure.condition_id)
+            market = self._market_for_exposure(exposure, by_token, by_condition)
+            if market is None:
+                continue
             if _ledger_has_exchange_guard(self.ledger, market=market, exposure=exposure):
                 continue
             self._record_exchange_guard(exposure=exposure, market=market, reconciled_at=now)
@@ -338,16 +338,23 @@ class Reconciler:
         )
 
     def _resolve_user_address(self) -> tuple[str, str]:
-        for name in (
-            "POLYMARKET_RECONCILE_USER_ADDRESS",
-            "POLYMARKET_FUNDER_ADDRESS",
-            "POLYMARKET_PROXY_ADDRESS",
-            "POLYMARKET_WALLET_ADDRESS",
-        ):
-            value = os.getenv(name)
-            if value:
-                return value.strip(), name
-        return self.order_placer.get_client_address(), "client_wallet"
+        explicit = os.getenv("POLYMARKET_RECONCILE_USER_ADDRESS")
+        trading_address = os.getenv("POLYMARKET_FUNDER_ADDRESS")
+        trading_source = "POLYMARKET_FUNDER_ADDRESS"
+        if not trading_address:
+            trading_address = self.order_placer.get_client_address()
+            trading_source = "client_wallet"
+
+        trading_address = trading_address.strip()
+        if explicit:
+            explicit_address = explicit.strip()
+            if explicit_address.lower() != trading_address.lower():
+                raise ValueError(
+                    "POLYMARKET_RECONCILE_USER_ADDRESS must match the live trading "
+                    f"address from {trading_source}: {explicit_address} != {trading_address}"
+                )
+            return explicit_address, "POLYMARKET_RECONCILE_USER_ADDRESS"
+        return trading_address, trading_source
 
     def _fetch_user_positions(self, user_address: str) -> list[dict[str, Any]]:
         positions: list[dict[str, Any]] = []
@@ -378,8 +385,6 @@ class Reconciler:
     def _exchange_exposures(
         open_orders: list[dict[str, Any]],
         positions: list[dict[str, Any]],
-        by_token: dict[str, dict],
-        by_condition: dict[str, dict],
     ) -> list[ExchangeExposure]:
         exposures: list[ExchangeExposure] = []
         for row in open_orders:
@@ -390,15 +395,18 @@ class Reconciler:
             exposure = exposure_from_position(row)
             if exposure is not None:
                 exposures.append(exposure)
+        return exposures
 
-        weather_exposures: list[ExchangeExposure] = []
-        for exposure in exposures:
-            if exposure.token_id in by_token:
-                weather_exposures.append(exposure)
-                continue
-            if exposure.condition_id and exposure.condition_id in by_condition:
-                weather_exposures.append(exposure)
-        return weather_exposures
+    @staticmethod
+    def _market_for_exposure(
+        exposure: ExchangeExposure,
+        by_token: dict[str, dict],
+        by_condition: dict[str, dict],
+    ) -> dict | None:
+        market = by_token.get(exposure.token_id)
+        if market is None and exposure.condition_id:
+            market = by_condition.get(exposure.condition_id)
+        return market
 
     def _record_exchange_guard(
         self,

@@ -338,6 +338,18 @@ def _parse_decimal_amount(value: Any, field: str) -> Decimal:
     return amount
 
 
+def _first_decimal_amount(row: dict[str, Any], keys: tuple[str, ...]) -> Decimal | None:
+    for key in keys:
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return _parse_decimal_amount(value, key)
+        except BalancePreflightError:
+            return None
+    return None
+
+
 def _parse_balance_allowance(response: Any) -> tuple[Decimal, Decimal | None]:
     if not isinstance(response, dict):
         raise BalancePreflightError(
@@ -356,6 +368,8 @@ def _parse_balance_allowance(response: Any) -> tuple[Decimal, Decimal | None]:
         ]
         if allowance_values:
             allowance = min(allowance_values)
+    if allowance is None:
+        raise BalancePreflightError("balance preflight response missing numeric allowance")
     return balance, allowance
 
 
@@ -461,6 +475,28 @@ def _raise_for_rejected_order_response(response: dict[str, Any]) -> None:
         raise OrderPostRejectedError(f"order rejected by CLOB: {response}")
 
 
+def _raise_for_unfilled_fok_response(response: dict[str, Any]) -> None:
+    status = str(response.get("status") or response.get("state") or "").strip().lower()
+    if status in {"canceled", "cancelled", "failed", "rejected", "unmatched"}:
+        raise OrderPostRejectedError(f"FOK order did not fill: {response}")
+    matched_size = _first_decimal_amount(
+        response,
+        (
+            "size_matched",
+            "matched_size",
+            "filled_size",
+            "fill_quantity",
+            "filledQuantity",
+            "matchedSize",
+            "filled",
+        ),
+    )
+    if matched_size is None or matched_size <= 0:
+        raise OrderPostRejectedError(
+            f"FOK order response did not confirm a positive fill: {response}"
+        )
+
+
 class OrderPlacer:
     def __init__(self, *, clob_host: str | None = None, dry_run: bool | None = None):
         self.clob_host = (clob_host or config.clob_host()).rstrip("/")
@@ -509,6 +545,7 @@ class OrderPlacer:
                 response = self._post_order(client, intent)
                 response_dict = response if isinstance(response, dict) else {"response": response}
                 _raise_for_rejected_order_response(response_dict)
+                _raise_for_unfilled_fok_response(response_dict)
                 return OrderResult(intent=intent, posted=True, response=response_dict)
             except Exception as exc:
                 last_exc = exc
@@ -601,27 +638,19 @@ class OrderPlacer:
         try:
             signer_address = str(client.get_address())
         except Exception as exc:
-            logger.warning(
-                "wallet_configuration_check_unavailable funder=%s error=%s",
-                _mask_address(funder),
-                exc,
-            )
-            self._wallet_configuration_checked = True
-            return
+            raise MissingCredentialsError(
+                f"wallet configuration check failed for funder {_mask_address(funder)}: {exc}"
+            ) from exc
         try:
             code, rpc_url = wallet_balance.fetch_contract_code(
                 funder,
                 timeout_seconds=4.0,
             )
         except Exception as exc:
-            logger.warning(
-                "wallet_configuration_check_unavailable signer=%s funder=%s error=%s",
-                _mask_address(signer_address),
-                _mask_address(funder),
-                exc,
-            )
-            self._wallet_configuration_checked = True
-            return
+            raise MissingCredentialsError(
+                "wallet configuration check failed for signer "
+                f"{_mask_address(signer_address)} funder {_mask_address(funder)}: {exc}"
+            ) from exc
 
         implementation = _polymarket_proxy_implementation_from_runtime_code(code)
         if implementation is None:
@@ -756,13 +785,19 @@ class OrderPlacer:
     ) -> CollateralPreflightContext:
         try:
             order_version = int(client.get_version())
-        except Exception:
-            order_version = _version_from_balance_response(response) or 1
+        except Exception as exc:
+            order_version = _version_from_balance_response(response)
+            if order_version is None:
+                raise BalancePreflightError(
+                    f"balance preflight cannot resolve CLOB order version: {exc}"
+                ) from exc
 
         try:
             neg_risk = bool(client.get_neg_risk(intent.token_id))
-        except Exception:
-            neg_risk = False
+        except Exception as exc:
+            raise BalancePreflightError(
+                f"balance preflight cannot resolve neg-risk status for token {intent.token_id}: {exc}"
+            ) from exc
 
         if order_version == 2:
             return CollateralPreflightContext(

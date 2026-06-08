@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Callable, Literal, Mapping
 
 from . import config
+from .arb_models import outcome_token_map_from_market
 from .forecast import estimate_forecast_prob
 from .market_parser import _parse_end_date, parse_market_question
 
@@ -90,6 +91,9 @@ def entered_position_for_market(market: dict, entered_positions: Mapping[str, di
 
 
 def yes_token_from_market(market: dict) -> str | None:
+    mapped = outcome_token_map_from_market(market)
+    if mapped.get("YES"):
+        return mapped["YES"]
     token_ids = token_ids_from_market(market)
     if token_ids:
         return token_ids[0]
@@ -97,6 +101,9 @@ def yes_token_from_market(market: dict) -> str | None:
 
 
 def no_token_from_market(market: dict) -> str | None:
+    mapped = outcome_token_map_from_market(market)
+    if mapped.get("NO"):
+        return mapped["NO"]
     token_ids = token_ids_from_market(market)
     if len(token_ids) >= 2:
         return token_ids[1]

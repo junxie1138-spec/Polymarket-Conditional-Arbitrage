@@ -50,6 +50,7 @@ SIGMA_CACHE_PATH = DATA_DIR / "sigma_cache.json"
 RESIDUALS_CACHE_PATH = DATA_DIR / "empirical_residuals.json"
 CALIBRATION_PATH = DATA_DIR / "calibration_table.json"
 POSITIONS_PATH = DATA_DIR / "live_positions.json"
+MERGE_ARB_POSITIONS_PATH = DATA_DIR / "paper_merge_positions.json"
 PNL_HISTORY_PATH = DATA_DIR / "pnl_history.json"
 EVENT_LOG_PATH = DATA_DIR / "live_events.jsonl"
 MARKET_SNAPSHOT_PATH = DATA_DIR / "market_snapshots.jsonl"
@@ -72,6 +73,14 @@ MAX_NO_ENTRY_PRICE = 0.75
 OFFLINE_RETRY_SECONDS = 60
 RECONCILE_ON_STARTUP = True
 POLYMARKET_AUTH_WRITE_DOTENV = True
+MERGE_ARB_LIVE_TRADING_ENABLED = False
+MIN_NET_PROFIT_USD = 0.25
+MIN_NET_RETURN_BPS = 25.0
+MAX_PAPER_POSITION_USD = 50.0
+SLIPPAGE_BUFFER_BPS = 10.0
+GAS_COST_USD = 0.02
+TAKER_FEE_BPS = 0.0
+MERGE_ARB_MAX_BOOK_AGE_SECONDS = 20.0
 
 MAX_LEAD_DAYS = 7
 DEFAULT_MODEL = "gfs_seamless"
@@ -97,11 +106,23 @@ WALLET_BALANCE_TTL_SECONDS = 60.0
 EVENT_SNAPSHOT_INTERVAL_MINUTES = 5.0
 
 
+TRUE_ENV_VALUES = {"1", "true", "yes", "y", "on"}
+FALSE_ENV_VALUES = {"0", "false", "no", "n", "off"}
+
+
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    normalized = value.strip().lower()
+    if normalized in TRUE_ENV_VALUES:
+        return True
+    if normalized in FALSE_ENV_VALUES:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean value "
+        f"({', '.join(sorted(TRUE_ENV_VALUES | FALSE_ENV_VALUES))}); got {value!r}"
+    )
 
 
 def env_float(name: str, default: float) -> float:
@@ -155,6 +176,41 @@ def reconcile_on_startup() -> bool:
 
 def polymarket_auth_write_dotenv() -> bool:
     return env_bool("POLYMARKET_AUTH_WRITE_DOTENV", POLYMARKET_AUTH_WRITE_DOTENV)
+
+
+def merge_arb_live_trading_enabled() -> bool:
+    return env_bool("MERGE_ARB_LIVE_TRADING_ENABLED", MERGE_ARB_LIVE_TRADING_ENABLED)
+
+
+def min_net_profit_usd() -> float:
+    return max(0.0, env_float("MIN_NET_PROFIT_USD", MIN_NET_PROFIT_USD))
+
+
+def min_net_return_bps() -> float:
+    return max(0.0, env_float("MIN_NET_RETURN_BPS", MIN_NET_RETURN_BPS))
+
+
+def max_paper_position_usd() -> float:
+    value = env_float("MAX_PAPER_POSITION_USD", MAX_PAPER_POSITION_USD)
+    if value <= 0:
+        raise ValueError("MAX_PAPER_POSITION_USD must be greater than 0")
+    return value
+
+
+def slippage_buffer_bps() -> float:
+    return max(0.0, env_float("SLIPPAGE_BUFFER_BPS", SLIPPAGE_BUFFER_BPS))
+
+
+def gas_cost_usd() -> float:
+    return max(0.0, env_float("GAS_COST_USD", GAS_COST_USD))
+
+
+def taker_fee_bps() -> float:
+    return max(0.0, env_float("TAKER_FEE_BPS", TAKER_FEE_BPS))
+
+
+def merge_arb_max_book_age_seconds() -> float:
+    return max(1.0, env_float("MERGE_ARB_MAX_BOOK_AGE_SECONDS", MERGE_ARB_MAX_BOOK_AGE_SECONDS))
 
 
 def max_position_usd() -> float:

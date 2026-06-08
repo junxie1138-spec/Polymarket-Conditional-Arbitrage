@@ -48,6 +48,38 @@ def test_enter_when_fixed_v1_gates_pass():
     assert decision.plan.lead_days == 3
 
 
+def test_labeled_outcomes_determine_yes_no_tokens_even_when_token_array_is_reversed():
+    reversed_market = market(
+        outcomes='["No", "Yes"]',
+        clobTokenIds='["no-token", "yes-token"]',
+    )
+
+    yes_decision = evaluate_market(
+        reversed_market,
+        0.30,
+        as_of=AS_OF,
+        entered_positions={},
+        forecast_probability_fn=forecast(0.80),
+        max_position_usd=50.0,
+    )
+    no_decision = evaluate_market(
+        reversed_market,
+        0.30,
+        side="NO",
+        as_of=AS_OF,
+        entered_positions={},
+        forecast_probability_fn=forecast(0.20),
+        max_position_usd=50.0,
+    )
+
+    assert yes_decision.action == "ENTER"
+    assert yes_decision.plan is not None
+    assert yes_decision.plan.token_id == "yes-token"
+    assert no_decision.action == "ENTER"
+    assert no_decision.plan is not None
+    assert no_decision.plan.token_id == "no-token"
+
+
 def test_enter_uses_configured_max_position_when_not_overridden(monkeypatch):
     monkeypatch.setenv("MAX_POSITION_USD", "2.50")
 

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Iterable
 
 from . import config, network
+from .arb_models import BinaryMarket, OrderBookSide
+from .order_book import asks_from_book
 from .strategy import yes_token_from_market
 from .ws_stream import BestBidAskCache
 
@@ -96,20 +99,22 @@ class LiveFetcher:
             config.ws_market_stale_seconds() if ws_stale_seconds is None else ws_stale_seconds
         )
 
-    def fetch_active_events(self, *, tag_slug: str = "weather") -> list[dict]:
+    def fetch_active_events(self, *, tag_slug: str | None = "weather") -> list[dict]:
         events: list[dict] = []
         offset = 0
         limit = 100
         while True:
+            params = {
+                "closed": "false",
+                "limit": limit,
+                "offset": offset,
+            }
+            if tag_slug:
+                params["tag_slug"] = tag_slug
             batch = network.get_json_with_retries(
                 self.session,
                 config.GAMMA_EVENTS_URL,
-                params={
-                    "tag_slug": tag_slug,
-                    "closed": "false",
-                    "limit": limit,
-                    "offset": offset,
-                },
+                params=params,
                 timeout=30,
             )
             if not isinstance(batch, list):
@@ -140,11 +145,19 @@ class LiveFetcher:
                 markets.append(row)
         return markets
 
-    def fetch_active_markets(self, *, limit: int | None = None) -> list[dict]:
-        markets = self.flatten_event_markets(self.fetch_active_events(tag_slug="weather"))
+    def fetch_active_markets(
+        self,
+        *,
+        tag_slug: str | None = "weather",
+        limit: int | None = None,
+    ) -> list[dict]:
+        markets = self.flatten_event_markets(self.fetch_active_events(tag_slug=tag_slug))
         if limit is not None:
             return markets[:limit]
         return markets
+
+    def fetch_all_active_markets(self, *, limit: int | None = None) -> list[dict]:
+        return self.fetch_active_markets(tag_slug=None, limit=limit)
 
     def fetch_order_book(self, token_id: str) -> dict:
         data = network.get_json_with_retries(
@@ -156,6 +169,26 @@ class LiveFetcher:
         if isinstance(data, dict):
             return data
         raise ValueError(f"unexpected order book response for token_id={token_id}")
+
+    def fetch_binary_ask_books(self, market: BinaryMarket) -> tuple[OrderBookSide, OrderBookSide]:
+        yes_book = self.fetch_order_book(market.yes_token_id)
+        yes_received_at = datetime.now(timezone.utc)
+        no_book = self.fetch_order_book(market.no_token_id)
+        no_received_at = datetime.now(timezone.utc)
+        return (
+            asks_from_book(
+                yes_book,
+                token_id=market.yes_token_id,
+                source="rest_book",
+                updated_at=yes_received_at,
+            ),
+            asks_from_book(
+                no_book,
+                token_id=market.no_token_id,
+                source="rest_book",
+                updated_at=no_received_at,
+            ),
+        )
 
     def fetch_quote(self, token_id: str) -> LiveQuote | None:
         if self.price_cache is not None:

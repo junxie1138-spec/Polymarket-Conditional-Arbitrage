@@ -734,7 +734,7 @@ wheels = [
 [[package]]
 name = "polymarket-weather-live-bot"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "py-clob-client-v2" },
     { name = "requests" },

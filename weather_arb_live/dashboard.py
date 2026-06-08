@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
@@ -77,6 +78,7 @@ MARK_FETCH_MAX_TOKENS = 100
 ACCOUNT_FETCH_TOTAL_TIMEOUT_SECONDS = 5.0
 PNL_HISTORY_MAX_POINTS = 10000
 PNL_HISTORY_MIN_INTERVAL_SECONDS = 10.0
+PNL_HISTORY_WRITE_LOCK = threading.Lock()
 
 
 def utc_now_iso() -> str:
@@ -506,21 +508,28 @@ def _normalize_pnl_history_entry(entry: Any) -> dict[str, Any] | None:
     }
 
 
-def read_pnl_history(path: Path | None = None) -> tuple[list[dict[str, Any]], str | None]:
+def _load_pnl_history(
+    path: Path | None = None,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any] | None]:
     history_path = path or config.PNL_HISTORY_PATH
     payload, error = _read_json(history_path)
     if payload is None:
-        return [], error
+        return [], error, None
     raw_entries = payload.get("points") if isinstance(payload, dict) else payload
     if not isinstance(raw_entries, list):
-        return [], "pnl history file is not a JSON list"
+        return [], "pnl history file is not a JSON list", payload if isinstance(payload, dict) else None
     history = [
         normalized
         for entry in raw_entries
         if (normalized := _normalize_pnl_history_entry(entry)) is not None
     ]
     history.sort(key=lambda entry: _parse_timestamp(entry["timestamp"]) or datetime.min.replace(tzinfo=timezone.utc))
-    return history[-PNL_HISTORY_MAX_POINTS:], error
+    return history[-PNL_HISTORY_MAX_POINTS:], error, payload if isinstance(payload, dict) else None
+
+
+def read_pnl_history(path: Path | None = None) -> tuple[list[dict[str, Any]], str | None]:
+    history, error, _envelope = _load_pnl_history(path)
+    return history, error
 
 
 def _same_pnl_snapshot_values(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -536,50 +545,59 @@ def record_pnl_history_snapshot(
     path: Path | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     history_path = path or config.PNL_HISTORY_PATH
-    history, error = read_pnl_history(history_path)
-    snapshot = _normalize_pnl_history_entry(
-        {
-            "timestamp": generated_at,
-            "pnl_usd": position_summary.get("total_pnl_usd"),
-            "position_usd": position_summary.get("total_position_usd"),
-            "position_count": position_summary.get("total"),
-            "pnl_count": position_summary.get("pnl_count"),
-            "mark_count": mark_count,
-            "source": "live_marks" if mark_count else "ledger",
-        }
-    )
-    if snapshot is None:
-        return history, error
-
-    if snapshot["position_count"] == 0 and snapshot["pnl_count"] == 0:
-        return history, error
-
-    should_append = True
-    if history:
-        last = history[-1]
-        last_time = _parse_timestamp(last.get("timestamp"))
-        current_time = _parse_timestamp(snapshot.get("timestamp"))
-        elapsed = (
-            (current_time - last_time).total_seconds()
-            if current_time is not None and last_time is not None
-            else PNL_HISTORY_MIN_INTERVAL_SECONDS
+    with PNL_HISTORY_WRITE_LOCK:
+        history, error, envelope = _load_pnl_history(history_path)
+        if error:
+            return history, error
+        snapshot = _normalize_pnl_history_entry(
+            {
+                "timestamp": generated_at,
+                "pnl_usd": position_summary.get("total_pnl_usd"),
+                "position_usd": position_summary.get("total_position_usd"),
+                "position_count": position_summary.get("total"),
+                "pnl_count": position_summary.get("pnl_count"),
+                "mark_count": mark_count,
+                "source": "live_marks" if mark_count else "ledger",
+            }
         )
-        should_append = elapsed >= PNL_HISTORY_MIN_INTERVAL_SECONDS or not _same_pnl_snapshot_values(last, snapshot)
+        if snapshot is None:
+            return history, error
 
-    if should_append:
-        history = [*history, snapshot][-PNL_HISTORY_MAX_POINTS:]
-        try:
-            history_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = history_path.with_suffix(f"{history_path.suffix}.tmp")
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                json.dump(history, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-            tmp_path.replace(history_path)
-            error = None
-        except Exception as exc:
-            return history, f"pnl history write failed: {exc}"
+        if snapshot["position_count"] == 0 and snapshot["pnl_count"] == 0:
+            return history, error
 
-    return history, error
+        should_append = True
+        if history:
+            last = history[-1]
+            last_time = _parse_timestamp(last.get("timestamp"))
+            current_time = _parse_timestamp(snapshot.get("timestamp"))
+            elapsed = (
+                (current_time - last_time).total_seconds()
+                if current_time is not None and last_time is not None
+                else PNL_HISTORY_MIN_INTERVAL_SECONDS
+            )
+            should_append = elapsed >= PNL_HISTORY_MIN_INTERVAL_SECONDS or not _same_pnl_snapshot_values(last, snapshot)
+
+        if should_append:
+            history = [*history, snapshot][-PNL_HISTORY_MAX_POINTS:]
+            try:
+                history_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = history_path.with_name(
+                    f"{history_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                payload: Any = history
+                if envelope is not None:
+                    payload = dict(envelope)
+                    payload["points"] = history
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                tmp_path.replace(history_path)
+                error = None
+            except Exception as exc:
+                return history, f"pnl history write failed: {exc}"
+
+        return history, error
 
 
 def tail_lines(path: Path, limit: int) -> tuple[list[str], str | None]:

@@ -23,6 +23,12 @@ class FakeAuthError(Exception):
         return "PolyApiException[status_code=401, error_message={'error': 'Unauthorized/Invalid api key'}]"
 
 
+def filled_response(**overrides):
+    response = {"success": True, "status": "matched", "size_matched": "1"}
+    response.update(overrides)
+    return response
+
+
 def test_order_intent_uses_slippage_and_position_cap():
     intent = build_order_intent(token_id="yes-token", market_price=0.40, position_usd=1.0, dry_run=True)
 
@@ -84,7 +90,7 @@ def test_live_order_retries_retryable_http_error(monkeypatch):
                 response = requests.Response()
                 response.status_code = 503
                 raise requests.HTTPError("server unavailable", response=response)
-            return {"ok": True}
+            return filled_response(ok=True)
 
     placer = RetryPlacer()
 
@@ -92,7 +98,7 @@ def test_live_order_retries_retryable_http_error(monkeypatch):
 
     assert placer.calls == 2
     assert result.posted is True
-    assert result.response == {"ok": True}
+    assert result.response == filled_response(ok=True)
 
 
 def test_startup_auth_derives_missing_api_credentials_and_updates_dotenv(monkeypatch):
@@ -315,6 +321,41 @@ def test_wallet_configuration_accepts_matching_proxy_wallet(monkeypatch):
     assert placer._wallet_configuration_checked is True
 
 
+def test_wallet_configuration_fails_closed_when_signer_address_unavailable(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000002")
+
+    class FakeClient:
+        def get_address(self):
+            raise RuntimeError("address unavailable")
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+
+    with pytest.raises(MissingCredentialsError, match="wallet configuration check failed"):
+        placer._ensure_wallet_configuration_valid(FakeClient())
+
+    assert placer._wallet_configuration_checked is False
+
+
+def test_wallet_configuration_fails_closed_when_contract_code_unavailable(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_FUNDER_ADDRESS", "0x0000000000000000000000000000000000000002")
+    monkeypatch.setattr(
+        order_placer.wallet_balance,
+        "fetch_contract_code",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("rpc unavailable")),
+    )
+
+    class FakeClient:
+        def get_address(self):
+            return "0x0000000000000000000000000000000000000001"
+
+    placer = OrderPlacer(dry_run=False, clob_host="https://example.invalid")
+
+    with pytest.raises(MissingCredentialsError, match="wallet configuration check failed"):
+        placer._ensure_wallet_configuration_valid(FakeClient())
+
+    assert placer._wallet_configuration_checked is False
+
+
 def test_balance_preflight_refreshes_api_credentials_once_after_401(monkeypatch):
     monkeypatch.setenv("POLYMARKET_AUTH_WRITE_DOTENV", "false")
 
@@ -356,7 +397,7 @@ def test_balance_preflight_refreshes_api_credentials_once_after_401(monkeypatch)
             return self.client
 
         def _post_order(self, _client, _intent):
-            return {"success": True}
+            return filled_response()
 
     placer = RefreshingPlacer()
 
@@ -410,7 +451,7 @@ def test_balance_preflight_refresh_derives_before_create_after_401(monkeypatch):
             return self.client
 
         def _post_order(self, _client, _intent):
-            return {"success": True}
+            return filled_response()
 
     placer = RefreshingPlacer()
 
@@ -483,13 +524,14 @@ class BalanceGuardPlacer(OrderPlacer):
         super().__init__(dry_run=False, clob_host="https://example.invalid")
         self.client = BalanceClient(response)
         self.posted = False
+        self._wallet_configuration_checked = True
 
     def _get_client(self):
         return self.client
 
     def _post_order(self, _client, _intent):
         self.posted = True
-        return {"success": True}
+        return filled_response()
 
 
 def test_live_order_blocks_when_collateral_balance_is_too_low():
@@ -499,6 +541,15 @@ def test_live_order_blocks_when_collateral_balance_is_too_low():
         placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
 
     assert placer.client.updated is True
+    assert placer.posted is False
+
+
+def test_live_order_blocks_when_allowance_is_missing():
+    placer = BalanceGuardPlacer({"balance": "100"})
+
+    with pytest.raises(order_placer.BalancePreflightError, match="missing numeric allowance"):
+        placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
     assert placer.posted is False
 
 
@@ -614,6 +665,40 @@ def test_live_order_uses_wallet_allowance_fallback_for_zero_clob_allowance(monke
     assert calls[0][3] == "USDC.e"
 
 
+def test_live_order_blocks_allowance_fallback_when_order_version_unknown(monkeypatch):
+    class VersionUnknownClient(BalanceClient):
+        def get_version(self):
+            raise RuntimeError("version unavailable")
+
+        def get_neg_risk(self, _token_id):
+            return False
+
+    placer = BalanceGuardPlacer({"balance": "100", "allowance": "0"})
+    placer.client = VersionUnknownClient({"balance": "100", "allowance": "0"})
+
+    with pytest.raises(order_placer.BalancePreflightError, match="order version"):
+        placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert placer.posted is False
+
+
+def test_live_order_blocks_allowance_fallback_when_neg_risk_unknown(monkeypatch):
+    class NegRiskUnknownClient(BalanceClient):
+        def get_version(self):
+            return 1
+
+        def get_neg_risk(self, _token_id):
+            raise RuntimeError("neg risk unavailable")
+
+    placer = BalanceGuardPlacer({"balance": "100", "allowance": "0"})
+    placer.client = NegRiskUnknownClient({"balance": "100", "allowance": "0"})
+
+    with pytest.raises(order_placer.BalancePreflightError, match="neg-risk"):
+        placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert placer.posted is False
+
+
 def test_live_order_uses_pusd_v2_exchange_allowance_fallback(monkeypatch):
     funder = "0x1111111111111111111111111111111111111111"
     calls = []
@@ -680,7 +765,7 @@ def test_live_order_posts_after_successful_balance_preflight():
 
     assert placer.posted is True
     assert result.posted is True
-    assert result.response == {"success": True}
+    assert result.response == filled_response()
     assert attempts == [(1, 0.40 * 1.005)]
 
 
@@ -693,6 +778,34 @@ def test_live_order_rejects_error_response_without_marking_posted():
     placer = ErrorResponsePlacer({"balance": "100", "allowance": "100"})
 
     with pytest.raises(OrderPostRejectedError, match="not enough balance"):
+        placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert placer.posted is True
+
+
+def test_live_order_rejects_unfilled_success_response_without_recording_success():
+    class UnfilledResponsePlacer(BalanceGuardPlacer):
+        def _post_order(self, _client, _intent):
+            self.posted = True
+            return {"success": True, "status": "cancelled", "size_matched": "0"}
+
+    placer = UnfilledResponsePlacer({"balance": "100", "allowance": "100"})
+
+    with pytest.raises(OrderPostRejectedError, match="did not fill"):
+        placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
+
+    assert placer.posted is True
+
+
+def test_live_order_rejects_success_response_without_fill_proof():
+    class MissingFillResponsePlacer(BalanceGuardPlacer):
+        def _post_order(self, _client, _intent):
+            self.posted = True
+            return {"success": True}
+
+    placer = MissingFillResponsePlacer({"balance": "100", "allowance": "100"})
+
+    with pytest.raises(OrderPostRejectedError, match="positive fill"):
         placer.place_order(token_id="yes-token", market_price=0.40, position_usd=1.0)
 
     assert placer.posted is True

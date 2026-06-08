@@ -8,6 +8,7 @@ from weather_arb_live.event_log import LiveEventLog
 from weather_arb_live.ws_stream import (
     BestBidAskCache,
     PolymarketMarketStream,
+    PolymarketUserStream,
     unique_market_condition_ids,
     unique_market_token_ids,
 )
@@ -103,6 +104,45 @@ def test_market_stream_records_market_resolved_event():
         assert rows[0]["event_type"] == "market_resolved"
         assert rows[0]["market_id"] == "0xabc"
         assert rows[0]["final_resolved_payout"] == 1.0
+    finally:
+        for path in (event_path, market_path, forecast_path):
+            path.unlink(missing_ok=True)
+
+
+def test_user_stream_dedupes_replayed_lifecycle_events():
+    event_path = Path("data/test_ws_user_events.jsonl")
+    market_path = Path("data/test_ws_user_market.jsonl")
+    forecast_path = Path("data/test_ws_user_forecast.jsonl")
+    for path in (event_path, market_path, forecast_path):
+        path.unlink(missing_ok=True)
+    event_log = LiveEventLog(
+        event_path=event_path,
+        market_snapshot_path=market_path,
+        forecast_snapshot_path=forecast_path,
+    )
+    stream = PolymarketUserStream(
+        base_url="wss://example.invalid/ws",
+        logger_=logging.getLogger("test_user_stream_events"),
+        event_log=event_log,
+    )
+    payload = {
+        "event_type": "trade",
+        "id": "order-1",
+        "market": "0xabc",
+        "asset_id": "yes-token",
+        "status": "filled",
+        "price": "0.42",
+        "size_matched": "3",
+        "timestamp": "2026-04-26T12:00:00Z",
+    }
+
+    try:
+        stream._handle_message(payload)
+        stream._handle_message(dict(payload))
+
+        rows = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+        assert [row["event_type"] for row in rows] == ["order_filled"]
+        assert rows[0]["exchange_order_id"] == "order-1"
     finally:
         for path in (event_path, market_path, forecast_path):
             path.unlink(missing_ok=True)

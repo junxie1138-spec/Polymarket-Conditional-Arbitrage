@@ -132,6 +132,29 @@ Dry-run orders are logged but not posted. They are also recorded in
 `data/live_positions.json` so the bot does not repeatedly enter the same market
 during validation.
 
+## Binary Merge-Arbitrage Paper Mode
+
+The generic binary scanner is separate from the weather forecast strategy. It
+scans active binary YES/NO markets, walks executable ask depth on both outcome
+books, and records all-or-none paper fills followed by an immediate simulated
+merge when the configured net profit and return thresholds pass.
+
+Live trading is disabled for this mode in v1. If
+`MERGE_ARB_LIVE_TRADING_ENABLED=true`, startup fails closed before scanning or
+placing anything.
+
+Run one bounded paper scan:
+
+```powershell
+$env:LIVE_MARKET_LIMIT="25"
+uv run python -m weather_arb_live.merge_arb_bot --once
+```
+
+Paper positions are written to `data/paper_merge_positions.json`. The default
+cost assumptions are `MIN_NET_PROFIT_USD=0.25`, `MIN_NET_RETURN_BPS=25`,
+`MAX_PAPER_POSITION_USD=50`, `SLIPPAGE_BUFFER_BPS=10`,
+`GAS_COST_USD=0.02`, and `TAKER_FEE_BPS=0`.
+
 ## Local Dashboard
 
 Run the dashboard in a second PowerShell window while the bot is running:

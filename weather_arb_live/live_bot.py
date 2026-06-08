@@ -1073,6 +1073,26 @@ class LiveBot:
                 )
                 return
             raise
+        if not self.runtime.dry_run and not result.posted:
+            self.event_log.append_event(
+                "order_acknowledged",
+                {
+                    **event_payload,
+                    **self._intent_event_payload(result.intent),
+                    **self._order_response_event_payload(result.response),
+                    "posted": result.posted,
+                    "dry_run": result.intent.dry_run,
+                    "raw_order_response": result.response,
+                },
+            )
+            self.logger.warning(
+                "order_not_posted market_id=%s side=%s token_id=%s response=%s",
+                plan.market_id,
+                plan.side,
+                plan.token_id,
+                result.response,
+            )
+            return
         row = self.ledger.record(
             plan,
             dry_run=self.runtime.dry_run,

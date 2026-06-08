@@ -407,6 +407,19 @@ class BalancePreflightFailingOrderPlacer:
         raise BalancePreflightError("balance preflight failed")
 
 
+class NonPostedLiveOrderPlacer:
+    def place_order(self, *, token_id, market_price, position_usd=None, on_submit_attempt=None):
+        intent = build_order_intent(
+            token_id=token_id,
+            market_price=market_price,
+            position_usd=position_usd,
+            dry_run=False,
+        )
+        if on_submit_attempt is not None:
+            on_submit_attempt(intent, 1)
+        return OrderResult(intent=intent, posted=False, response={"status": "cancelled"})
+
+
 def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch, isolated_event_log):
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
@@ -458,6 +471,54 @@ def test_live_order_connection_loss_records_unknown_local_guard(monkeypatch, iso
     finally:
         if path.exists():
             path.unlink()
+
+
+def test_live_non_posted_order_response_does_not_record_position(monkeypatch, isolated_event_log):
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("RECONCILE_ON_STARTUP", "false")
+    monkeypatch.setattr("weather_arb_live.live_bot.flush_cache", lambda: None)
+    path = Path("data/test_non_posted_order_positions.json")
+    path.unlink(missing_ok=True)
+    plan = TradePlan(
+        market_id="m5",
+        token_id="yes-token",
+        side="YES",
+        question="Q",
+        city="New York",
+        target_date="2026-04-27",
+        market_price=0.30,
+        entry_price=0.3015,
+        shares=165.837,
+        position_usd=50.0,
+        forecast_prob=0.80,
+        edge=0.4985,
+        lead_days=3,
+        entry_time=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+    )
+
+    def fake_evaluate(_market, current_price, **_kwargs):
+        if current_price is None:
+            return Decision.skip("missing_live_price", market_id="m5", token_id="yes-token")
+        return Decision.enter(plan)
+
+    monkeypatch.setattr("weather_arb_live.live_bot.evaluate_market", fake_evaluate)
+    logger = logging.getLogger("test_live_bot_non_posted_order")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    bot = LiveBot(
+        fetcher=FakeFetcher(),
+        order_placer=NonPostedLiveOrderPlacer(),
+        ledger=PositionLedger(path).load(),
+        logger=logger,
+        event_log=isolated_event_log,
+    )
+    bot.calibration = None
+
+    try:
+        assert bot.run_one_cycle() is True
+        assert "m5" not in bot.ledger.positions
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_live_balance_preflight_failure_does_not_record_unknown_guard(monkeypatch, isolated_event_log):
