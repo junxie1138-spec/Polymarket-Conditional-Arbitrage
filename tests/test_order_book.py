@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from weather_arb_live.order_book import asks_from_book, bids_from_book, is_crossed_book
+from polymarket_conditional_arb.order_book import asks_from_book, bids_from_book, is_crossed_book
 
 
 def test_normalized_asks_sort_by_executable_price_and_ignore_invalid_levels():
@@ -34,4 +34,3 @@ def test_normalized_bids_sort_descending_and_crossed_book_is_detected():
 
     assert [level.price for level in bids.levels] == [0.52, 0.50]
     assert is_crossed_book(book) is True
-

@@ -5,11 +5,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-
 BookSideName = Literal["bid", "ask"]
+OpportunityKind = Literal["binary_complete_set", "neg_risk_event_set"]
 
 
-def _json_list(value: Any) -> list[Any]:
+def json_list(value: Any) -> list[Any]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -18,7 +18,7 @@ def _json_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-def _as_float(value: Any) -> float | None:
+def as_float(value: Any) -> float | None:
     if value in (None, "") or isinstance(value, bool):
         return None
     try:
@@ -30,17 +30,17 @@ def _as_float(value: Any) -> float | None:
     return parsed
 
 
-def _as_bool(value: Any, default: bool = False) -> bool:
+def as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if value is None or value == "":
         return default
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
 
 
-def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+def first_present(mapping: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in mapping:
             return mapping[key]
@@ -60,7 +60,7 @@ def _token_id_from_token_row(row: dict[str, Any]) -> str | None:
 
 
 def outcome_token_map_from_market(market: dict[str, Any]) -> dict[str, str]:
-    token_rows = _json_list(market.get("tokens"))
+    token_rows = json_list(market.get("tokens"))
     mapped: dict[str, str] = {}
     for row in token_rows:
         if not isinstance(row, dict):
@@ -78,8 +78,8 @@ def outcome_token_map_from_market(market: dict[str, Any]) -> dict[str, str]:
     if mapped:
         return mapped
 
-    outcomes = _json_list(market.get("outcomes"))
-    token_ids = _json_list(market.get("clobTokenIds"))
+    outcomes = json_list(market.get("outcomes"))
+    token_ids = json_list(market.get("clobTokenIds"))
     if len(outcomes) != len(token_ids):
         return {}
     for label, token_id in zip(outcomes, token_ids):
@@ -105,6 +105,26 @@ class BinaryMarket:
     min_order_size: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def event_id(self) -> str | None:
+        value = self.metadata.get("_event_id")
+        return str(value) if value not in (None, "") else None
+
+    @property
+    def event_title(self) -> str | None:
+        value = self.metadata.get("_event_title")
+        return str(value) if value not in (None, "") else None
+
+    @property
+    def is_tradable(self) -> bool:
+        return (
+            self.active
+            and not self.closed
+            and self.accepting_orders
+            and self.enable_order_book
+            and len({self.yes_token_id, self.no_token_id}) == 2
+        )
+
     @classmethod
     def from_gamma_market(cls, market: dict[str, Any]) -> "BinaryMarket | None":
         mapped = outcome_token_map_from_market(market)
@@ -119,39 +139,46 @@ class BinaryMarket:
         if not market_id:
             return None
 
-        tick_size = _as_float(market.get("orderPriceMinTickSize") or market.get("tickSize"))
-        min_order_size = _as_float(market.get("orderMinSize") or market.get("minOrderSize"))
+        tick_size = as_float(market.get("orderPriceMinTickSize") or market.get("tickSize"))
+        min_order_size = as_float(market.get("orderMinSize") or market.get("minOrderSize"))
+        event_neg_risk = as_bool(market.get("_event_neg_risk"), default=False)
+        market_neg_risk = first_present(market, "negRisk", "neg_risk")
+        metadata = {
+            key: market.get(key)
+            for key in (
+                "slug",
+                "endDate",
+                "volume",
+                "liquidity",
+                "_event_id",
+                "_event_title",
+                "_event_slug",
+                "_event_endDate",
+                "_event_tags",
+                "_event_neg_risk",
+            )
+            if key in market
+        }
         return cls(
             market_id=market_id,
             condition_id=str(market.get("conditionId") or "").strip() or None,
             question=str(market.get("question") or market.get("title") or ""),
             yes_token_id=yes_token_id,
             no_token_id=no_token_id,
-            active=_as_bool(market.get("active"), default=True),
-            closed=_as_bool(market.get("closed"), default=False),
-            accepting_orders=_as_bool(
-                _first_present(market, "acceptingOrders", "accepting_orders"),
+            active=as_bool(market.get("active"), default=True),
+            closed=as_bool(market.get("closed"), default=False),
+            accepting_orders=as_bool(
+                first_present(market, "acceptingOrders", "accepting_orders"),
                 default=True,
             ),
-            enable_order_book=_as_bool(
-                _first_present(market, "enableOrderBook", "enable_order_book"),
+            enable_order_book=as_bool(
+                first_present(market, "enableOrderBook", "enable_order_book"),
                 default=True,
             ),
-            neg_risk=_as_bool(market.get("negRisk") or market.get("neg_risk"), default=False),
+            neg_risk=as_bool(market_neg_risk, default=event_neg_risk),
             tick_size=tick_size,
             min_order_size=min_order_size,
-            metadata={
-                key: market.get(key)
-                for key in (
-                    "slug",
-                    "endDate",
-                    "_event_id",
-                    "_event_title",
-                    "_event_endDate",
-                    "_event_tags",
-                )
-                if key in market
-            },
+            metadata=metadata,
         )
 
 
@@ -206,13 +233,25 @@ class OrderBookSide:
 
 
 @dataclass(frozen=True)
-class ArbOpportunity:
-    market: BinaryMarket
-    executable_size: float
-    yes_vwap: float
-    no_vwap: float
-    yes_cost: float
-    no_cost: float
+class OpportunityLeg:
+    market_id: str
+    condition_id: str | None
+    token_id: str
+    outcome: Literal["YES", "NO"]
+    quantity: float
+    vwap: float
+    cost: float
+
+
+@dataclass(frozen=True)
+class ConditionalArbOpportunity:
+    opportunity_id: str
+    kind: OpportunityKind
+    event_id: str | None
+    event_title: str | None
+    markets: tuple[BinaryMarket, ...]
+    legs: tuple[OpportunityLeg, ...]
+    collateral_redeemed: float
     gross_cost: float
     estimated_fees: float
     gas_cost: float
@@ -224,5 +263,47 @@ class ArbOpportunity:
     details: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def merge_value(self) -> float:
-        return self.executable_size
+    def capital_at_risk(self) -> float:
+        return self.gross_cost + self.estimated_fees + self.gas_cost + self.slippage_buffer
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "opportunity_id": self.opportunity_id,
+            "kind": self.kind,
+            "event_id": self.event_id,
+            "event_title": self.event_title,
+            "detected_at": self.detected_at.isoformat(),
+            "markets": [
+                {
+                    "market_id": market.market_id,
+                    "condition_id": market.condition_id,
+                    "question": market.question,
+                    "yes_token_id": market.yes_token_id,
+                    "no_token_id": market.no_token_id,
+                    "neg_risk": market.neg_risk,
+                }
+                for market in self.markets
+            ],
+            "legs": [
+                {
+                    "market_id": leg.market_id,
+                    "condition_id": leg.condition_id,
+                    "token_id": leg.token_id,
+                    "outcome": leg.outcome,
+                    "quantity": leg.quantity,
+                    "vwap": leg.vwap,
+                    "cost": leg.cost,
+                }
+                for leg in self.legs
+            ],
+            "collateral_redeemed": self.collateral_redeemed,
+            "gross_cost": self.gross_cost,
+            "estimated_fees": self.estimated_fees,
+            "gas_cost": self.gas_cost,
+            "slippage_buffer": self.slippage_buffer,
+            "capital_at_risk": self.capital_at_risk,
+            "net_profit": self.net_profit,
+            "net_return_bps": self.net_return_bps,
+            "source_timestamps": self.source_timestamps,
+            "details": self.details,
+        }

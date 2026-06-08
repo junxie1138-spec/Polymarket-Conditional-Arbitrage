@@ -1,18 +1,16 @@
 [project]
-name = "polymarket-weather-live-bot"
+name = "polymarket-conditional-arbitrage"
 version = "0.1.0"
-description = "Standalone fixed_v1_no Combined Polymarket weather arbitrage live bot"
+description = "Paper-only scanner for Polymarket conditional arbitrage"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "py-clob-client-v2>=1.0.0",
   "requests>=2.31.0",
   "scipy>=1.11.0",
 ]
 
 [project.scripts]
-weather-daily-report = "weather_arb_live.daily_report:main"
-poly-merge-arb-paper = "weather_arb_live.merge_arb_bot:main"
+poly-cond-arb-scan = "polymarket_conditional_arb.scan_bot:main"
 
 [project.optional-dependencies]
 dev = [
@@ -24,7 +22,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["weather_arb_live*"]
+include = ["polymarket_conditional_arb*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

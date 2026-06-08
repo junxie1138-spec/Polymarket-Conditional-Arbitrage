@@ -1,9 +1,4 @@
-"""DNS-safe HTTP session helpers.
-
-This machine has unreliable DNS for outbound HTTPS. Install a small
-DNS-over-HTTPS resolver shim before creating requests sessions so every HTTP
-call made by this package and the CLOB SDK uses the patched resolver.
-"""
+"""DNS-safe HTTP session helpers."""
 
 from __future__ import annotations
 
@@ -71,7 +66,7 @@ def install() -> None:
 def get_session() -> requests.Session:
     install()
     session = requests.Session()
-    session.headers["User-Agent"] = "polymarket-weather-live-bot/0.1"
+    session.headers["User-Agent"] = "polymarket-conditional-arbitrage/0.1"
     return session
 
 
@@ -125,3 +120,30 @@ def get_json_with_retries(
                 raise
             sleep_for_attempt(attempt, base_seconds=backoff_seconds)
     raise RuntimeError(f"GET failed after retries: {url}") from last_exc
+
+
+def post_json_with_retries(
+    session: requests.Session,
+    url: str,
+    *,
+    json_body: Any,
+    timeout: float = 30,
+    attempts: int = 3,
+    backoff_seconds: float = 1.0,
+) -> Any:
+    """POST JSON and parse JSON response with bounded transient retries."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.post(url, json=json_body, timeout=timeout)
+            if is_retryable_status(response.status_code) and attempt < attempts:
+                sleep_for_attempt(attempt, base_seconds=backoff_seconds)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == attempts or not is_retryable_exception(exc):
+                raise
+            sleep_for_attempt(attempt, base_seconds=backoff_seconds)
+    raise RuntimeError(f"POST failed after retries: {url}") from last_exc
