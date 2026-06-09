@@ -11,6 +11,7 @@ DOTENV_PATH = PROJECT_ROOT / ".env"
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_PRODUCTION_HOST = "https://clob.polymarket.com"
 CLOB_BATCH_BOOK_LIMIT = 500
+MARKET_WS_PRODUCTION_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 DEFAULT_MARKET_LIMIT = 0
 DEFAULT_POLL_INTERVAL_SECONDS = 60
@@ -22,6 +23,12 @@ DEFAULT_GAS_COST_USD = 0.02
 DEFAULT_TAKER_FEE_BPS = 0.0
 DEFAULT_MAX_BOOK_AGE_SECONDS = 20.0
 DEFAULT_INCLUDE_NEG_RISK = True
+DEFAULT_MARKET_WS_ENABLED = True
+DEFAULT_MARKET_WS_HEARTBEAT_SECONDS = 10.0
+DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION = 500
+DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS = 300
+DEFAULT_REST_RECONCILE_INTERVAL_SECONDS = 60
+DEFAULT_WS_STALE_SECONDS = 5.0
 
 
 def _decode_dotenv_value(value: str) -> str:
@@ -144,6 +151,34 @@ def clob_host() -> str:
     return os.getenv("POLYMARKET_CLOB_HOST", CLOB_PRODUCTION_HOST).rstrip("/")
 
 
+def market_ws_enabled() -> bool:
+    return env_bool("COND_ARB_MARKET_WS_ENABLED", DEFAULT_MARKET_WS_ENABLED)
+
+
+def market_ws_endpoint() -> str:
+    return os.getenv("COND_ARB_MARKET_WS_ENDPOINT", MARKET_WS_PRODUCTION_ENDPOINT).strip()
+
+
+def market_ws_heartbeat_seconds() -> float:
+    return max(0.1, env_float("COND_ARB_MARKET_WS_HEARTBEAT_SECONDS", DEFAULT_MARKET_WS_HEARTBEAT_SECONDS))
+
+
+def market_ws_max_assets_per_connection() -> int:
+    return max(1, env_int("COND_ARB_MARKET_WS_MAX_ASSETS_PER_CONNECTION", DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION))
+
+
+def market_refresh_interval_seconds() -> int:
+    return max(1, env_int("COND_ARB_MARKET_REFRESH_INTERVAL_SECONDS", DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS))
+
+
+def rest_reconcile_interval_seconds() -> int:
+    return max(1, env_int("COND_ARB_REST_RECONCILE_INTERVAL_SECONDS", DEFAULT_REST_RECONCILE_INTERVAL_SECONDS))
+
+
+def ws_stale_seconds() -> float:
+    return max(0.1, env_float("COND_ARB_WS_STALE_SECONDS", DEFAULT_WS_STALE_SECONDS))
+
+
 def event_log_path(base_data_dir: Path | None = None) -> Path:
     return (base_data_dir or data_dir()) / "conditional_arb_events.jsonl"
 
@@ -175,6 +210,13 @@ class ScanConfig:
     taker_fee_bps: float
     max_book_age_seconds: float
     include_neg_risk: bool
+    market_ws_enabled: bool = DEFAULT_MARKET_WS_ENABLED
+    market_ws_endpoint: str = MARKET_WS_PRODUCTION_ENDPOINT
+    market_ws_heartbeat_seconds: float = DEFAULT_MARKET_WS_HEARTBEAT_SECONDS
+    market_ws_max_assets_per_connection: int = DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION
+    market_refresh_interval_seconds: int = DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS
+    rest_reconcile_interval_seconds: int = DEFAULT_REST_RECONCILE_INTERVAL_SECONDS
+    ws_stale_seconds: float = DEFAULT_WS_STALE_SECONDS
 
     @property
     def event_log_path(self) -> Path:
@@ -208,4 +250,11 @@ def load_scan_config() -> ScanConfig:
         taker_fee_bps=taker_fee_bps(),
         max_book_age_seconds=max_book_age_seconds(),
         include_neg_risk=include_neg_risk(),
+        market_ws_enabled=market_ws_enabled(),
+        market_ws_endpoint=market_ws_endpoint(),
+        market_ws_heartbeat_seconds=market_ws_heartbeat_seconds(),
+        market_ws_max_assets_per_connection=market_ws_max_assets_per_connection(),
+        market_refresh_interval_seconds=market_refresh_interval_seconds(),
+        rest_reconcile_interval_seconds=rest_reconcile_interval_seconds(),
+        ws_stale_seconds=ws_stale_seconds(),
     )
