@@ -2,23 +2,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import signal
 import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Mapping
 
 from . import config
-from .arb_models import BinaryMarket, ConditionalArbOpportunity, OrderBookSide
-from .arb_strategy import ArbDecision, ArbStrategyParams, evaluate_binary_arbitrage, evaluate_neg_risk_event_group
-from .event_log import ConditionalArbEventLog, jsonable, utc_iso
+from .arb_models import BinaryMarket, OrderBookSide
+from .event_log import utc_iso
 from .fetcher import GammaClobClient
 from .market_data import MarketDataCache, MarketWebSocketManager, MarketWebSocketSettings
-from .paper import PaperConditionalArbLedger
+from .paper import PaperPortfolio, PaperPortfolioDecision, PaperPortfolioParams
 
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
 
@@ -38,7 +35,7 @@ class MarketUniverse:
 
 def setup_logging(scan_config: config.ScanConfig) -> logging.Logger:
     scan_config.log_dir.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("polymarket_conditional_arb.scan")
+    logger = logging.getLogger("polymarket_conditional_arb.portfolio")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
@@ -58,19 +55,6 @@ def _token_ids_for_markets(markets: list[BinaryMarket]) -> list[str]:
     for market in markets:
         token_ids.extend([market.yes_token_id, market.no_token_id])
     return token_ids
-
-
-def _write_opportunities_snapshot(path: Path, opportunities: list[ConditionalArbOpportunity], summary: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "generated_at": utc_iso(),
-        "summary": summary,
-        "opportunities": [opportunity.to_record() for opportunity in opportunities],
-    }
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(jsonable(payload), f, indent=2, sort_keys=True)
-    tmp.replace(path)
 
 
 def _build_market_universe(
@@ -101,35 +85,39 @@ class ConditionalArbScanner:
         *,
         scan_config: config.ScanConfig | None = None,
         client: GammaClobClient | None = None,
-        ledger: PaperConditionalArbLedger | None = None,
-        event_log: ConditionalArbEventLog | None = None,
+        portfolio: PaperPortfolio | None = None,
         logger: logging.Logger | None = None,
-        params: ArbStrategyParams | None = None,
+        params: PaperPortfolioParams | None = None,
+        **_legacy_kwargs: Any,
     ):
         self.config = scan_config or config.load_scan_config()
         self.client = client or GammaClobClient(clob_host=self.config.clob_host)
-        self.ledger = ledger or PaperConditionalArbLedger(self.config.paper_ledger_path)
-        self.event_log = event_log or ConditionalArbEventLog(self.config.event_log_path)
-        self.logger = logger or logging.getLogger("polymarket_conditional_arb.scan")
-        self.params = params or ArbStrategyParams.from_config(self.config)
+        self.params = params or PaperPortfolioParams.from_config(self.config)
+        self.portfolio = portfolio or PaperPortfolio(
+            self.config.paper_portfolio_instance_path,
+            events_path=self.config.paper_portfolio_events_path,
+            params=self.params,
+        )
+        self.logger = logger or logging.getLogger("polymarket_conditional_arb.portfolio")
         self.running = True
 
     def bootstrap(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.config.log_dir.mkdir(parents=True, exist_ok=True)
-        self.ledger.load()
-        self.event_log.append_event(
-            "conditional_arb_scanner_started",
+        self.portfolio.load()
+        self.portfolio.append_event(
+            "paper_portfolio_instance_started",
             {
-                "mode": "paper_alert_only",
+                "mode": "paper_portfolio_instance",
                 "clob_host": self.config.clob_host,
                 "market_limit": self.config.market_limit,
-                "include_neg_risk": self.config.include_neg_risk,
+                "include_neg_risk": False,
                 "market_ws_enabled": self.config.market_ws_enabled,
                 "market_ws_endpoint": self.config.market_ws_endpoint,
                 "min_net_profit_usd": self.params.min_net_profit_usd,
                 "min_net_return_bps": self.params.min_net_return_bps,
-                "max_capital_usd": self.params.max_capital_usd,
+                "starting_capital_usd": self.params.starting_capital_usd,
+                "trade_ceiling_usd": self.params.trade_ceiling_usd,
             },
         )
 
@@ -146,7 +134,7 @@ class ConditionalArbScanner:
         try:
             return self.run_one_cycle()
         finally:
-            self.ledger.save()
+            self.portfolio.save()
 
     def run_forever(self) -> None:
         self.bootstrap()
@@ -157,7 +145,7 @@ class ConditionalArbScanner:
             else:
                 self._run_rest_forever()
         finally:
-            self.ledger.save()
+            self.portfolio.save()
 
     def _run_rest_forever(self) -> None:
         while self.running:
@@ -290,8 +278,8 @@ class ConditionalArbScanner:
         if removed_tokens:
             cache.remove_tokens(removed_tokens)
 
-        self.event_log.append_event(
-            "conditional_arb_market_universe_refreshed",
+        self.portfolio.append_event(
+            "paper_portfolio_market_universe_refreshed",
             {
                 "events_fetched": new_universe.events_fetched,
                 "raw_markets": new_universe.raw_markets,
@@ -338,7 +326,7 @@ class ConditionalArbScanner:
         *,
         dirty_token_ids: set[str] | None,
         evaluation_reason: str,
-        params: ArbStrategyParams,
+        params: PaperPortfolioParams,
     ) -> dict[str, Any]:
         return self._evaluate_universe(
             universe,
@@ -355,12 +343,12 @@ class ConditionalArbScanner:
         *,
         dirty_token_ids: set[str] | None,
         evaluation_reason: str,
-        params: ArbStrategyParams,
+        params: PaperPortfolioParams,
     ) -> dict[str, Any]:
         cycle_started = datetime.now(timezone.utc)
         self.logger.info("cycle_start reason=%s at=%s", evaluation_reason, cycle_started.isoformat())
-        self.event_log.append_event(
-            "conditional_arb_cycle_started",
+        self.portfolio.append_event(
+            "paper_portfolio_cycle_started",
             {
                 "cycle_started_at_utc": utc_iso(cycle_started),
                 "evaluation_reason": evaluation_reason,
@@ -369,14 +357,12 @@ class ConditionalArbScanner:
         )
 
         skip_counts: dict[str, int] = {}
-        neg_risk_groups = dict(universe.neg_risk_groups) if self.config.include_neg_risk else {}
-        standard_markets, neg_groups_to_evaluate = self._evaluation_targets(
+        standard_markets = self._evaluation_targets(
             universe,
             dirty_token_ids=dirty_token_ids,
             skip_counts=skip_counts,
         )
-        entered_positions = dict(self.ledger.opportunities)
-        opportunities: list[ConditionalArbOpportunity] = []
+        executions: list[dict[str, Any]] = []
 
         for market in standard_markets:
             yes_book = books_by_token.get(market.yes_token_id)
@@ -384,26 +370,16 @@ class ConditionalArbScanner:
             if yes_book is None or no_book is None:
                 skip_counts["missing_ask_book"] = skip_counts.get("missing_ask_book", 0) + 1
                 continue
-            decision = evaluate_binary_arbitrage(
+            decision = self.portfolio.execute_binary_complete_set(
                 market,
                 yes_book,
                 no_book,
                 as_of=cycle_started,
-                entered_positions=entered_positions,
                 params=params,
             )
-            self._handle_decision(decision, opportunities, skip_counts)
+            self._handle_decision(decision, executions, skip_counts)
 
-        for group in neg_groups_to_evaluate:
-            decision = evaluate_neg_risk_event_group(
-                list(group),
-                books_by_token,
-                as_of=cycle_started,
-                params=params,
-            )
-            self._handle_decision(decision, opportunities, skip_counts)
-
-        recorded = self._record_opportunities(opportunities, cycle_started, skip_counts)
+        neg_risk_markets = sum(1 for market in universe.markets if market.neg_risk)
         summary = {
             "cycle_started_at_utc": utc_iso(cycle_started),
             "evaluation_reason": evaluation_reason,
@@ -412,31 +388,25 @@ class ConditionalArbScanner:
             "raw_markets": universe.raw_markets,
             "tradable_markets": len(universe.markets),
             "standard_binary_markets": sum(1 for market in universe.markets if not market.neg_risk),
-            "neg_risk_groups": len(neg_risk_groups),
+            "neg_risk_markets_skipped": neg_risk_markets,
             "evaluated_standard_binary_markets": len(standard_markets),
-            "evaluated_neg_risk_groups": len(neg_groups_to_evaluate),
-            "opportunities_detected": len(opportunities),
-            "opportunities_recorded": recorded,
+            "executions": len(executions),
             "skip_counts": skip_counts,
         }
-        _write_opportunities_snapshot(self.config.opportunities_path, opportunities, summary)
-        self.event_log.append_event("conditional_arb_cycle_completed", summary)
+        self.portfolio.append_event("paper_portfolio_cycle_completed", summary)
         self.logger.info(
-            "cycle_end reason=%s events=%s raw_markets=%s tradable=%s evaluated_binary=%s "
-            "evaluated_neg_groups=%s opportunities=%s recorded=%s skipped=%s",
+            "cycle_end reason=%s events=%s raw_markets=%s tradable=%s evaluated_binary=%s executions=%s skipped=%s",
             evaluation_reason,
             universe.events_fetched,
             universe.raw_markets,
             len(universe.markets),
             len(standard_markets),
-            len(neg_groups_to_evaluate),
-            len(opportunities),
-            recorded,
+            len(executions),
             skip_counts,
         )
         return {
             "summary": summary,
-            "opportunities": [opportunity.to_record() for opportunity in opportunities],
+            "executions": executions,
         }
 
     def _evaluation_targets(
@@ -445,75 +415,50 @@ class ConditionalArbScanner:
         *,
         dirty_token_ids: set[str] | None,
         skip_counts: dict[str, int],
-    ) -> tuple[list[BinaryMarket], list[tuple[BinaryMarket, ...]]]:
+    ) -> list[BinaryMarket]:
         if dirty_token_ids is None:
-            if self.config.include_neg_risk:
-                missing_grouping = sum(1 for market in universe.markets if market.neg_risk and not market.event_id)
-                if missing_grouping:
-                    skip_counts["missing_grouping_metadata"] = missing_grouping
-                return (
-                    [market for market in universe.markets if not market.neg_risk],
-                    list(universe.neg_risk_groups.values()),
-                )
-            return [market for market in universe.markets if not market.neg_risk], []
+            return [market for market in universe.markets if not market.neg_risk]
 
         standard_by_market_id: dict[str, BinaryMarket] = {}
-        neg_group_ids: set[str] = set()
-        missing_grouping_seen: set[str] = set()
+        neg_risk_seen: set[str] = set()
         for token_id in dirty_token_ids:
             for market in universe.markets_by_token.get(token_id, ()):
                 if market.neg_risk:
-                    if self.config.include_neg_risk and market.event_id:
-                        neg_group_ids.add(market.event_id)
-                    elif self.config.include_neg_risk:
-                        missing_grouping_seen.add(market.market_id)
+                    neg_risk_seen.add(market.market_id)
                     continue
                 standard_by_market_id[market.market_id] = market
 
-        if missing_grouping_seen:
-            skip_counts["missing_grouping_metadata"] = len(missing_grouping_seen)
-        return (
-            list(standard_by_market_id.values()),
-            [universe.neg_risk_groups[event_id] for event_id in sorted(neg_group_ids)],
-        )
-
-    def _record_opportunities(
-        self,
-        opportunities: list[ConditionalArbOpportunity],
-        as_of: datetime,
-        skip_counts: dict[str, int],
-    ) -> int:
-        recorded = 0
-        for opportunity in opportunities:
-            if self.ledger.has_opportunity(opportunity.opportunity_id):
-                skip_counts["already_recorded"] = skip_counts.get("already_recorded", 0) + 1
-                continue
-            self.ledger.record(opportunity, as_of=as_of)
-            recorded += 1
-            self.event_log.append_event(
-                "conditional_arb_opportunity_recorded",
-                opportunity.to_record(),
-            )
-        return recorded
+        if neg_risk_seen:
+            skip_counts["neg_risk_not_supported"] = len(neg_risk_seen)
+        return list(standard_by_market_id.values())
 
     def _handle_decision(
         self,
-        decision: ArbDecision,
-        opportunities: list[ConditionalArbOpportunity],
+        decision: PaperPortfolioDecision,
+        executions: list[dict[str, Any]],
         skip_counts: dict[str, int],
     ) -> None:
-        if decision.action == "ENTER" and decision.opportunity is not None:
-            opportunities.append(decision.opportunity)
-            self.event_log.append_event(
-                "conditional_arb_opportunity_detected",
-                decision.opportunity.to_record(),
-            )
+        if decision.action == "EXECUTE" and decision.execution is not None:
+            execution = decision.execution
+            executions.append(execution)
             self.logger.info(
-                "opportunity kind=%s id=%s net_profit=%.4f return_bps=%.2f",
-                decision.opportunity.kind,
-                decision.opportunity.opportunity_id,
-                decision.opportunity.net_profit,
-                decision.opportunity.net_return_bps,
+                "paper_execution market_id=%s question=%r quantity=%.4f yes_vwap=%.4f no_vwap=%.4f "
+                "gross_cost=%.4f fees=%.4f slippage=%.4f tax=%.4f merge=%.4f net_pnl=%.4f "
+                "return_bps=%.2f ceiling_used=%.4f stop_reason=%s",
+                execution["market_id"],
+                execution.get("question"),
+                execution["quantity_redeemed"],
+                execution["yes_vwap"],
+                execution["no_vwap"],
+                execution["gross_cost"],
+                execution["estimated_fees"],
+                execution["slippage_buffer"],
+                execution["tax_cost"],
+                execution["merge_cost"],
+                execution["net_profit"],
+                execution["net_return_bps"],
+                execution["ceiling_used_usd"],
+                execution["stop_reason"],
             )
             return
         reason = decision.reason or "unknown"
@@ -521,63 +466,46 @@ class ConditionalArbScanner:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    loaded = config.load_scan_config()
-    parser = argparse.ArgumentParser(description="Scan Polymarket for paper-only conditional arbitrage")
-    parser.add_argument("--once", action="store_true", help="Run one REST snapshot cycle and exit")
-    parser.add_argument("--limit", type=int, default=loaded.market_limit, help="Maximum tradable markets to scan")
-    parser.add_argument(
-        "--poll-interval-seconds",
-        type=int,
-        default=loaded.poll_interval_seconds,
-        help="Seconds between REST polling cycles when market WebSocket is disabled",
-    )
-    parser.add_argument(
-        "--min-net-profit-usd",
-        type=float,
-        default=loaded.min_net_profit_usd,
-        help="Minimum net profit after fees, slippage buffer, and gas",
-    )
-    parser.add_argument(
-        "--min-net-return-bps",
-        type=float,
-        default=loaded.min_net_return_bps,
-        help="Minimum net return on capital in basis points",
-    )
-    parser.add_argument(
-        "--max-capital-usd",
-        type=float,
-        default=loaded.max_capital_usd,
-        help="Maximum paper capital to allocate per opportunity",
-    )
-    parser.add_argument("--include-neg-risk", dest="include_neg_risk", action="store_true", default=None)
-    parser.add_argument("--no-neg-risk", dest="include_neg_risk", action="store_false")
-    parser.add_argument("--market-ws", dest="market_ws_enabled", action="store_true", default=None)
-    parser.add_argument("--no-market-ws", dest="market_ws_enabled", action="store_false")
-    parser.add_argument("--json", action="store_true", help="Print cycle result as JSON")
-    parser.add_argument("--data-dir", type=Path, default=loaded.data_dir, help="Data output directory")
-    parser.add_argument("--clob-host", default=loaded.clob_host, help="CLOB host override")
+    parser = argparse.ArgumentParser(description="Run a local paper Polymarket arbitrage portfolio")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("run", help="Run the continuous paper portfolio instance")
+    subparsers.add_parser("status", help="Print paper portfolio performance")
+    reset_parser = subparsers.add_parser("reset", help="Reset the local paper portfolio state")
+    reset_parser.add_argument("--yes", action="store_true", help="Confirm resetting the paper portfolio")
     return parser
 
 
 def _config_from_args(args: argparse.Namespace) -> config.ScanConfig:
-    loaded = config.load_scan_config()
-    include_neg_risk = loaded.include_neg_risk if args.include_neg_risk is None else bool(args.include_neg_risk)
-    market_ws_enabled = (
-        loaded.market_ws_enabled if args.market_ws_enabled is None else bool(args.market_ws_enabled)
-    )
-    data_dir = Path(args.data_dir)
-    return replace(
-        loaded,
-        data_dir=data_dir,
-        log_dir=config.log_dir(),
-        clob_host=str(args.clob_host).rstrip("/"),
-        market_limit=args.limit if args.limit and args.limit > 0 else None,
-        poll_interval_seconds=max(1, int(args.poll_interval_seconds)),
-        min_net_profit_usd=max(0.0, float(args.min_net_profit_usd)),
-        min_net_return_bps=max(0.0, float(args.min_net_return_bps)),
-        max_capital_usd=max(0.01, float(args.max_capital_usd)),
-        include_neg_risk=include_neg_risk,
-        market_ws_enabled=market_ws_enabled,
+    _ = args
+    return replace(config.load_scan_config(), include_neg_risk=False)
+
+
+def _money(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+def _format_status(status: dict[str, Any]) -> str:
+    costs = status["costs"]
+    unmatched = status["unmatched_inventory"]
+    unmatched_text = "none" if not unmatched else f"{len(unmatched)} positions"
+    return "\n".join(
+        [
+            "Paper Portfolio Status",
+            f"Starting capital: {_money(status['starting_capital_usd'])}",
+            f"Cash: {_money(status['cash'])}",
+            f"Realized PnL: {_money(status['realized_pnl'])}",
+            f"Total equity: {_money(status['total_equity'])}",
+            f"Return: {status['return_pct']:.2f}%",
+            f"Trades: {status['trade_count']}",
+            f"Win rate: {status['win_rate_pct']:.2f}%",
+            "Costs: "
+            f"fees {_money(costs['fees_usd'])}, "
+            f"slippage {_money(costs['slippage_usd'])}, "
+            f"tax {_money(costs['tax_usd'])}, "
+            f"merge {_money(costs['merge_usd'])}",
+            f"Last execution: {status['last_execution_at_utc'] or 'never'}",
+            f"Unmatched inventory: {unmatched_text}",
+        ]
     )
 
 
@@ -585,14 +513,33 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     scan_config = _config_from_args(args)
+    command = args.command or "run"
+    params = PaperPortfolioParams.from_config(scan_config)
+    portfolio = PaperPortfolio(
+        scan_config.paper_portfolio_instance_path,
+        events_path=scan_config.paper_portfolio_events_path,
+        params=params,
+    )
+
+    if command == "status":
+        print(_format_status(portfolio.status()))
+        return
+
+    if command == "reset":
+        if not getattr(args, "yes", False):
+            parser.error("reset requires --yes")
+        portfolio.reset(yes=True)
+        print(f"Paper portfolio reset to {_money(params.starting_capital_usd)}")
+        return
+
     logger = setup_logging(scan_config)
-    scanner = ConditionalArbScanner(scan_config=scan_config, logger=logger)
-    if args.once:
-        result = scanner.run_once()
-        if args.json:
-            print(json.dumps(jsonable(result), sort_keys=True))
-    else:
-        scanner.run_forever()
+    scanner = ConditionalArbScanner(
+        scan_config=scan_config,
+        portfolio=portfolio,
+        logger=logger,
+        params=params,
+    )
+    scanner.run_forever()
 
 
 if __name__ == "__main__":

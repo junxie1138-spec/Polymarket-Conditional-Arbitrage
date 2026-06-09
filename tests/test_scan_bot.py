@@ -9,12 +9,10 @@ from pathlib import Path
 import pytest
 
 from polymarket_conditional_arb import config
-from polymarket_conditional_arb.arb_strategy import ArbStrategyParams
-from polymarket_conditional_arb.event_log import ConditionalArbEventLog
 from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
 from polymarket_conditional_arb.order_book import asks_from_book
-from polymarket_conditional_arb.paper import PaperConditionalArbLedger
+from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams
 from polymarket_conditional_arb.scan_bot import ConditionalArbScanner, _config_from_args, build_parser, main
 
 
@@ -115,9 +113,13 @@ def scan_config(tmp_path: Path):
         min_net_profit_usd=0.0,
         min_net_return_bps=0.0,
         max_capital_usd=20.0,
+        starting_capital_usd=1000.0,
+        trade_ceiling_usd=20.0,
         slippage_buffer_bps=0.0,
         gas_cost_usd=0.0,
+        merge_cost_usd=0.0,
         taker_fee_bps=0.0,
+        tax_bps=0.0,
         max_book_age_seconds=20.0,
         include_neg_risk=True,
     )
@@ -125,13 +127,17 @@ def scan_config(tmp_path: Path):
 
 def scanner_for(tmp_path: Path, client):
     cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
     scanner = ConditionalArbScanner(
         scan_config=cfg,
         client=client,
-        ledger=PaperConditionalArbLedger(cfg.paper_ledger_path),
-        event_log=ConditionalArbEventLog(cfg.event_log_path),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
         logger=null_logger(),
-        params=ArbStrategyParams.from_config(cfg),
+        params=params,
     )
     scanner.bootstrap()
     return scanner
@@ -156,28 +162,34 @@ def profitable_books(token_ids, *, updated_at):
     return books
 
 
-def test_scanner_writes_json_snapshot_event_log_and_paper_ledger(tmp_path):
+def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
     cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
     scanner = ConditionalArbScanner(
         scan_config=cfg,
         client=FakeClient(),
-        ledger=PaperConditionalArbLedger(cfg.paper_ledger_path),
-        event_log=ConditionalArbEventLog(cfg.event_log_path),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
         logger=null_logger(),
-        params=ArbStrategyParams.from_config(cfg),
+        params=params,
     )
 
     result = scanner.run_once()
 
-    assert result["summary"]["opportunities_detected"] == 1
-    assert cfg.opportunities_path.exists()
-    assert cfg.event_log_path.exists()
-    assert cfg.paper_ledger_path.exists()
+    assert result["summary"]["executions"] == 1
+    assert cfg.paper_portfolio_instance_path.exists()
+    assert cfg.paper_portfolio_events_path.exists()
 
-    snapshot = json.loads(cfg.opportunities_path.read_text(encoding="utf-8"))
-    ledger = json.loads(cfg.paper_ledger_path.read_text(encoding="utf-8"))
-    assert snapshot["opportunities"][0]["opportunity_id"] == "binary:m1"
-    assert ledger["binary:m1"]["status"] == "paper_alert_recorded"
+    state = json.loads(cfg.paper_portfolio_instance_path.read_text(encoding="utf-8"))
+    assert state["starting_capital_usd"] == 1000.0
+    assert state["cash"] == pytest.approx(1000.3)
+    assert state["realized_pnl"] == pytest.approx(0.3)
+    assert state["executions"][0]["market_id"] == "m1"
+    assert state["executions"][0]["quantity_redeemed"] == 10.0
+    assert state["inventory"] == {}
 
 
 def test_cli_help_smoke(capsys):
@@ -185,7 +197,13 @@ def test_cli_help_smoke(capsys):
         main(["--help"])
 
     assert excinfo.value.code == 0
-    assert "Scan Polymarket" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "paper Polymarket" in output
+    assert "--once" not in output
+    assert "--limit" not in output
+    assert "--json" not in output
+    assert "--no-market-ws" not in output
+    assert "--no-neg-risk" not in output
 
 
 def test_scanner_package_has_no_live_order_or_auth_imports():
@@ -221,7 +239,7 @@ def test_dirty_token_update_evaluates_only_its_market(tmp_path):
     )
 
     assert result["summary"]["evaluated_standard_binary_markets"] == 1
-    assert result["opportunities"][0]["opportunity_id"] == "binary:m1"
+    assert result["executions"][0]["market_id"] == "m1"
 
 
 def test_websocket_dirty_tick_does_not_fetch_rest_books(tmp_path):
@@ -251,13 +269,13 @@ def test_stale_websocket_cache_skips_opportunities(tmp_path):
     cache.seed_ask_books(
         profitable_books(universe.token_ids, updated_at=datetime.now(timezone.utc) - timedelta(seconds=6))
     )
-    ws_params = ArbStrategyParams(
-        min_net_profit_usd=0.0,
-        min_net_return_bps=0.0,
-        max_capital_usd=20.0,
+    ws_params = PaperPortfolioParams(
+        starting_capital_usd=1000.0,
+        trade_ceiling_usd=20.0,
         slippage_buffer_bps=0.0,
-        gas_cost_usd=0.0,
         taker_fee_bps=0.0,
+        tax_bps=0.0,
+        merge_cost_usd=0.0,
         max_book_age_seconds=5.0,
     )
 
@@ -269,7 +287,7 @@ def test_stale_websocket_cache_skips_opportunities(tmp_path):
         params=ws_params,
     )
 
-    assert result["summary"]["opportunities_detected"] == 0
+    assert result["summary"]["executions"] == 0
     assert result["summary"]["skip_counts"]["stale_book"] == 1
 
 
@@ -281,13 +299,13 @@ def test_rest_reconciliation_refreshes_stale_books_and_restores_evaluation(tmp_p
     cache.seed_ask_books(
         profitable_books(universe.token_ids, updated_at=datetime.now(timezone.utc) - timedelta(seconds=6))
     )
-    ws_params = ArbStrategyParams(
-        min_net_profit_usd=0.0,
-        min_net_return_bps=0.0,
-        max_capital_usd=20.0,
+    ws_params = PaperPortfolioParams(
+        starting_capital_usd=1000.0,
+        trade_ceiling_usd=20.0,
         slippage_buffer_bps=0.0,
-        gas_cost_usd=0.0,
         taker_fee_bps=0.0,
+        tax_bps=0.0,
+        merge_cost_usd=0.0,
         max_book_age_seconds=5.0,
     )
 
@@ -301,11 +319,82 @@ def test_rest_reconciliation_refreshes_stale_books_and_restores_evaluation(tmp_p
     )
 
     assert client.fetch_ask_books_calls == 1
-    assert result["summary"]["opportunities_detected"] == 2
+    assert result["summary"]["executions"] == 2
 
 
-def test_no_market_ws_cli_flag_disables_websocket_mode():
+def test_unchanged_book_fingerprint_does_not_duplicate_paper_execution(tmp_path):
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client)
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    updated_at = datetime.now(timezone.utc)
+    cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=updated_at))
+
+    first = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+    second = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+
+    assert first["summary"]["executions"] == 1
+    assert second["summary"]["executions"] == 0
+    assert second["summary"]["skip_counts"]["unchanged_book_snapshot"] == 1
+
+
+def test_changed_book_depth_allows_new_paper_execution(tmp_path):
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client)
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    first_updated_at = datetime.now(timezone.utc)
+    cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=first_updated_at))
+
+    first = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+    second_updated_at = datetime.now(timezone.utc)
+    cache.seed_ask_books(
+        {
+            "yes-1": asks_from_book(
+                {"asks": [{"price": "0.47", "size": "10"}]},
+                token_id="yes-1",
+                updated_at=second_updated_at,
+            ),
+            "no-1": asks_from_book(
+                {"asks": [{"price": "0.49", "size": "10"}]},
+                token_id="no-1",
+                updated_at=second_updated_at,
+            ),
+        }
+    )
+    second = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+
+    assert first["summary"]["executions"] == 1
+    assert second["summary"]["executions"] == 1
+    assert second["executions"][0]["yes_vwap"] == pytest.approx(0.47)
+
+
+def test_parser_public_surface_uses_portfolio_commands():
     parser = build_parser()
-    cfg = _config_from_args(parser.parse_args(["--no-market-ws"]))
+    cfg = _config_from_args(parser.parse_args(["status"]))
 
-    assert cfg.market_ws_enabled is False
+    assert cfg.include_neg_risk is False
