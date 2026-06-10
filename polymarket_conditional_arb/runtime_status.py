@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -230,6 +231,7 @@ def format_status_dashboard(
     return "\n".join(
         [
             f"Paper Portfolio Status [{state}]",
+            f"Last refreshed: {utc_iso(current_time)}",
             f"PID/Host: {pid} on {host}",
             f"Heartbeat: {_format_age(heartbeat_age)} ago; phase={runtime_row.get('phase') or 'unknown'}; {detail}",
             (
@@ -280,14 +282,19 @@ def run_status_watch(
     *,
     render: Callable[[], str],
     refresh_seconds: float,
-    output: Callable[[str], None] = print,
+    output: Callable[[str], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     iterations: int | None = None,
 ) -> None:
+    writer = output or sys.stdout.write
     count = 0
     while iterations is None or count < iterations:
-        prefix = "" if iterations == 1 else "\x1b[2J\x1b[H"
-        output(prefix + render())
+        writer("\x1b[2J\x1b[H" + render())
+        flush = getattr(writer, "flush", None)
+        if callable(flush):
+            flush()
+        elif output is None:
+            sys.stdout.flush()
         count += 1
         if iterations is not None and count >= iterations:
             return

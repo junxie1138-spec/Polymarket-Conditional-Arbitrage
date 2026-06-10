@@ -708,6 +708,7 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     dead = format_status_dashboard(runtime=None, portfolio=portfolio_status, now=now)
 
     assert "Paper Portfolio Status [ONLINE]" in online
+    assert "Last refreshed: 2026-06-10T12:00:00Z" in online
     assert "Last cycle: reason=ws_bootstrap; completed=2026-06-10T12:00:00Z; evaluated=2; executions=1; skips=1" in online
     assert "Paper Portfolio Status [WARMUP]" in warmup
     assert "Paper Portfolio Status [DEAD]" in dead
@@ -726,6 +727,7 @@ def test_status_watch_loop_can_be_bounded():
     )
 
     assert rendered == ["\x1b[2J\x1b[Hsnapshot", "\x1b[2J\x1b[Hsnapshot"]
+    assert all(frame.count("snapshot") == 1 for frame in rendered)
     assert sleeps == [0.2]
 
 
