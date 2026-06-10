@@ -12,6 +12,7 @@ from polymarket_conditional_arb.market_data import (
     MarketWebSocketSettings,
     chunk_asset_ids,
 )
+from polymarket_conditional_arb.order_book import asks_from_book
 
 AS_OF = datetime(2026, 6, 8, 12, tzinfo=timezone.utc)
 
@@ -118,6 +119,85 @@ def test_price_change_updates_removes_zero_size_levels_and_preserves_ordering():
     assert asks is not None
     assert [(level.price, level.size) for level in asks.levels] == [(0.48, 2.0), (0.50, 3.0)]
     assert asks.source == "ws_price_change"
+
+
+def test_price_change_without_ready_snapshot_is_ignored(caplog):
+    cache = MarketDataCache()
+    logger = logging.getLogger("test_market_data")
+
+    with caplog.at_level(logging.WARNING, logger="test_market_data"):
+        updated = cache.apply_message(
+            {
+                "event_type": "price_change",
+                "price_changes": [
+                    {"asset_id": "token-a", "side": "SELL", "price": "0.48", "size": "2"},
+                ],
+            },
+            received_at=AS_OF,
+            logger=logger,
+        )
+
+    assert updated == set()
+    assert cache.book_side("token-a", "ask") is None
+    assert cache.is_snapshot_ready("token-a") is False
+    assert "market_ws_price_change_without_ready_snapshot" in caplog.text
+
+
+def test_price_change_after_stale_marking_waits_for_rest_reseed():
+    cache = MarketDataCache()
+    cache.apply_message(
+        {
+            "event_type": "book",
+            "asset_id": "token-a",
+            "asks": [{"price": "0.50", "size": "3"}],
+        },
+        received_at=AS_OF,
+    )
+    assert cache.is_snapshot_ready("token-a") is True
+    first_generation = cache.snapshot_generation("token-a")
+
+    cache.mark_tokens_stale(["token-a"], stale_at=AS_OF)
+    ignored = cache.apply_message(
+        {
+            "event_type": "price_change",
+            "price_changes": [
+                {"asset_id": "token-a", "side": "SELL", "price": "0.48", "size": "2"},
+            ],
+        },
+        received_at=AS_OF,
+    )
+    stale_asks = cache.book_side("token-a", "ask")
+
+    assert ignored == set()
+    assert cache.is_snapshot_ready("token-a") is False
+    assert cache.snapshot_generation("token-a") > first_generation
+    assert stale_asks is not None
+    assert stale_asks.source.endswith("_stale")
+    assert [(level.price, level.size) for level in stale_asks.levels] == [(0.50, 3.0)]
+
+    cache.seed_ask_books(
+        {
+            "token-a": asks_from_book(
+                {"asks": [{"price": "0.51", "size": "4"}]},
+                token_id="token-a",
+                updated_at=AS_OF,
+            )
+        }
+    )
+    updated = cache.apply_message(
+        {
+            "event_type": "price_change",
+            "price_changes": [
+                {"asset_id": "token-a", "side": "SELL", "price": "0.49", "size": "1"},
+            ],
+        },
+        received_at=AS_OF,
+    )
+    asks = cache.book_side("token-a", "ask")
+
+    assert updated == {"token-a"}
+    assert asks is not None
+    assert [(level.price, level.size) for level in asks.levels] == [(0.49, 1.0), (0.51, 4.0)]
 
 
 def test_malformed_messages_are_logged_and_ignored(caplog):

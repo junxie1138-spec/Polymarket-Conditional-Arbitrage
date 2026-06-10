@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable as IterableABC
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -20,18 +21,52 @@ def _as_float(value: Any) -> float | None:
 
 def _raw_levels(book: dict[str, Any], side: BookSideName) -> Iterable[Any]:
     if side == "ask":
-        return book.get("asks") or book.get("sell") or []
-    return book.get("bids") or book.get("buy") or []
+        for key in ("asks", "sell"):
+            if key in book:
+                value = book.get(key)
+                return value if isinstance(value, IterableABC) and not isinstance(value, (str, bytes)) else []
+        return []
+    for key in ("bids", "buy"):
+        if key in book:
+            value = book.get(key)
+            return value if isinstance(value, IterableABC) and not isinstance(value, (str, bytes)) else []
+    return []
+
+
+def _first_present(level: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in level:
+            return level[key]
+    return None
 
 
 def _price_size(level: Any) -> tuple[float | None, float | None]:
     if isinstance(level, dict):
         price = _as_float(level.get("price"))
-        size = _as_float(level.get("size") or level.get("quantity") or level.get("amount"))
+        size = _as_float(_first_present(level, "size", "quantity", "amount"))
         return price, size
     if isinstance(level, (list, tuple)) and len(level) >= 2:
         return _as_float(level[0]), _as_float(level[1])
     return None, None
+
+
+def _source_revision(book: dict[str, Any]) -> str | None:
+    for key in (
+        "hash",
+        "book_hash",
+        "bookHash",
+        "update_id",
+        "updateId",
+        "sequence",
+        "sequence_id",
+        "sequenceId",
+        "timestamp",
+        "ts",
+    ):
+        value = book.get(key)
+        if value not in (None, ""):
+            return f"{key}:{value}"
+    return None
 
 
 def normalize_book_side(
@@ -41,6 +76,7 @@ def normalize_book_side(
     side: BookSideName,
     source: str = "rest_book",
     updated_at: datetime | None = None,
+    source_revision: str | None = None,
 ) -> OrderBookSide:
     levels: list[BookLevel] = []
     for raw_level in _raw_levels(book, side):
@@ -58,6 +94,7 @@ def normalize_book_side(
         levels=tuple(levels),
         source=source,
         updated_at=updated_at,
+        source_revision=source_revision or _source_revision(book),
     )
 
 
@@ -67,6 +104,7 @@ def asks_from_book(
     token_id: str,
     source: str = "rest_book",
     updated_at: datetime | None = None,
+    source_revision: str | None = None,
 ) -> OrderBookSide:
     return normalize_book_side(
         book,
@@ -74,6 +112,7 @@ def asks_from_book(
         side="ask",
         source=source,
         updated_at=updated_at,
+        source_revision=source_revision,
     )
 
 
@@ -83,6 +122,7 @@ def bids_from_book(
     token_id: str,
     source: str = "rest_book",
     updated_at: datetime | None = None,
+    source_revision: str | None = None,
 ) -> OrderBookSide:
     return normalize_book_side(
         book,
@@ -90,6 +130,7 @@ def bids_from_book(
         side="bid",
         source=source,
         updated_at=updated_at,
+        source_revision=source_revision,
     )
 
 
@@ -101,4 +142,3 @@ def is_crossed_book(book: dict[str, Any]) -> bool:
         and asks.best_price is not None
         and bids.best_price > asks.best_price
     )
-

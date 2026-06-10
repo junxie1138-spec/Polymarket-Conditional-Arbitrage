@@ -42,8 +42,12 @@ def as_bool(value: Any, default: bool = False) -> bool:
 
 def first_present(mapping: dict[str, Any], *keys: str) -> Any:
     for key in keys:
-        if key in mapping:
-            return mapping[key]
+        value = mapping.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, dict, tuple, set)) and not value:
+            continue
+        return value
     return None
 
 
@@ -199,6 +203,7 @@ class OrderBookSide:
     levels: tuple[BookLevel, ...]
     source: str = "rest_book"
     updated_at: datetime | None = None
+    source_revision: str | None = None
 
     @property
     def available_size(self) -> float:

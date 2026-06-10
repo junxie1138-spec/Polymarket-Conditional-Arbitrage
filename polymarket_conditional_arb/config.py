@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -175,8 +176,25 @@ def include_neg_risk() -> bool:
     return env_bool("COND_ARB_INCLUDE_NEG_RISK", DEFAULT_INCLUDE_NEG_RISK)
 
 
+def _validated_url(value: str, *, env_name: str, allowed_schemes: set[str]) -> str:
+    raw = value.strip()
+    schemes = "/".join(sorted(allowed_schemes))
+    if not raw:
+        raise ValueError(f"{env_name} must be a non-empty {schemes} URL")
+    parsed = urlparse(raw)
+    if parsed.scheme not in allowed_schemes:
+        raise ValueError(f"{env_name} must use {schemes} scheme; got {parsed.scheme or 'missing'}")
+    if not parsed.netloc:
+        raise ValueError(f"{env_name} must include a host; got {raw!r}")
+    return raw
+
+
 def clob_host() -> str:
-    return os.getenv("POLYMARKET_CLOB_HOST", CLOB_PRODUCTION_HOST).rstrip("/")
+    return _validated_url(
+        os.getenv("POLYMARKET_CLOB_HOST", CLOB_PRODUCTION_HOST),
+        env_name="POLYMARKET_CLOB_HOST",
+        allowed_schemes={"http", "https"},
+    ).rstrip("/")
 
 
 def market_ws_enabled() -> bool:
@@ -184,7 +202,11 @@ def market_ws_enabled() -> bool:
 
 
 def market_ws_endpoint() -> str:
-    return os.getenv("COND_ARB_MARKET_WS_ENDPOINT", MARKET_WS_PRODUCTION_ENDPOINT).strip()
+    return _validated_url(
+        os.getenv("COND_ARB_MARKET_WS_ENDPOINT", MARKET_WS_PRODUCTION_ENDPOINT),
+        env_name="COND_ARB_MARKET_WS_ENDPOINT",
+        allowed_schemes={"ws", "wss"},
+    )
 
 
 def market_ws_heartbeat_seconds() -> float:

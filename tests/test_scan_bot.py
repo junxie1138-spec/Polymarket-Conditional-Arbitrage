@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,7 +14,14 @@ from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
 from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams
-from polymarket_conditional_arb.scan_bot import ConditionalArbScanner, _config_from_args, build_parser, main
+from polymarket_conditional_arb.portfolio_lock import PortfolioDataLock, PortfolioLockError
+from polymarket_conditional_arb.scan_bot import (
+    ConditionalArbScanner,
+    ScannerRetryPolicy,
+    _config_from_args,
+    build_parser,
+    main,
+)
 
 
 class FakeClient:
@@ -100,6 +108,32 @@ class TwoMarketClient:
 
     def fetch_ask_books(self, token_ids):
         self.fetch_ask_books_calls += 1
+        return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
+
+
+class FlakyEventClient(FakeClient):
+    def __init__(self, *, failures: int):
+        self.failures = failures
+        self.fetch_active_events_calls = 0
+
+    def fetch_active_events(self):
+        self.fetch_active_events_calls += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("events unavailable")
+        return super().fetch_active_events()
+
+
+class FlakyBookClient(TwoMarketClient):
+    def __init__(self, *, failures: int):
+        super().__init__()
+        self.failures = failures
+
+    def fetch_ask_books(self, token_ids):
+        self.fetch_ask_books_calls += 1
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("books unavailable")
         return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
 
 
@@ -192,6 +226,111 @@ def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
     assert state["inventory"] == {}
 
 
+def test_rest_cycle_retries_and_recovers_after_book_failure(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    client = FlakyBookClient(failures=1)
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=client,
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=logging.getLogger("test_rest_cycle_retry"),
+        params=params,
+        retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+    )
+    scanner.bootstrap()
+
+    with caplog.at_level(logging.INFO, logger="test_rest_cycle_retry"):
+        result = scanner.run_one_cycle()
+
+    assert client.fetch_ask_books_calls == 2
+    assert result["summary"]["executions"] == 2
+    assert "scanner_retry operation=rest_book_fetch attempt=1" in caplog.text
+    assert "scanner_recovered operation=rest_book_fetch attempts=2" in caplog.text
+
+
+def test_rest_cycle_does_not_retry_after_portfolio_side_effect(tmp_path):
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client)
+    original_append_event = scanner.portfolio.append_event
+
+    def fail_cycle_completed(event_type, payload=None, **fields):
+        if event_type == "paper_portfolio_cycle_completed":
+            raise RuntimeError("cycle completion log failed")
+        return original_append_event(event_type, payload, **fields)
+
+    scanner.portfolio.append_event = fail_cycle_completed
+
+    with pytest.raises(RuntimeError, match="cycle completion log failed"):
+        scanner.run_one_cycle()
+
+    assert client.fetch_ask_books_calls == 1
+    assert len(scanner.portfolio.state["executions"]) == 2
+
+
+def test_websocket_startup_market_fetch_retries(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    client = FlakyEventClient(failures=1)
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=client,
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=logging.getLogger("test_market_universe_retry"),
+        params=params,
+        retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+    )
+
+    with caplog.at_level(logging.INFO, logger="test_market_universe_retry"):
+        universe = asyncio.run(scanner._fetch_market_universe_with_retry())
+
+    assert client.fetch_active_events_calls == 2
+    assert len(universe.markets) == 1
+    assert "scanner_retry operation=market_universe_fetch attempt=1" in caplog.text
+    assert "scanner_recovered operation=market_universe_fetch attempts=2" in caplog.text
+
+
+def test_websocket_bootstrap_rest_seed_retries(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    client = FlakyBookClient(failures=1)
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=client,
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=logging.getLogger("test_rest_seed_retry"),
+        params=params,
+        retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+    )
+    cache = MarketDataCache()
+
+    with caplog.at_level(logging.INFO, logger="test_rest_seed_retry"):
+        updated = asyncio.run(
+            scanner._seed_rest_books_with_retry(
+                cache,
+                ["yes-1", "no-1"],
+                reason="ws_bootstrap",
+            )
+        )
+
+    assert client.fetch_ask_books_calls == 2
+    assert updated == {"yes-1", "no-1"}
+    assert "scanner_retry operation=rest_book_seed attempt=1" in caplog.text
+    assert "scanner_recovered operation=rest_book_seed attempts=2" in caplog.text
+
+
 def test_cli_help_smoke(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["--help"])
@@ -204,6 +343,94 @@ def test_cli_help_smoke(capsys):
     assert "--json" not in output
     assert "--no-market-ws" not in output
     assert "--no-neg-risk" not in output
+
+
+def test_portfolio_lock_rejects_second_active_holder(tmp_path):
+    state_path = tmp_path / "paper_portfolio_instance.json"
+    first = PortfolioDataLock(state_path).acquire()
+    try:
+        with pytest.raises(PortfolioLockError, match="paper portfolio data is locked"):
+            PortfolioDataLock(state_path).acquire()
+    finally:
+        first.release()
+
+
+def test_portfolio_lock_recovers_dead_same_host_lock(tmp_path, monkeypatch):
+    state_path = tmp_path / "paper_portfolio_instance.json"
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    lock_path.write_text(
+        json.dumps(
+            {
+                "host": socket.gethostname(),
+                "pid": 999999,
+                "token": "old",
+                "created_at_utc": "2026-06-08T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(PortfolioDataLock, "_process_is_alive", staticmethod(lambda _pid: False))
+
+    with PortfolioDataLock(state_path):
+        assert lock_path.exists()
+
+    assert not lock_path.exists()
+
+
+def test_cli_status_reads_state_without_lock_or_mutation(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COND_ARB_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COND_ARB_LOG_DIR", str(tmp_path / "logs"))
+    state_path = config.paper_portfolio_instance_path(data_dir)
+    params = PaperPortfolioParams.from_config(scan_config(tmp_path))
+    portfolio = PaperPortfolio(
+        state_path,
+        events_path=config.paper_portfolio_events_path(data_dir),
+        params=params,
+    )
+    portfolio.reset(yes=True)
+    before = state_path.read_text(encoding="utf-8")
+    lock = PortfolioDataLock(state_path).acquire()
+    try:
+        main(["status"])
+    finally:
+        lock.release()
+    after = state_path.read_text(encoding="utf-8")
+
+    assert "Paper Portfolio Status" in capsys.readouterr().out
+    assert before == after
+
+
+def test_cli_reset_acquires_lock_and_writes_clean_state(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COND_ARB_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COND_ARB_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("COND_ARB_STARTING_CAPITAL_USD", "1234")
+
+    main(["reset", "--yes"])
+
+    state_path = config.paper_portfolio_instance_path(data_dir)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["cash"] == 1234.0
+    assert state["executions"] == []
+    assert not state_path.with_name(state_path.name + ".lock").exists()
+    assert "Paper portfolio reset" in capsys.readouterr().out
+
+
+def test_cli_run_fails_fast_when_portfolio_lock_exists(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COND_ARB_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COND_ARB_LOG_DIR", str(tmp_path / "logs"))
+    state_path = config.paper_portfolio_instance_path(data_dir)
+    lock = PortfolioDataLock(state_path).acquire()
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            main(["run"])
+    finally:
+        lock.release()
+
+    assert excinfo.value.code == 2
+    assert "paper portfolio data is locked" in capsys.readouterr().err
 
 
 def test_scanner_package_has_no_live_order_or_auth_imports():

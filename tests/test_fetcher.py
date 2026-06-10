@@ -107,3 +107,22 @@ def test_fetch_ask_books_falls_back_to_single_book_on_malformed_batch_response()
     assert len(session.get_calls) == 2
     assert books["token-a"].source == "rest_book_fallback"
     assert books["token-b"].best_price == 0.44
+
+
+def test_fetch_ask_books_keeps_partial_single_book_fallback_successes():
+    session = Session(
+        post_responses=[Response({"bad": "shape"})],
+        get_responses=[
+            Response({"asset_id": "token-a", "asks": [{"price": "0.43", "size": "5"}]}),
+            Response([]),
+            Response({"asset_id": "token-c", "asks": [{"price": "0.45", "size": "7"}]}),
+        ],
+    )
+    client = GammaClobClient(session=session, clob_host="https://clob.example")
+
+    books = client.fetch_ask_books(["token-a", "token-b", "token-c"])
+
+    assert len(session.get_calls) == 3
+    assert sorted(books) == ["token-a", "token-c"]
+    assert books["token-a"].source == "rest_book_fallback"
+    assert books["token-c"].best_price == 0.45

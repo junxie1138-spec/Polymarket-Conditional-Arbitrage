@@ -55,3 +55,19 @@ def test_tradable_binary_markets_require_open_orderbook_enabled_markets():
     )
 
     assert [market.market_id for market in markets] == ["ok"]
+
+
+def test_binary_market_prefers_non_empty_alias_values():
+    market = BinaryMarket.from_gamma_market(
+        raw_market(
+            acceptingOrders="",
+            accepting_orders=False,
+            negRisk="",
+            neg_risk=True,
+        )
+    )
+
+    assert market is not None
+    assert market.accepting_orders is False
+    assert market.neg_risk is True
+    assert market.is_tradable is False

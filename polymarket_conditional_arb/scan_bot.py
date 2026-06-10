@@ -6,6 +6,7 @@ import logging
 import signal
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -16,8 +17,21 @@ from .event_log import utc_iso
 from .fetcher import GammaClobClient
 from .market_data import MarketDataCache, MarketWebSocketManager, MarketWebSocketSettings
 from .paper import PaperPortfolio, PaperPortfolioDecision, PaperPortfolioParams
+from .portfolio_lock import PortfolioDataLock, PortfolioLockError
 
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
+
+
+@dataclass(frozen=True)
+class ScannerRetryPolicy:
+    initial_backoff_seconds: float = 1.0
+    max_backoff_seconds: float = 30.0
+    max_attempts: int | None = 3
+
+    def backoff_seconds(self, failed_attempt: int) -> float:
+        initial = max(0.0, self.initial_backoff_seconds)
+        cap = max(initial, self.max_backoff_seconds)
+        return min(cap, initial * (2 ** max(0, failed_attempt - 1)))
 
 
 @dataclass(frozen=True)
@@ -88,6 +102,7 @@ class ConditionalArbScanner:
         portfolio: PaperPortfolio | None = None,
         logger: logging.Logger | None = None,
         params: PaperPortfolioParams | None = None,
+        retry_policy: ScannerRetryPolicy | None = None,
         **_legacy_kwargs: Any,
     ):
         self.config = scan_config or config.load_scan_config()
@@ -99,7 +114,109 @@ class ConditionalArbScanner:
             params=self.params,
         )
         self.logger = logger or logging.getLogger("polymarket_conditional_arb.portfolio")
+        self.retry_policy = retry_policy or ScannerRetryPolicy()
         self.running = True
+
+    def _should_retry(self, failed_attempt: int) -> bool:
+        return self.running and (
+            self.retry_policy.max_attempts is None
+            or failed_attempt < self.retry_policy.max_attempts
+        )
+
+    def _sleep_retry_backoff(self, seconds: float) -> None:
+        if seconds <= 0.0:
+            return
+        deadline = time.monotonic() + seconds
+        while self.running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            time.sleep(min(remaining, 0.25))
+
+    async def _sleep_async_retry_backoff(self, seconds: float) -> None:
+        if seconds <= 0.0:
+            await asyncio.sleep(0)
+            return
+        deadline = asyncio.get_running_loop().time() + seconds
+        while self.running:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                return
+            await asyncio.sleep(min(remaining, 0.25))
+
+    def _run_with_retries(
+        self,
+        operation: str,
+        func: Callable[[], Any],
+        *,
+        summary: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        attempt = 1
+        while True:
+            try:
+                result = func()
+            except Exception as exc:
+                if not self._should_retry(attempt):
+                    raise
+                backoff = self.retry_policy.backoff_seconds(attempt)
+                self.logger.warning(
+                    "scanner_retry operation=%s attempt=%s error=%r backoff_seconds=%.3f",
+                    operation,
+                    attempt,
+                    exc,
+                    backoff,
+                )
+                self._sleep_retry_backoff(backoff)
+                if not self.running:
+                    raise
+                attempt += 1
+                continue
+
+            if attempt > 1:
+                self.logger.info(
+                    "scanner_recovered operation=%s attempts=%s summary=%s",
+                    operation,
+                    attempt,
+                    summary(result) if summary is not None else {},
+                )
+            return result
+
+    async def _run_async_with_retries(
+        self,
+        operation: str,
+        func: Callable[[], Any],
+        *,
+        summary: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        attempt = 1
+        while True:
+            try:
+                result = await func()
+            except Exception as exc:
+                if not self._should_retry(attempt):
+                    raise
+                backoff = self.retry_policy.backoff_seconds(attempt)
+                self.logger.warning(
+                    "scanner_retry operation=%s attempt=%s error=%r backoff_seconds=%.3f",
+                    operation,
+                    attempt,
+                    exc,
+                    backoff,
+                )
+                await self._sleep_async_retry_backoff(backoff)
+                if not self.running:
+                    raise
+                attempt += 1
+                continue
+
+            if attempt > 1:
+                self.logger.info(
+                    "scanner_recovered operation=%s attempts=%s summary=%s",
+                    operation,
+                    attempt,
+                    summary(result) if summary is not None else {},
+                )
+            return result
 
     def bootstrap(self) -> None:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -149,7 +266,10 @@ class ConditionalArbScanner:
 
     def _run_rest_forever(self) -> None:
         while self.running:
-            self.run_one_cycle()
+            try:
+                self.run_one_cycle()
+            except Exception as exc:
+                self.logger.warning("rest_cycle_failed_after_retries error=%r", exc)
             if self.running:
                 time.sleep(self.config.poll_interval_seconds)
 
@@ -182,9 +302,16 @@ class ConditionalArbScanner:
         )
 
         try:
-            universe = await asyncio.to_thread(self._fetch_market_universe)
-            await self._seed_rest_books(cache, universe.token_ids, reason="ws_bootstrap")
-            await manager.start(universe.token_ids)
+            universe = await self._fetch_market_universe_with_retry()
+            await self._seed_rest_books_with_retry(cache, universe.token_ids, reason="ws_bootstrap")
+            await self._run_async_with_retries(
+                "market_ws_start",
+                lambda: manager.start(universe.token_ids),
+                summary=lambda _result: {
+                    "tokens": len(universe.token_ids),
+                    "connections": manager.connection_count,
+                },
+            )
             self._evaluate_from_cache(
                 universe,
                 cache,
@@ -227,7 +354,11 @@ class ConditionalArbScanner:
                 now = loop.time()
                 if now >= next_reconcile:
                     try:
-                        await self._seed_rest_books(cache, universe.token_ids, reason="rest_reconcile")
+                        await self._seed_rest_books_with_retry(
+                            cache,
+                            universe.token_ids,
+                            reason="rest_reconcile",
+                        )
                         dirty_queue.put_nowait(set(universe.token_ids))
                     except Exception as exc:
                         self.logger.warning("rest_reconcile_failed error=%s", exc)
@@ -257,6 +388,22 @@ class ConditionalArbScanner:
         self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(updated))
         return updated
 
+    async def _seed_rest_books_with_retry(
+        self,
+        cache: MarketDataCache,
+        token_ids: list[str],
+        *,
+        reason: str,
+    ) -> set[str]:
+        return await self._run_async_with_retries(
+            "rest_book_seed",
+            lambda: self._seed_rest_books(cache, token_ids, reason=reason),
+            summary=lambda updated: {
+                "reason": reason,
+                "tokens": len(updated),
+            },
+        )
+
     async def _refresh_market_universe(
         self,
         old_universe: MarketUniverse,
@@ -264,14 +411,18 @@ class ConditionalArbScanner:
         manager: MarketWebSocketManager,
         dirty_queue: asyncio.Queue[set[str]],
     ) -> MarketUniverse:
-        new_universe = await asyncio.to_thread(self._fetch_market_universe)
+        new_universe = await self._fetch_market_universe_with_retry()
         old_tokens = set(old_universe.token_ids)
         new_tokens = set(new_universe.token_ids)
         added_tokens = sorted(new_tokens - old_tokens)
         removed_tokens = sorted(old_tokens - new_tokens)
 
         if added_tokens:
-            seeded = await self._seed_rest_books(cache, added_tokens, reason="market_refresh_added")
+            seeded = await self._seed_rest_books_with_retry(
+                cache,
+                added_tokens,
+                reason="market_refresh_added",
+            )
             if seeded:
                 dirty_queue.put_nowait(seeded)
         await manager.update_tokens(new_universe.token_ids)
@@ -297,14 +448,28 @@ class ConditionalArbScanner:
         return new_universe
 
     def run_one_cycle(self) -> dict[str, Any]:
-        universe = self._fetch_market_universe()
-        books_by_token = self.client.fetch_ask_books(universe.token_ids)
+        universe = self._fetch_market_universe_with_retry_sync()
+        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids)
         return self._evaluate_universe(
             universe,
             books_by_token,
             dirty_token_ids=None,
             evaluation_reason="rest_cycle",
             params=self.params,
+        )
+
+    def _fetch_market_universe_with_retry_sync(self) -> MarketUniverse:
+        return self._run_with_retries(
+            "market_universe_fetch",
+            self._fetch_market_universe,
+            summary=self._universe_retry_summary,
+        )
+
+    def _fetch_ask_books_with_retry(self, token_ids: list[str]) -> Mapping[str, OrderBookSide]:
+        return self._run_with_retries(
+            "rest_book_fetch",
+            lambda: self.client.fetch_ask_books(token_ids),
+            summary=lambda books: {"tokens": len(books)},
         )
 
     def _fetch_market_universe(self) -> MarketUniverse:
@@ -318,6 +483,22 @@ class ConditionalArbScanner:
             raw_markets=len(raw_markets),
             markets=tradable_markets,
         )
+
+    async def _fetch_market_universe_with_retry(self) -> MarketUniverse:
+        return await self._run_async_with_retries(
+            "market_universe_fetch",
+            lambda: asyncio.to_thread(self._fetch_market_universe),
+            summary=self._universe_retry_summary,
+        )
+
+    @staticmethod
+    def _universe_retry_summary(universe: MarketUniverse) -> dict[str, int]:
+        return {
+            "events_fetched": universe.events_fetched,
+            "raw_markets": universe.raw_markets,
+            "tradable_markets": len(universe.markets),
+            "tokens": len(universe.token_ids),
+        }
 
     def _evaluate_from_cache(
         self,
@@ -528,18 +709,26 @@ def main(argv: list[str] | None = None) -> None:
     if command == "reset":
         if not getattr(args, "yes", False):
             parser.error("reset requires --yes")
-        portfolio.reset(yes=True)
+        try:
+            with PortfolioDataLock(scan_config.paper_portfolio_instance_path):
+                portfolio.reset(yes=True)
+        except PortfolioLockError as exc:
+            parser.exit(2, f"{exc}\n")
         print(f"Paper portfolio reset to {_money(params.starting_capital_usd)}")
         return
 
-    logger = setup_logging(scan_config)
-    scanner = ConditionalArbScanner(
-        scan_config=scan_config,
-        portfolio=portfolio,
-        logger=logger,
-        params=params,
-    )
-    scanner.run_forever()
+    try:
+        with PortfolioDataLock(scan_config.paper_portfolio_instance_path):
+            logger = setup_logging(scan_config)
+            scanner = ConditionalArbScanner(
+                scan_config=scan_config,
+                portfolio=portfolio,
+                logger=logger,
+                params=params,
+            )
+            scanner.run_forever()
+    except PortfolioLockError as exc:
+        parser.exit(2, f"{exc}\n")
 
 
 if __name__ == "__main__":

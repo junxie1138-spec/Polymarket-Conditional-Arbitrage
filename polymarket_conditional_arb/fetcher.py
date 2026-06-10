@@ -152,13 +152,22 @@ class GammaClobClient:
                         source="rest_books_batch",
                         updated_at=received_at,
                     )
-            except Exception:
+            except Exception as batch_exc:
+                fallback_failures: dict[str, Exception] = {}
                 for token_id in chunk:
-                    raw_book = self.fetch_order_book(token_id)
+                    try:
+                        raw_book = self.fetch_order_book(token_id)
+                    except Exception as exc:
+                        fallback_failures[token_id] = exc
+                        continue
                     ask_books[token_id] = asks_from_book(
                         raw_book,
                         token_id=token_id,
                         source="rest_book_fallback",
                         updated_at=datetime.now(timezone.utc),
                     )
+                if len(fallback_failures) == len(chunk):
+                    raise RuntimeError(
+                        f"failed to fetch order books for all {len(chunk)} tokens after batch failure"
+                    ) from batch_exc
         return ask_books

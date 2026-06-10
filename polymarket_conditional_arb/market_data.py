@@ -65,11 +65,32 @@ class MarketDataCache:
 
     def __init__(self) -> None:
         self._books: dict[tuple[str, BookSideName], OrderBookSide] = {}
+        self._ready_tokens: set[str] = set()
+        self._snapshot_generations: dict[str, int] = {}
         self._lock = threading.RLock()
+
+    def _mark_snapshot_ready_locked(self, token_id: str) -> None:
+        normalized_token_id = str(token_id)
+        self._ready_tokens.add(normalized_token_id)
+        self._snapshot_generations[normalized_token_id] = self._snapshot_generations.get(normalized_token_id, 0) + 1
+
+    def _mark_snapshot_not_ready_locked(self, token_id: str) -> None:
+        normalized_token_id = str(token_id)
+        self._ready_tokens.discard(normalized_token_id)
+        self._snapshot_generations[normalized_token_id] = self._snapshot_generations.get(normalized_token_id, 0) + 1
+
+    def is_snapshot_ready(self, token_id: str) -> bool:
+        with self._lock:
+            return str(token_id) in self._ready_tokens
+
+    def snapshot_generation(self, token_id: str) -> int:
+        with self._lock:
+            return self._snapshot_generations.get(str(token_id), 0)
 
     def set_book_side(self, book: OrderBookSide) -> None:
         with self._lock:
             self._books[(book.token_id, book.side)] = book
+            self._mark_snapshot_ready_locked(book.token_id)
 
     def seed_ask_books(self, books_by_token: Mapping[str, OrderBookSide]) -> set[str]:
         updated: set[str] = set()
@@ -79,6 +100,7 @@ class MarketDataCache:
                     continue
                 normalized_token_id = str(token_id)
                 self._books[(normalized_token_id, "ask")] = book
+                self._mark_snapshot_ready_locked(normalized_token_id)
                 updated.add(normalized_token_id)
         return updated
 
@@ -88,6 +110,9 @@ class MarketDataCache:
             for key in list(self._books):
                 if key[0] in token_set:
                     self._books.pop(key, None)
+            for token_id in token_set:
+                self._ready_tokens.discard(token_id)
+                self._snapshot_generations.pop(token_id, None)
 
     def mark_tokens_stale(self, token_ids: Iterable[str], *, stale_at: datetime) -> None:
         token_set = {str(token_id) for token_id in token_ids}
@@ -101,7 +126,10 @@ class MarketDataCache:
                         levels=book.levels,
                         source=f"{book.source}_stale",
                         updated_at=timestamp,
+                        source_revision=book.source_revision,
                     )
+            for token_id in token_set:
+                self._mark_snapshot_not_ready_locked(token_id)
 
     def book_side(self, token_id: str, side: BookSideName) -> OrderBookSide | None:
         with self._lock:
@@ -183,12 +211,13 @@ class MarketDataCache:
             if logger is not None:
                 logger.warning("market_ws_book_missing_token")
             return set()
-        self.set_book_side(
-            bids_from_book(dict(payload), token_id=token_id, source="ws_book", updated_at=received_at)
-        )
-        self.set_book_side(
-            asks_from_book(dict(payload), token_id=token_id, source="ws_book", updated_at=received_at)
-        )
+        raw_book = dict(payload)
+        bid_book = bids_from_book(raw_book, token_id=token_id, source="ws_book", updated_at=received_at)
+        ask_book = asks_from_book(raw_book, token_id=token_id, source="ws_book", updated_at=received_at)
+        with self._lock:
+            self._books[(token_id, "bid")] = bid_book
+            self._books[(token_id, "ask")] = ask_book
+            self._mark_snapshot_ready_locked(token_id)
         return {token_id}
 
     def _apply_price_change(
@@ -205,6 +234,7 @@ class MarketDataCache:
             return set()
 
         updated: set[str] = set()
+        skipped_without_snapshot = 0
         with self._lock:
             for change in changes:
                 if not isinstance(change, Mapping):
@@ -219,10 +249,13 @@ class MarketDataCache:
                     continue
 
                 current = self._books.get((token_id, side))
+                if current is None or token_id not in self._ready_tokens:
+                    skipped_without_snapshot += 1
+                    continue
                 levels_by_price = {
                     level.price: level.size
                     for level in current.levels
-                } if current is not None else {}
+                }
                 if size <= 0.0:
                     levels_by_price.pop(price, None)
                 else:
@@ -233,8 +266,11 @@ class MarketDataCache:
                     levels=_sorted_levels(side, levels_by_price),
                     source="ws_price_change",
                     updated_at=received_at,
+                    source_revision=_source_revision(payload, change) or current.source_revision,
                 )
                 updated.add(token_id)
+        if skipped_without_snapshot and logger is not None:
+            logger.warning("market_ws_price_change_without_ready_snapshot skipped=%s", skipped_without_snapshot)
         return updated
 
 
@@ -260,6 +296,26 @@ def market_subscription_update_payload(asset_ids: Iterable[str], operation: Lite
     if operation == "subscribe":
         payload["custom_feature_enabled"] = True
     return payload
+
+
+def _source_revision(*payloads: Mapping[str, Any]) -> str | None:
+    for payload in payloads:
+        for key in (
+            "hash",
+            "book_hash",
+            "bookHash",
+            "update_id",
+            "updateId",
+            "sequence",
+            "sequence_id",
+            "sequenceId",
+            "timestamp",
+            "ts",
+        ):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return f"{key}:{value}"
+    return None
 
 
 @dataclass(frozen=True)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,7 @@ from .event_log import AppendOnlyJsonl, jsonable, utc_iso
 EPSILON = 1e-9
 SCHEMA_VERSION = 1
 PORTFOLIO_SCHEMA_VERSION = 1
+LOGGER = logging.getLogger(__name__)
 
 
 class PaperPortfolioLoadError(RuntimeError):
@@ -108,29 +111,42 @@ def _stale_seconds(book: OrderBookSide, as_of: datetime) -> float | None:
     return (_ensure_aware(as_of) - _ensure_aware(book.updated_at)).total_seconds()
 
 
-def _book_fingerprint_payload(book: OrderBookSide) -> dict[str, Any]:
-    return {
-        "token_id": book.token_id,
-        "side": book.side,
-        "source": book.source,
-        "updated_at": utc_iso(book.updated_at) if book.updated_at else None,
-        "levels": [
-            {
-                "price": round(float(level.price), 12),
-                "size": round(float(level.size), 12),
-            }
-            for level in book.levels
-        ],
-    }
+def _rounded_tranches(tranches: tuple[dict[str, float], ...]) -> list[dict[str, float]]:
+    return [
+        {
+            "quantity": round(float(tranche["quantity"]), 12),
+            "yes_price": round(float(tranche["yes_price"]), 12),
+            "no_price": round(float(tranche["no_price"]), 12),
+            "unit_gross_cost": round(float(tranche["unit_gross_cost"]), 12),
+        }
+        for tranche in tranches
+    ]
 
 
-def book_pair_fingerprint(market: BinaryMarket, yes_asks: OrderBookSide, no_asks: OrderBookSide) -> str:
+def book_pair_fingerprint(
+    market: BinaryMarket,
+    yes_asks: OrderBookSide,
+    no_asks: OrderBookSide,
+    *,
+    tranches: tuple[dict[str, float], ...] = (),
+) -> str:
     payload = {
         "market_id": market.market_id,
         "condition_id": market.condition_id,
-        "yes": _book_fingerprint_payload(yes_asks),
-        "no": _book_fingerprint_payload(no_asks),
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "tranches": _rounded_tranches(tranches),
     }
+    source_revisions = {
+        side: revision
+        for side, revision in (
+            ("yes", yes_asks.source_revision),
+            ("no", no_asks.source_revision),
+        )
+        if revision not in (None, "")
+    }
+    if source_revisions:
+        payload["source_revisions"] = source_revisions
     encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -327,7 +343,6 @@ def evaluate_binary_paper_execution(
     as_of: datetime | None = None,
 ) -> PaperPortfolioDecision:
     now = _ensure_aware(as_of or _utc_now())
-    fingerprint = book_pair_fingerprint(market, yes_asks, no_asks)
 
     if market.neg_risk:
         return PaperPortfolioDecision.skip("neg_risk_not_supported", market_id=market.market_id)
@@ -362,13 +377,6 @@ def evaluate_binary_paper_execution(
                 max_age_seconds=params.max_book_age_seconds,
             )
 
-    if _known_fingerprint(state, market.market_id) == fingerprint:
-        return PaperPortfolioDecision.skip(
-            "unchanged_book_snapshot",
-            market_id=market.market_id,
-            book_fingerprint=fingerprint,
-        )
-
     cash = _as_float(state.get("cash"), params.starting_capital_usd)
     quantity, yes_cost, no_cost, tranches, stop_reason = _simulate_paired_tranches(
         yes_asks,
@@ -376,6 +384,14 @@ def evaluate_binary_paper_execution(
         cash=cash,
         params=params,
     )
+    fingerprint = book_pair_fingerprint(market, yes_asks, no_asks, tranches=tranches)
+    if _known_fingerprint(state, market.market_id) == fingerprint:
+        return PaperPortfolioDecision.skip(
+            "unchanged_book_snapshot",
+            market_id=market.market_id,
+            book_fingerprint=fingerprint,
+        )
+
     min_quantity = max(_as_float(market.min_order_size), 0.0)
     if quantity <= EPSILON:
         return PaperPortfolioDecision.skip(
@@ -500,15 +516,33 @@ class PaperPortfolio:
     def save(self) -> None:
         if not self.state:
             self.state = initial_portfolio_state(self.params)
-        self.state["total_equity"] = self.state["cash"] + _redeemable_inventory_value(self.state)
-        metadata = self.state.setdefault("metadata", {})
+        self._save_state(self.state)
+
+    def _prepare_state_for_save(self, state: dict[str, Any]) -> None:
+        state["cash"] = _as_float(state.get("cash"), self.params.starting_capital_usd)
+        state["total_equity"] = state["cash"] + _redeemable_inventory_value(state)
+        metadata = state.setdefault("metadata", {})
         if isinstance(metadata, dict):
             metadata["updated_at_utc"] = utc_iso()
+
+    def _save_state(self, state: dict[str, Any]) -> None:
+        if not state:
+            state.update(initial_portfolio_state(self.params))
+        self._prepare_state_for_save(state)
+        self._write_state(state)
+
+    def _write_state(self, state: Mapping[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(jsonable(self.state), f, indent=2, sort_keys=True)
+            json.dump(jsonable(state), f, indent=2, sort_keys=True)
         tmp.replace(self.path)
+
+    def _reload_after_failed_save(self, fallback_state: Mapping[str, Any]) -> None:
+        try:
+            self.state = self._read_state() if self.path.exists() else deepcopy(dict(fallback_state))
+        except PaperPortfolioLoadError:
+            self.state = deepcopy(dict(fallback_state))
 
     def append_event(self, event_type: str, payload: dict[str, Any] | None = None, **fields: Any) -> dict[str, Any]:
         merged = dict(payload or {})
@@ -579,55 +613,109 @@ class PaperPortfolio:
         if not self.state:
             self.load()
         execution_params = params or self.params
+        base_state = deepcopy(self.state)
         decision = evaluate_binary_paper_execution(
             market,
             yes_asks,
             no_asks,
-            state=self.state,
+            state=base_state,
             params=execution_params,
             as_of=as_of,
         )
         if decision.action != "EXECUTE" or decision.execution is None:
             return decision
 
-        self._apply_execution(decision.execution)
-        self.save()
-        self.append_event("paper_portfolio_execution", decision.execution)
-        return decision
+        working_state = deepcopy(base_state)
+        execution = deepcopy(decision.execution)
+        self._apply_execution_to_state(working_state, execution)
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+
+        self.state = working_state
+        returned_execution = deepcopy(execution)
+        details = dict(decision.details)
+        try:
+            self.append_event("paper_portfolio_execution", returned_execution)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            details["event_log_error"] = error
+            returned_execution["event_log_error"] = error
+            LOGGER.warning(
+                "paper_portfolio_execution_event_append_failed execution_id=%s error=%r",
+                returned_execution.get("execution_id"),
+                exc,
+            )
+        return PaperPortfolioDecision(
+            action="EXECUTE",
+            execution=returned_execution,
+            details=details,
+        )
 
     def _apply_execution(self, execution: dict[str, Any]) -> None:
-        cash_before = _as_float(self.state.get("cash"), self.params.starting_capital_usd)
+        self._apply_execution_to_state(self.state, execution)
+
+    def _apply_execution_to_state(self, state: dict[str, Any], execution: dict[str, Any]) -> None:
+        preexisting_redeemed = self._redeem_completed_pairs_from_state(
+            state,
+            market_id=str(execution["market_id"]),
+            yes_token_id=str(execution["yes_token_id"]),
+            no_token_id=str(execution["no_token_id"]),
+        )
+        if preexisting_redeemed > EPSILON:
+            state["cash"] = _as_float(state.get("cash"), self.params.starting_capital_usd) + preexisting_redeemed
+            normalizations = state.setdefault("inventory_normalizations", [])
+            if isinstance(normalizations, list):
+                normalizations.append(
+                    {
+                        "market_id": execution["market_id"],
+                        "yes_token_id": execution["yes_token_id"],
+                        "no_token_id": execution["no_token_id"],
+                        "redeemed_value": preexisting_redeemed,
+                        "normalized_before_execution_id": execution["execution_id"],
+                        "normalized_at_utc": execution["executed_at_utc"],
+                    }
+                )
+
+        cash_before = _as_float(state.get("cash"), self.params.starting_capital_usd)
         capital_used = _as_float(execution.get("capital_used"))
-        self.state["cash"] = cash_before - capital_used
+        state["cash"] = cash_before - capital_used
 
         quantity = _as_float(execution.get("quantity"))
-        self._add_inventory(
+        self._add_inventory_to_state(
+            state,
             token_id=str(execution["yes_token_id"]),
             market_id=str(execution["market_id"]),
             condition_id=execution.get("condition_id"),
             outcome="YES",
             quantity=quantity,
         )
-        self._add_inventory(
+        self._add_inventory_to_state(
+            state,
             token_id=str(execution["no_token_id"]),
             market_id=str(execution["market_id"]),
             condition_id=execution.get("condition_id"),
             outcome="NO",
             quantity=quantity,
         )
-        redeemed = self._redeem_completed_pairs(
+        redeemed = self._redeem_completed_pairs_from_state(
+            state,
             market_id=str(execution["market_id"]),
             yes_token_id=str(execution["yes_token_id"]),
             no_token_id=str(execution["no_token_id"]),
         )
-        self.state["cash"] += redeemed
-        cash_after = _as_float(self.state.get("cash"))
+        state["cash"] += redeemed
+        cash_after = _as_float(state.get("cash"))
 
         execution["cash_before"] = cash_before
         execution["cash_after"] = cash_after
+        if preexisting_redeemed > EPSILON:
+            execution["preexisting_redeemed_value"] = preexisting_redeemed
         execution["quantity_redeemed"] = redeemed
         execution["net_profit"] = cash_after - cash_before
-        costs = self.state.setdefault("costs", {})
+        costs = state.setdefault("costs", {})
         if isinstance(costs, dict):
             costs["fees_usd"] = _as_float(costs.get("fees_usd")) + _as_float(execution.get("estimated_fees"))
             costs["slippage_usd"] = _as_float(costs.get("slippage_usd")) + _as_float(
@@ -635,21 +723,19 @@ class PaperPortfolio:
             )
             costs["tax_usd"] = _as_float(costs.get("tax_usd")) + _as_float(execution.get("tax_cost"))
             costs["merge_usd"] = _as_float(costs.get("merge_usd")) + _as_float(execution.get("merge_cost"))
-        self.state["realized_pnl"] = _as_float(self.state.get("realized_pnl")) + _as_float(
-            execution.get("net_profit")
-        )
-        executions = self.state.setdefault("executions", [])
+        state["realized_pnl"] = _as_float(state.get("realized_pnl")) + _as_float(execution.get("net_profit"))
+        executions = state.setdefault("executions", [])
         if isinstance(executions, list):
             executions.append(execution)
-        fingerprints = self.state.setdefault("book_fingerprints", {})
+        fingerprints = state.setdefault("book_fingerprints", {})
         if isinstance(fingerprints, dict):
             fingerprints[str(execution["market_id"])] = {
                 "fingerprint": execution["book_fingerprint"],
                 "execution_id": execution["execution_id"],
                 "executed_at_utc": execution["executed_at_utc"],
             }
-        self.state["last_execution_at_utc"] = execution["executed_at_utc"]
-        self.state["total_equity"] = self.state["cash"] + _redeemable_inventory_value(self.state)
+        state["last_execution_at_utc"] = execution["executed_at_utc"]
+        state["total_equity"] = state["cash"] + _redeemable_inventory_value(state)
 
     def _add_inventory(
         self,
@@ -660,10 +746,29 @@ class PaperPortfolio:
         outcome: str,
         quantity: float,
     ) -> None:
-        inventory = self.state.setdefault("inventory", {})
+        self._add_inventory_to_state(
+            self.state,
+            token_id=token_id,
+            market_id=market_id,
+            condition_id=condition_id,
+            outcome=outcome,
+            quantity=quantity,
+        )
+
+    @staticmethod
+    def _add_inventory_to_state(
+        state: dict[str, Any],
+        *,
+        token_id: str,
+        market_id: str,
+        condition_id: str | None,
+        outcome: str,
+        quantity: float,
+    ) -> None:
+        inventory = state.setdefault("inventory", {})
         if not isinstance(inventory, dict):
             inventory = {}
-            self.state["inventory"] = inventory
+            state["inventory"] = inventory
         row = dict(inventory.get(token_id) or {})
         row.update(
             {
@@ -677,7 +782,22 @@ class PaperPortfolio:
         inventory[token_id] = row
 
     def _redeem_completed_pairs(self, *, market_id: str, yes_token_id: str, no_token_id: str) -> float:
-        inventory = self.state.get("inventory")
+        return self._redeem_completed_pairs_from_state(
+            self.state,
+            market_id=market_id,
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
+        )
+
+    @staticmethod
+    def _redeem_completed_pairs_from_state(
+        state: dict[str, Any],
+        *,
+        market_id: str,
+        yes_token_id: str,
+        no_token_id: str,
+    ) -> float:
+        inventory = state.get("inventory")
         if not isinstance(inventory, dict):
             return 0.0
         yes_row = inventory.get(yes_token_id)

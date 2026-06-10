@@ -34,3 +34,38 @@ def test_normalized_bids_sort_descending_and_crossed_book_is_detected():
 
     assert [level.price for level in bids.levels] == [0.52, 0.50]
     assert is_crossed_book(book) is True
+
+
+def test_order_book_side_captures_exchange_source_revision():
+    asks = asks_from_book(
+        {
+            "timestamp": "1717800000000",
+            "asks": [{"price": "0.41", "size": "5"}],
+        },
+        token_id="yes-token",
+    )
+
+    assert asks.source_revision == "timestamp:1717800000000"
+
+
+def test_explicit_empty_level_list_does_not_fall_back_to_alias():
+    asks = asks_from_book(
+        {
+            "asks": [],
+            "sell": [{"price": "0.41", "size": "5"}],
+        },
+        token_id="yes-token",
+    )
+
+    assert asks.levels == ()
+
+
+def test_explicit_zero_size_does_not_fall_back_to_quantity_alias():
+    asks = asks_from_book(
+        {
+            "asks": [{"price": "0.41", "size": 0, "quantity": "5"}],
+        },
+        token_id="yes-token",
+    )
+
+    assert asks.levels == ()

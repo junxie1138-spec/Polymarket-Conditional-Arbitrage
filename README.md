@@ -44,11 +44,24 @@ Reset the local simulated portfolio:
 uv run poly-cond-arb reset --yes
 ```
 
+## Runtime Behavior
+
+The runner is paper-only. It never places orders, uses API credentials, reads wallet secrets, signs transactions, or calls merge/redeem contracts.
+
+REST polling retries market-universe and order-book fetches with capped exponential backoff before portfolio evaluation starts. Once paper execution begins, the cycle is not retried as a unit, so a post-execution logging or completion failure cannot replay the same trade. In WebSocket mode, startup market-universe fetches, REST book seeding, market refreshes, and WebSocket manager startup use the same finite recovery policy. Each retry is logged with the operation, attempt, error, and backoff seconds; after recovery, the successful fetch or bootstrap summary is logged.
+
+`data/paper_portfolio_instance.json` is the source of truth for restart and resume. Paper executions are applied to a cloned state, written atomically through a temporary file, and only then swapped into memory. If the state write fails, the in-memory portfolio rolls back to the last persisted state. The append-only event log is useful for audit history, but a failed execution event append is reported without undoing or retrying the already persisted paper trade. `status` and restart recovery read the current state file, and leftover `paper_portfolio_instance.json.tmp` files are ignored on load.
+
+The WebSocket cache evaluates price-change deltas only after a current snapshot exists for that token. Disconnect/stale marking clears snapshot readiness; REST bootstrap and reconciliation reseed the cache before dirty WebSocket updates are trusted again.
+
+`run` and `reset --yes` acquire `paper_portfolio_instance.json.lock` in the data directory. A second runner or reset fails fast while that lock is active. If a lock belongs to a dead process on the same host, the runner removes it and continues; locks from another host or locks with unverifiable metadata are left in place and cause a clear failure. `status` does not take the lock and does not mutate state.
+
 ## Outputs
 
 - `logs/conditional_arb_scan.log`: human-readable portfolio runner log.
 - `data/paper_portfolio_instance.json`: current cash, equity, realized PnL, costs, executions, inventory, book fingerprints, and metadata.
 - `data/paper_portfolio_events.jsonl`: append-only portfolio lifecycle, cycle, and execution events.
+- `data/paper_portfolio_instance.json.lock`: local process lock for `run` and `reset --yes`.
 
 ## Environment Variables
 
