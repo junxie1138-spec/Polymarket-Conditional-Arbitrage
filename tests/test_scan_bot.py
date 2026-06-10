@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 from polymarket_conditional_arb import config
 from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
+from polymarket_conditional_arb.market_universe_cache import write_market_universe_cache
 from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams
 from polymarket_conditional_arb.portfolio_lock import PortfolioDataLock, PortfolioLockError
@@ -123,6 +125,62 @@ class TwoMarketClient:
         return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
 
 
+class RecordingDiscoveryClient:
+    def __init__(
+        self,
+        *,
+        startup_rows=None,
+        full_rows=None,
+        fail_on_discovery: bool = False,
+    ):
+        self.startup_rows = list(startup_rows or [])
+        self.full_rows = list(full_rows or self.startup_rows)
+        self.fail_on_discovery = fail_on_discovery
+        self.slice_calls = []
+        self.full_calls = 0
+        self.fetch_ask_books_calls = 0
+
+    def fetch_active_events_slice(self, *, limit, order=None, ascending=None, on_page=None, should_continue=None):
+        if self.fail_on_discovery:
+            raise AssertionError("live discovery should not be called")
+        self.slice_calls.append({"limit": limit, "order": order, "ascending": ascending})
+        if on_page is not None:
+            on_page(0, 1, 1)
+        if should_continue is not None:
+            should_continue()
+        return [{"id": "startup-event", "title": "Startup", "markets": self.startup_rows}]
+
+    def fetch_active_events(self, *, on_page=None, should_continue=None):
+        if self.fail_on_discovery:
+            raise AssertionError("live discovery should not be called")
+        self.full_calls += 1
+        if on_page is not None:
+            on_page(0, 1, 1)
+        if should_continue is not None:
+            should_continue()
+        return [{"id": "full-event", "title": "Full", "markets": self.full_rows}]
+
+    @staticmethod
+    def flatten_event_markets(events):
+        return GammaClobClient.flatten_event_markets(events)
+
+    @staticmethod
+    def tradable_binary_markets(markets):
+        return GammaClobClient.tradable_binary_markets(markets)
+
+    def fetch_ask_books(self, token_ids):
+        self.fetch_ask_books_calls += 1
+        return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
+
+
+class RecordingManager:
+    def __init__(self):
+        self.updated_token_ids = []
+
+    async def update_tokens(self, token_ids):
+        self.updated_token_ids.append(list(token_ids))
+
+
 class FlakyEventClient(FakeClient):
     def __init__(self, *, failures: int):
         self.failures = failures
@@ -171,8 +229,8 @@ def scan_config(tmp_path: Path):
     )
 
 
-def scanner_for(tmp_path: Path, client):
-    cfg = scan_config(tmp_path)
+def scanner_for(tmp_path: Path, client, cfg=None):
+    cfg = cfg or scan_config(tmp_path)
     params = PaperPortfolioParams.from_config(cfg)
     scanner = ConditionalArbScanner(
         scan_config=cfg,
@@ -206,6 +264,11 @@ def profitable_books(token_ids, *, updated_at):
             updated_at=updated_at,
         )
     return books
+
+
+def tradable_markets_for_rows(rows):
+    raw_markets = GammaClobClient.flatten_event_markets([{"id": "cached-event", "markets": rows}])
+    return GammaClobClient.tradable_binary_markets(raw_markets)
 
 
 def test_market_universe_fetch_logs_startup_progress(tmp_path, caplog):
@@ -250,6 +313,171 @@ def test_market_universe_fetch_stops_between_event_pages(tmp_path):
 
     with pytest.raises(ScannerStopped, match="scanner stopped"):
         scanner._fetch_market_universe()
+
+
+def test_cold_fast_start_fetches_only_startup_slice_before_first_evaluation(tmp_path):
+    cfg = replace(
+        scan_config(tmp_path),
+        fast_start_enabled=True,
+        fast_start_event_limit=20,
+        fast_start_token_limit=2,
+    )
+    client = RecordingDiscoveryClient(
+        startup_rows=[
+            TwoMarketClient._market_row("m1", "yes-1", "no-1"),
+            TwoMarketClient._market_row("m2", "yes-2", "no-2"),
+        ],
+        full_rows=[TwoMarketClient._market_row("m3", "yes-3", "no-3")],
+    )
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    universe = scanner._fetch_startup_market_universe()
+    result = scanner._evaluate_universe(
+        universe,
+        client.fetch_ask_books(universe.token_ids),
+        dirty_token_ids=None,
+        evaluation_reason="ws_bootstrap",
+        params=scanner.params,
+    )
+
+    assert client.slice_calls == [{"limit": 20, "order": "volume24hr", "ascending": False}]
+    assert client.full_calls == 0
+    assert [market.market_id for market in universe.markets] == ["m1"]
+    assert universe.token_ids == ["yes-1", "no-1"]
+    assert result["summary"]["evaluated_standard_binary_markets"] == 1
+
+
+def test_warm_fast_start_uses_fresh_cache_without_gamma_discovery(tmp_path):
+    cfg = replace(
+        scan_config(tmp_path),
+        fast_start_enabled=True,
+        fast_start_token_limit=2,
+    )
+    cached_markets = tradable_markets_for_rows(
+        [
+            TwoMarketClient._market_row("m1", "yes-1", "no-1"),
+            TwoMarketClient._market_row("m2", "yes-2", "no-2"),
+        ]
+    )
+    write_market_universe_cache(
+        cfg.market_universe_cache_path,
+        markets=cached_markets,
+        events_fetched=2,
+        raw_markets=2,
+        gamma_query={"closed": "false", "discovery": "full_active_events"},
+        fetched_at=datetime.now(timezone.utc),
+    )
+    client = RecordingDiscoveryClient(fail_on_discovery=True)
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    universe = scanner._fetch_startup_market_universe()
+
+    assert client.slice_calls == []
+    assert client.full_calls == 0
+    assert [market.market_id for market in universe.markets] == ["m1"]
+    assert universe.events_fetched == 2
+    assert universe.raw_markets == 2
+
+
+def test_corrupt_fast_start_cache_falls_back_to_live_slice(tmp_path, caplog):
+    cfg = replace(scan_config(tmp_path), fast_start_enabled=True)
+    cfg.market_universe_cache_path.parent.mkdir(parents=True)
+    cfg.market_universe_cache_path.write_text("{not-json", encoding="utf-8")
+    client = RecordingDiscoveryClient(
+        startup_rows=[TwoMarketClient._market_row("m1", "yes-1", "no-1")],
+    )
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    with caplog.at_level(logging.WARNING, logger="test_scanner"):
+        universe = scanner._fetch_startup_market_universe()
+
+    assert [market.market_id for market in universe.markets] == ["m1"]
+    assert len(client.slice_calls) == 1
+    assert "market_universe_cache_ignored reason=invalid" in caplog.text
+
+
+def test_background_backfill_adds_tokens_updates_ws_and_writes_cache(tmp_path):
+    cfg = replace(scan_config(tmp_path), fast_start_enabled=True, fast_start_token_limit=2)
+    client = RecordingDiscoveryClient(
+        startup_rows=[TwoMarketClient._market_row("m1", "yes-1", "no-1")],
+        full_rows=[
+            TwoMarketClient._market_row("m1", "yes-1", "no-1"),
+            TwoMarketClient._market_row("m2", "yes-2", "no-2"),
+        ],
+    )
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+    old_universe = scanner._fetch_startup_market_universe()
+    cache = MarketDataCache()
+    cache.seed_ask_books(profitable_books(old_universe.token_ids, updated_at=datetime.now(timezone.utc)))
+    manager = RecordingManager()
+    dirty_queue: asyncio.Queue[set[str]] = asyncio.Queue()
+
+    new_universe = asyncio.run(
+        scanner._refresh_market_universe(
+            old_universe,
+            cache,
+            manager,
+            dirty_queue,
+            reason="fast_start_backfill",
+        )
+    )
+
+    assert client.full_calls == 1
+    assert [market.market_id for market in new_universe.markets] == ["m1", "m2"]
+    assert manager.updated_token_ids[-1] == ["yes-1", "no-1", "yes-2", "no-2"]
+    assert dirty_queue.get_nowait() == {"yes-2", "no-2"}
+    assert cache.book_side("yes-2", "ask") is not None
+    assert cfg.market_universe_cache_path.exists()
+
+
+def test_dirty_token_evaluation_runs_while_slow_full_refresh_is_in_progress(tmp_path):
+    cfg = replace(scan_config(tmp_path), fast_start_enabled=True, fast_start_token_limit=2)
+    client = RecordingDiscoveryClient(
+        startup_rows=[TwoMarketClient._market_row("m1", "yes-1", "no-1")],
+        full_rows=[
+            TwoMarketClient._market_row("m1", "yes-1", "no-1"),
+            TwoMarketClient._market_row("m2", "yes-2", "no-2"),
+        ],
+    )
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+    old_universe = scanner._fetch_startup_market_universe()
+    cache = MarketDataCache()
+    cache.seed_ask_books(profitable_books(old_universe.token_ids, updated_at=datetime.now(timezone.utc)))
+    manager = RecordingManager()
+    dirty_queue: asyncio.Queue[set[str]] = asyncio.Queue()
+
+    async def run_refresh_and_dirty_evaluation():
+        async def slow_full_refresh():
+            await asyncio.sleep(0.05)
+            return scanner._fetch_market_universe()
+
+        scanner._fetch_market_universe_with_retry = slow_full_refresh
+        refresh_task = asyncio.create_task(
+            scanner._refresh_market_universe(
+                old_universe,
+                cache,
+                manager,
+                dirty_queue,
+                reason="periodic_market_refresh",
+            )
+        )
+        await asyncio.sleep(0)
+        assert not refresh_task.done()
+        result = scanner._evaluate_from_cache(
+            old_universe,
+            cache,
+            dirty_token_ids={"yes-1"},
+            evaluation_reason="ws_dirty_update",
+            params=scanner.params,
+        )
+        refreshed_universe = await refresh_task
+        return result, refreshed_universe
+
+    result, refreshed_universe = asyncio.run(run_refresh_and_dirty_evaluation())
+
+    assert result["summary"]["evaluated_standard_binary_markets"] == 1
+    assert result["executions"][0]["market_id"] == "m1"
+    assert [market.market_id for market in refreshed_universe.markets] == ["m1", "m2"]
 
 
 def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):

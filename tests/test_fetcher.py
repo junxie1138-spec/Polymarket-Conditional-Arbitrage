@@ -70,6 +70,24 @@ def test_fetch_active_events_can_stop_between_pages():
     assert len(session.get_calls) == 1
 
 
+def test_fetch_active_events_slice_orders_by_volume_and_does_not_paginate():
+    events = [{"id": f"e{i}", "markets": []} for i in range(20)]
+    session = Session(get_responses=[Response(events)])
+    client = GammaClobClient(session=session, clob_host="https://clob.example")
+
+    fetched = client.fetch_active_events_slice(limit=20, order="volume24hr", ascending=False)
+
+    assert fetched == events
+    assert len(session.get_calls) == 1
+    _, kwargs = session.get_calls[0]
+    assert kwargs["params"] == {
+        "closed": "false",
+        "limit": 20,
+        "order": "volume24hr",
+        "ascending": "false",
+    }
+
+
 def test_flatten_event_markets_keeps_all_tags_and_attaches_event_context():
     events = [
         {

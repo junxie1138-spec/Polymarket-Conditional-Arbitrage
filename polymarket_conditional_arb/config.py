@@ -34,6 +34,10 @@ DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION = 500
 DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_REST_RECONCILE_INTERVAL_SECONDS = 60
 DEFAULT_WS_STALE_SECONDS = 5.0
+DEFAULT_FAST_START_ENABLED = True
+DEFAULT_FAST_START_EVENT_LIMIT = 20
+DEFAULT_FAST_START_TOKEN_LIMIT = 500
+DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS = 3600
 
 
 def _decode_dotenv_value(value: str) -> str:
@@ -229,8 +233,28 @@ def ws_stale_seconds() -> float:
     return max(0.1, env_float("COND_ARB_WS_STALE_SECONDS", DEFAULT_WS_STALE_SECONDS))
 
 
+def fast_start_enabled() -> bool:
+    return env_bool("COND_ARB_FAST_START_ENABLED", DEFAULT_FAST_START_ENABLED)
+
+
+def fast_start_event_limit() -> int:
+    return max(1, env_int("COND_ARB_FAST_START_EVENT_LIMIT", DEFAULT_FAST_START_EVENT_LIMIT))
+
+
+def fast_start_token_limit() -> int:
+    return max(2, env_int("COND_ARB_FAST_START_TOKEN_LIMIT", DEFAULT_FAST_START_TOKEN_LIMIT))
+
+
+def universe_cache_max_age_seconds() -> int:
+    return max(0, env_int("COND_ARB_UNIVERSE_CACHE_MAX_AGE_SECONDS", DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS))
+
+
 def event_log_path(base_data_dir: Path | None = None) -> Path:
     return (base_data_dir or data_dir()) / "conditional_arb_events.jsonl"
+
+
+def market_universe_cache_path(base_data_dir: Path | None = None) -> Path:
+    return (base_data_dir or data_dir()) / "market_universe_cache.json"
 
 
 def paper_portfolio_instance_path(base_data_dir: Path | None = None) -> Path:
@@ -271,10 +295,18 @@ class ScanConfig:
     market_refresh_interval_seconds: int = DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS
     rest_reconcile_interval_seconds: int = DEFAULT_REST_RECONCILE_INTERVAL_SECONDS
     ws_stale_seconds: float = DEFAULT_WS_STALE_SECONDS
+    fast_start_enabled: bool = DEFAULT_FAST_START_ENABLED
+    fast_start_event_limit: int = DEFAULT_FAST_START_EVENT_LIMIT
+    fast_start_token_limit: int = DEFAULT_FAST_START_TOKEN_LIMIT
+    universe_cache_max_age_seconds: int = DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS
 
     @property
     def event_log_path(self) -> Path:
         return event_log_path(self.data_dir)
+
+    @property
+    def market_universe_cache_path(self) -> Path:
+        return market_universe_cache_path(self.data_dir)
 
     @property
     def paper_portfolio_instance_path(self) -> Path:
@@ -315,4 +347,8 @@ def load_scan_config() -> ScanConfig:
         market_refresh_interval_seconds=market_refresh_interval_seconds(),
         rest_reconcile_interval_seconds=rest_reconcile_interval_seconds(),
         ws_stale_seconds=ws_stale_seconds(),
+        fast_start_enabled=fast_start_enabled(),
+        fast_start_event_limit=fast_start_event_limit(),
+        fast_start_token_limit=fast_start_token_limit(),
+        universe_cache_max_age_seconds=universe_cache_max_age_seconds(),
     )

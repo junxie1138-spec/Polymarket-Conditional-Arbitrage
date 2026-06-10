@@ -67,6 +67,35 @@ class GammaClobClient:
             offset += limit
         return events
 
+    def fetch_active_events_slice(
+        self,
+        *,
+        limit: int,
+        order: str | None = None,
+        ascending: bool | None = None,
+        on_page: Callable[[int, int, int], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        page_limit = max(1, int(limit))
+        params: dict[str, Any] = {"closed": "false", "limit": page_limit}
+        if order:
+            params["order"] = order
+        if ascending is not None:
+            params["ascending"] = "true" if ascending else "false"
+        batch = network.get_json_with_retries(
+            self.session,
+            self.gamma_events_url,
+            params=params,
+            timeout=30,
+        )
+        if not isinstance(batch, list):
+            raise ValueError(f"unexpected Gamma events response: {type(batch).__name__}")
+        if on_page is not None:
+            on_page(0, len(batch), len(batch))
+        if should_continue is not None and not should_continue():
+            raise InterruptedError("active event fetch stopped")
+        return batch
+
     @staticmethod
     def flatten_event_markets(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         markets: list[dict[str, Any]] = []

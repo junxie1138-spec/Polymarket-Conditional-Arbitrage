@@ -50,7 +50,9 @@ The runner is paper-only. It never places orders, uses API credentials, reads wa
 
 REST polling retries market-universe and order-book fetches with capped exponential backoff before portfolio evaluation starts. Once paper execution begins, the cycle is not retried as a unit, so a post-execution logging or completion failure cannot replay the same trade. In WebSocket mode, startup market-universe fetches, REST book seeding, market refreshes, and WebSocket manager startup use the same finite recovery policy. Each retry is logged with the operation, attempt, error, and backoff seconds; after recovery, the successful fetch or bootstrap summary is logged.
 
-Startup fetches the active Gamma event universe before the first evaluation cycle. The console and `logs/conditional_arb_scan.log` report `market_universe_fetch_start`, each `market_events_page_fetched`, and `market_universe_fetch_complete` so a large initial fetch shows progress instead of appearing stuck. Ctrl+C stops after the current request/page boundary.
+Fast start is enabled by default. On startup, the WebSocket runner first uses a fresh `data/market_universe_cache.json` when available; otherwise it fetches a small Gamma slice ordered by 24h volume, seeds those CLOB books, starts WebSocket subscriptions, and runs the first paper evaluation. Full all-tradable discovery then runs in the background, writes a refreshed cache, seeds newly added token books, updates WebSocket subscriptions, and evaluates the added tokens without blocking dirty-token evaluation.
+
+The console and `logs/conditional_arb_scan.log` report `market_universe_fast_start_fetch_start`, each `market_events_page_fetched`, `market_universe_fast_start_fetch_complete`, background `market_universe_refresh_scheduled`, and full `market_universe_fetch_complete` / `market_universe_refreshed` progress. Ctrl+C stops after the current request/page boundary.
 
 `data/paper_portfolio_instance.json` is the source of truth for restart and resume. Paper executions are applied to a cloned state, written atomically through a temporary file, and only then swapped into memory. If the state write fails, the in-memory portfolio rolls back to the last persisted state. The append-only event log is useful for audit history, but a failed execution event append is reported without undoing or retrying the already persisted paper trade. `status` and restart recovery read the current state file, and leftover `paper_portfolio_instance.json.tmp` files are ignored on load.
 
@@ -64,6 +66,7 @@ The WebSocket cache evaluates price-change deltas only after a current snapshot 
 - `data/paper_portfolio_instance.json`: current cash, equity, realized PnL, costs, executions, inventory, book fingerprints, and metadata.
 - `data/paper_portfolio_events.jsonl`: append-only portfolio lifecycle, cycle, and execution events.
 - `data/paper_portfolio_instance.json.lock`: local process lock for `run` and `reset --yes`.
+- `data/market_universe_cache.json`: warm-start cache of public tradable market metadata, kept in priority order.
 
 ## Environment Variables
 
@@ -87,6 +90,10 @@ The WebSocket cache evaluates price-change deltas only after a current snapshot 
 - `COND_ARB_MARKET_REFRESH_INTERVAL_SECONDS`
 - `COND_ARB_REST_RECONCILE_INTERVAL_SECONDS`
 - `COND_ARB_WS_STALE_SECONDS`
+- `COND_ARB_FAST_START_ENABLED`
+- `COND_ARB_FAST_START_EVENT_LIMIT`
+- `COND_ARB_FAST_START_TOKEN_LIMIT`
+- `COND_ARB_UNIVERSE_CACHE_MAX_AGE_SECONDS`
 - `POLYMARKET_CLOB_HOST`
 
-`COND_ARB_MARKET_LIMIT=0` means no local validation cap. The WebSocket path is enabled by default; REST `/books` remains in use for startup seeding and periodic reconciliation.
+`COND_ARB_MARKET_LIMIT=0` means no local validation cap. `COND_ARB_FAST_START_TOKEN_LIMIT=500` keeps the default startup seed to one CLOB `/books` batch. The WebSocket path is enabled by default; REST `/books` remains in use for startup seeding, added-token backfill, and periodic reconciliation.
