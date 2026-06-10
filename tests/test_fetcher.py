@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from polymarket_conditional_arb.fetcher import GammaClobClient
 
 
@@ -41,6 +43,31 @@ def test_fetch_active_events_uses_closed_false_and_no_tag_filter():
     _, kwargs = session.get_calls[0]
     assert kwargs["params"]["closed"] == "false"
     assert "tag_slug" not in kwargs["params"]
+
+
+def test_fetch_active_events_reports_page_progress():
+    first_page = [{"id": f"e{i}", "markets": []} for i in range(100)]
+    second_page = [{"id": "final", "markets": []}]
+    session = Session(get_responses=[Response(first_page), Response(second_page)])
+    client = GammaClobClient(session=session, clob_host="https://clob.example")
+    pages = []
+
+    events = client.fetch_active_events(on_page=lambda offset, rows, total: pages.append((offset, rows, total)))
+
+    assert len(events) == 101
+    assert pages == [(0, 100, 100), (100, 1, 101)]
+
+
+def test_fetch_active_events_can_stop_between_pages():
+    first_page = [{"id": f"e{i}", "markets": []} for i in range(100)]
+    second_page = [{"id": "unused", "markets": []}]
+    session = Session(get_responses=[Response(first_page), Response(second_page)])
+    client = GammaClobClient(session=session, clob_host="https://clob.example")
+
+    with pytest.raises(InterruptedError, match="active event fetch stopped"):
+        client.fetch_active_events(should_continue=lambda: False)
+
+    assert len(session.get_calls) == 1
 
 
 def test_flatten_event_markets_keeps_all_tags_and_attaches_event_context():

@@ -21,6 +21,7 @@ from polymarket_conditional_arb.portfolio_lock import PortfolioDataLock, Portfol
 from polymarket_conditional_arb.scan_bot import (
     ConditionalArbScanner,
     ScannerRetryPolicy,
+    ScannerStopped,
     _config_from_args,
     build_parser,
     main,
@@ -28,7 +29,11 @@ from polymarket_conditional_arb.scan_bot import (
 
 
 class FakeClient:
-    def fetch_active_events(self):
+    def fetch_active_events(self, *, on_page=None, should_continue=None):
+        if on_page is not None:
+            on_page(0, 1, 1)
+        if should_continue is not None:
+            should_continue()
         return [
             {
                 "id": "e1",
@@ -75,7 +80,11 @@ class TwoMarketClient:
     def __init__(self):
         self.fetch_ask_books_calls = 0
 
-    def fetch_active_events(self):
+    def fetch_active_events(self, *, on_page=None, should_continue=None):
+        if on_page is not None:
+            on_page(0, 1, 1)
+        if should_continue is not None:
+            should_continue()
         return [
             {
                 "id": "e1",
@@ -119,12 +128,12 @@ class FlakyEventClient(FakeClient):
         self.failures = failures
         self.fetch_active_events_calls = 0
 
-    def fetch_active_events(self):
+    def fetch_active_events(self, **kwargs):
         self.fetch_active_events_calls += 1
         if self.failures > 0:
             self.failures -= 1
             raise RuntimeError("events unavailable")
-        return super().fetch_active_events()
+        return super().fetch_active_events(**kwargs)
 
 
 class FlakyBookClient(TwoMarketClient):
@@ -197,6 +206,50 @@ def profitable_books(token_ids, *, updated_at):
             updated_at=updated_at,
         )
     return books
+
+
+def test_market_universe_fetch_logs_startup_progress(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=FakeClient(),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=logging.getLogger("test_market_universe_progress"),
+        params=params,
+    )
+
+    with caplog.at_level(logging.INFO, logger="test_market_universe_progress"):
+        universe = scanner._fetch_market_universe()
+
+    assert len(universe.markets) == 1
+    assert "market_universe_fetch_start market_limit=None" in caplog.text
+    assert "market_events_page_fetched offset=0 rows=1 total_events=1" in caplog.text
+    assert "market_universe_fetch_complete events=1 raw_markets=1 tradable_markets=1 tokens=2" in caplog.text
+
+
+def test_market_universe_fetch_stops_between_event_pages(tmp_path):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=FakeClient(),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=null_logger(),
+        params=params,
+    )
+    scanner.running = False
+
+    with pytest.raises(ScannerStopped, match="scanner stopped"):
+        scanner._fetch_market_universe()
 
 
 def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):

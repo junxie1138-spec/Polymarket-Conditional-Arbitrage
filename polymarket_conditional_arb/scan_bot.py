@@ -22,6 +22,10 @@ from .portfolio_lock import PortfolioDataLock, PortfolioLockError
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
 
 
+class ScannerStopped(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ScannerRetryPolicy:
     initial_backoff_seconds: float = 1.0
@@ -144,6 +148,11 @@ class ConditionalArbScanner:
                 return
             await asyncio.sleep(min(remaining, 0.25))
 
+    def _ensure_running(self) -> bool:
+        if not self.running:
+            raise ScannerStopped("scanner stopped")
+        return True
+
     def _run_with_retries(
         self,
         operation: str,
@@ -261,6 +270,8 @@ class ConditionalArbScanner:
                 asyncio.run(self._run_market_ws_forever())
             else:
                 self._run_rest_forever()
+        except ScannerStopped:
+            self.logger.info("scanner_stopped")
         finally:
             self.portfolio.save()
 
@@ -268,6 +279,8 @@ class ConditionalArbScanner:
         while self.running:
             try:
                 self.run_one_cycle()
+            except ScannerStopped:
+                break
             except Exception as exc:
                 self.logger.warning("rest_cycle_failed_after_retries error=%r", exc)
             if self.running:
@@ -473,15 +486,34 @@ class ConditionalArbScanner:
         )
 
     def _fetch_market_universe(self) -> MarketUniverse:
-        events = self.client.fetch_active_events()
+        self.logger.info("market_universe_fetch_start market_limit=%s", self.config.market_limit)
+        events = self.client.fetch_active_events(
+            on_page=self._log_market_event_page,
+            should_continue=self._ensure_running,
+        )
         raw_markets = self.client.flatten_event_markets(events)
         tradable_markets = self.client.tradable_binary_markets(raw_markets)
         if self.config.market_limit is not None:
             tradable_markets = tradable_markets[: self.config.market_limit]
+        self.logger.info(
+            "market_universe_fetch_complete events=%s raw_markets=%s tradable_markets=%s tokens=%s",
+            len(events),
+            len(raw_markets),
+            len(tradable_markets),
+            len(_token_ids_for_markets(tradable_markets)),
+        )
         return _build_market_universe(
             events_fetched=len(events),
             raw_markets=len(raw_markets),
             markets=tradable_markets,
+        )
+
+    def _log_market_event_page(self, offset: int, rows: int, total_events: int) -> None:
+        self.logger.info(
+            "market_events_page_fetched offset=%s rows=%s total_events=%s",
+            offset,
+            rows,
+            total_events,
         )
 
     async def _fetch_market_universe_with_retry(self) -> MarketUniverse:

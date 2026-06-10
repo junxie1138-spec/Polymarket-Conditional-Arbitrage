@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
 from . import config, network
 from .arb_models import BinaryMarket, as_bool
@@ -35,7 +36,12 @@ class GammaClobClient:
         self.gamma_events_url = gamma_events_url
         self.batch_book_limit = max(1, min(config.CLOB_BATCH_BOOK_LIMIT, batch_book_limit))
 
-    def fetch_active_events(self) -> list[dict[str, Any]]:
+    def fetch_active_events(
+        self,
+        *,
+        on_page: Callable[[int, int, int], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         offset = 0
         limit = 100
@@ -48,9 +54,14 @@ class GammaClobClient:
             )
             if not isinstance(batch, list):
                 raise ValueError(f"unexpected Gamma events response: {type(batch).__name__}")
+            next_total = len(events) + len(batch)
+            if on_page is not None:
+                on_page(offset, len(batch), next_total)
             if not batch:
                 break
             events.extend(batch)
+            if should_continue is not None and not should_continue():
+                raise InterruptedError("active event fetch stopped")
             if len(batch) < limit:
                 break
             offset += limit
