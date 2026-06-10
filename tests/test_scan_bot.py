@@ -618,6 +618,7 @@ def test_runtime_status_records_warmup_progress_before_startup_evaluation(tmp_pa
     assert [market.market_id for market in universe.markets] == ["m1", "m2"]
     assert client.fetch_ask_books_calls == 0
     assert runtime["phase"] == "warmup"
+    assert runtime["status"] == "WARMUP"
     assert runtime["events_fetched"] == 1
     assert runtime["raw_markets"] == 2
     assert runtime["tradable_markets"] == 2
@@ -641,6 +642,7 @@ def test_runtime_status_records_online_after_startup_evaluation(tmp_path):
     assert result["summary"]["executions"] == 2
     assert client.fetch_ask_books_calls == 1
     assert runtime["phase"] == "online"
+    assert runtime["status"] == "ONLINE"
     assert runtime["detail"] == "online"
     assert runtime["last_evaluation_reason"] == "rest_bootstrap"
     assert runtime["last_cycle_completed_at_utc"] is not None
@@ -707,11 +709,64 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     warmup = format_status_dashboard(runtime={**runtime, "phase": "warmup"}, portfolio=portfolio_status, now=now)
     dead = format_status_dashboard(runtime=None, portfolio=portfolio_status, now=now)
 
-    assert "Paper Portfolio Status [ONLINE]" in online
+    assert online.splitlines()[:2] == ["Paper Portfolio Status", "Current: ONLINE"]
     assert "Last refreshed: 2026-06-10T12:00:00Z" in online
     assert "Last cycle: reason=ws_bootstrap; completed=2026-06-10T12:00:00Z; evaluated=2; executions=1; skips=1" in online
-    assert "Paper Portfolio Status [WARMUP]" in warmup
-    assert "Paper Portfolio Status [DEAD]" in dead
+    assert warmup.splitlines()[:2] == ["Paper Portfolio Status", "Current: WARMUP"]
+    assert dead.splitlines()[:2] == ["Paper Portfolio Status", "Current: DEAD"]
+
+
+def test_status_dashboard_uses_one_live_status_value_and_hides_history_by_default():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+    base_runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "online",
+    }
+    polls = [
+        {**base_runtime, "statusEntries": ["warming cache"]},
+        {**base_runtime, "statusEntries": ["warming cache", "online"]},
+        {**base_runtime, "statusEntries": ["warming cache", "online", "reconciling"]},
+    ]
+
+    frames = [
+        format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+        for runtime in polls
+    ]
+
+    assert frames[0].splitlines()[:2] == ["Paper Portfolio Status", "Current: warming cache"]
+    assert frames[-1].splitlines()[:2] == ["Paper Portfolio Status", "Current: reconciling"]
+    assert all(frame.count("Current:") == 1 for frame in frames)
+    assert all("Status Log" not in frame for frame in frames)
+    assert "warming cache" not in frames[-1]
+    assert "ONLINE" not in frames[-1]
+    assert len({len(frame.splitlines()) for frame in frames}) == 1
+
+    with_log = format_status_dashboard(
+        runtime=polls[-1],
+        portfolio=portfolio_status,
+        now=now,
+        show_log=True,
+    )
+
+    assert "Status Log" in with_log
+    assert "- warming cache" in with_log
+    assert "- ONLINE" in with_log
+    assert "- reconciling" in with_log
 
 
 def test_status_watch_loop_can_be_bounded():
@@ -962,7 +1017,7 @@ def test_cli_status_reads_state_without_lock_or_mutation(tmp_path, monkeypatch, 
         lock.release()
     after = state_path.read_text(encoding="utf-8")
 
-    assert "Paper Portfolio Status [DEAD]" in capsys.readouterr().out
+    assert "Current: DEAD" in capsys.readouterr().out
     assert before == after
 
 

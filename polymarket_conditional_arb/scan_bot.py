@@ -1019,6 +1019,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Refresh cadence for watch mode",
     )
+    status_parser.add_argument(
+        "--show-log",
+        action="store_true",
+        help="Show backend status history when the runtime payload includes it",
+    )
     reset_parser = subparsers.add_parser("reset", help="Reset the local paper portfolio state")
     reset_parser.add_argument("--yes", action="store_true", help="Confirm resetting the paper portfolio")
     return parser
@@ -1033,12 +1038,17 @@ def _money(value: float) -> str:
     return f"${value:,.2f}"
 
 
-def _render_status_dashboard(scan_config: config.ScanConfig, portfolio: PaperPortfolio) -> str:
+def _render_status_dashboard(
+    scan_config: config.ScanConfig,
+    portfolio: PaperPortfolio,
+    *,
+    show_log: bool = False,
+) -> str:
     runtime, portfolio_status = read_runtime_and_portfolio_status(
         runtime_path=scan_config.paper_portfolio_runtime_path,
         portfolio_status=portfolio.status,
     )
-    return format_status_dashboard(runtime=runtime, portfolio=portfolio_status)
+    return format_status_dashboard(runtime=runtime, portfolio=portfolio_status, show_log=show_log)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1055,9 +1065,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if command == "status":
         refresh_seconds = max(0.1, float(getattr(args, "refresh_seconds", 2.0)))
+        show_log = bool(getattr(args, "show_log", False))
 
         def render() -> str:
-            return _render_status_dashboard(scan_config, portfolio)
+            return _render_status_dashboard(scan_config, portfolio, show_log=show_log)
 
         try:
             if getattr(args, "once", False):

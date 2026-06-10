@@ -62,6 +62,8 @@ After the runner is `ONLINE`, full-universe refreshes continue in the background
 
 `data/paper_portfolio_runtime.json` is local operational metadata written by `run` without acquiring another lock. It records host, PID, heartbeat, `warmup` / `online` / `stopping` phase, cache progress, last cycle summary, and the latest error. `poly-cond-arb status` watches that file every 2 seconds by default and repaints one terminal dashboard instead of appending repeated snapshots. Each dashboard includes a UTC `Last refreshed` timestamp and renders `ONLINE`, `WARMUP`, or `DEAD`; `--refresh-seconds N` changes the watch cadence and `--once` prints a single read-only snapshot.
 
+The status dashboard keeps the live state as one scalar `Current:` value. Historical backend status entries are hidden by default and are only printed in a separate `Status Log` section when `poly-cond-arb status --show-log` is used.
+
 `data/paper_portfolio_instance.json` is the source of truth for restart and resume. Paper executions are applied to a cloned state, written atomically through a temporary file, and only then swapped into memory. If the state write fails, the in-memory portfolio rolls back to the last persisted state. The append-only event log is useful for audit history, but a failed execution event append is reported without undoing or retrying the already persisted paper trade. `status` and restart recovery read the current state file, and leftover `paper_portfolio_instance.json.tmp` files are ignored on load.
 
 The WebSocket cache evaluates price-change deltas only after a current snapshot exists for that token. Disconnect/stale marking clears snapshot readiness; REST bootstrap and reconciliation reseed the cache before dirty WebSocket updates are trusted again.
