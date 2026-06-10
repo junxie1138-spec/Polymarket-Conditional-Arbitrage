@@ -16,7 +16,7 @@ from .arb_models import BinaryMarket, OrderBookSide
 from .event_log import utc_iso
 from .fetcher import GammaClobClient
 from .market_data import MarketDataCache, MarketWebSocketManager, MarketWebSocketSettings
-from .paper import PaperPortfolio, PaperPortfolioDecision, PaperPortfolioParams
+from .paper import PaperPortfolio, PaperPortfolioDecision, PaperPortfolioLoadError, PaperPortfolioParams
 from .portfolio_lock import PortfolioDataLock, PortfolioLockError
 
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
@@ -703,7 +703,10 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if command == "status":
-        print(_format_status(portfolio.status()))
+        try:
+            print(_format_status(portfolio.status()))
+        except PaperPortfolioLoadError as exc:
+            parser.exit(2, f"{exc}\n")
         return
 
     if command == "reset":

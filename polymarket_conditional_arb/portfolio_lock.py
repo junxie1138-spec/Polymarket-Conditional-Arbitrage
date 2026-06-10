@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
 from .event_log import utc_iso
+
+LOCK_UNLINK_ATTEMPTS = 8
+LOCK_UNLINK_BACKOFF_SECONDS = 0.01
 
 
 class PortfolioLockError(RuntimeError):
@@ -41,12 +45,12 @@ class PortfolioDataLock:
             except FileExistsError:
                 existing = self._read_existing()
                 if self._is_stale_same_host_lock(existing):
-                    try:
-                        self.path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    except OSError as exc:
-                        raise PortfolioLockError(f"failed to remove stale portfolio lock {self.path}: {exc}") from exc
+                    removed = self._unlink_lock_matching_token(
+                        str(existing.get("token") or ""),
+                        error_context="remove stale portfolio lock",
+                    )
+                    if not removed:
+                        raise PortfolioLockError(self._locked_message(self._read_existing()))
                     continue
                 raise PortfolioLockError(self._locked_message(existing))
 
@@ -63,11 +67,30 @@ class PortfolioDataLock:
             return
         existing = self._read_existing()
         if existing.get("token") == self.token:
+            self._unlink_lock_matching_token(self.token, error_context="release portfolio lock")
+        self._acquired = False
+
+    def _unlink_lock_matching_token(self, expected_token: str, *, error_context: str) -> bool:
+        if not expected_token:
+            return False
+        delay = LOCK_UNLINK_BACKOFF_SECONDS
+        for attempt in range(LOCK_UNLINK_ATTEMPTS):
+            existing = self._read_existing()
+            if existing.get("token") != expected_token:
+                return False
             try:
                 self.path.unlink()
+                return True
             except FileNotFoundError:
-                pass
-        self._acquired = False
+                return True
+            except PermissionError as exc:
+                if attempt + 1 >= LOCK_UNLINK_ATTEMPTS:
+                    raise PortfolioLockError(f"failed to {error_context} {self.path}: {exc}") from exc
+                time.sleep(delay)
+                delay *= 2
+            except OSError as exc:
+                raise PortfolioLockError(f"failed to {error_context} {self.path}: {exc}") from exc
+        return False
 
     def _metadata(self) -> dict[str, Any]:
         return {

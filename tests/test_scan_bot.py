@@ -4,6 +4,9 @@ import asyncio
 import json
 import logging
 import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -355,6 +358,66 @@ def test_portfolio_lock_rejects_second_active_holder(tmp_path):
         first.release()
 
 
+def test_portfolio_lock_repeated_contention_retries_transient_unlink_failures(tmp_path, monkeypatch):
+    state_path = tmp_path / "paper_portfolio_instance.json"
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    real_unlink = Path.unlink
+    remaining_permission_errors = 4
+    unlink_guard = threading.Lock()
+
+    def flaky_unlink(path: Path, *args, **kwargs):
+        nonlocal remaining_permission_errors
+        if path == lock_path:
+            with unlink_guard:
+                if remaining_permission_errors > 0:
+                    remaining_permission_errors -= 1
+                    raise PermissionError("simulated transient lock contention")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    active_holders = 0
+    max_active_holders = 0
+    holder_guard = threading.Lock()
+    start = threading.Barrier(4)
+
+    def worker() -> None:
+        nonlocal active_holders, max_active_holders
+        start.wait()
+        acquired = 0
+        attempts = 0
+        while acquired < 8:
+            attempts += 1
+            if attempts > 400:
+                raise AssertionError("could not acquire portfolio lock under contention")
+            lock = PortfolioDataLock(state_path)
+            try:
+                lock.acquire()
+            except PortfolioLockError:
+                time.sleep(0.001)
+                continue
+            try:
+                with holder_guard:
+                    active_holders += 1
+                    max_active_holders = max(max_active_holders, active_holders)
+                    if active_holders != 1:
+                        raise AssertionError("overlapping portfolio lock holders")
+                time.sleep(0.0005)
+            finally:
+                with holder_guard:
+                    active_holders -= 1
+                lock.release()
+            acquired += 1
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(worker) for _ in range(4)]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert max_active_holders == 1
+    assert remaining_permission_errors == 0
+    assert not lock_path.exists()
+
+
 def test_portfolio_lock_recovers_dead_same_host_lock(tmp_path, monkeypatch):
     state_path = tmp_path / "paper_portfolio_instance.json"
     lock_path = state_path.with_name(state_path.name + ".lock")
@@ -399,6 +462,25 @@ def test_cli_status_reads_state_without_lock_or_mutation(tmp_path, monkeypatch, 
 
     assert "Paper Portfolio Status" in capsys.readouterr().out
     assert before == after
+
+
+def test_cli_status_reports_corrupt_state_without_traceback(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COND_ARB_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COND_ARB_LOG_DIR", str(tmp_path / "logs"))
+    state_path = config.paper_portfolio_instance_path(data_dir)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["status"])
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 2
+    assert "failed to load paper portfolio" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+    assert not state_path.with_name(state_path.name + ".lock").exists()
 
 
 def test_cli_reset_acquires_lock_and_writes_clean_state(tmp_path, monkeypatch, capsys):
