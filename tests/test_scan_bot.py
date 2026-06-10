@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -14,12 +15,18 @@ from pathlib import Path
 import pytest
 
 from polymarket_conditional_arb import config
+from polymarket_conditional_arb.event_log import utc_iso
 from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
 from polymarket_conditional_arb.market_universe_cache import write_market_universe_cache
 from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams
 from polymarket_conditional_arb.portfolio_lock import PortfolioDataLock, PortfolioLockError
+from polymarket_conditional_arb.runtime_status import (
+    derive_runtime_state,
+    format_status_dashboard,
+    run_status_watch,
+)
 from polymarket_conditional_arb.scan_bot import (
     ConditionalArbScanner,
     ScannerRetryPolicy,
@@ -315,7 +322,7 @@ def test_market_universe_fetch_stops_between_event_pages(tmp_path):
         scanner._fetch_market_universe()
 
 
-def test_cold_fast_start_fetches_only_startup_slice_before_first_evaluation(tmp_path):
+def test_missing_startup_cache_rebuilds_full_universe_before_first_evaluation(tmp_path):
     cfg = replace(
         scan_config(tmp_path),
         fast_start_enabled=True,
@@ -327,7 +334,10 @@ def test_cold_fast_start_fetches_only_startup_slice_before_first_evaluation(tmp_
             TwoMarketClient._market_row("m1", "yes-1", "no-1"),
             TwoMarketClient._market_row("m2", "yes-2", "no-2"),
         ],
-        full_rows=[TwoMarketClient._market_row("m3", "yes-3", "no-3")],
+        full_rows=[
+            TwoMarketClient._market_row("m3", "yes-3", "no-3"),
+            TwoMarketClient._market_row("m4", "yes-4", "no-4"),
+        ],
     )
     scanner = scanner_for(tmp_path, client, cfg=cfg)
 
@@ -340,14 +350,16 @@ def test_cold_fast_start_fetches_only_startup_slice_before_first_evaluation(tmp_
         params=scanner.params,
     )
 
-    assert client.slice_calls == [{"limit": 20, "order": "volume24hr", "ascending": False}]
-    assert client.full_calls == 0
-    assert [market.market_id for market in universe.markets] == ["m1"]
-    assert universe.token_ids == ["yes-1", "no-1"]
-    assert result["summary"]["evaluated_standard_binary_markets"] == 1
+    assert client.slice_calls == []
+    assert client.full_calls == 1
+    assert [market.market_id for market in universe.markets] == ["m3", "m4"]
+    assert universe.token_ids == ["yes-3", "no-3", "yes-4", "no-4"]
+    assert result["summary"]["evaluated_standard_binary_markets"] == 2
+    cache_payload = json.loads(cfg.market_universe_cache_path.read_text(encoding="utf-8"))
+    assert cache_payload["gamma_query"]["discovery"] == "full_active_events"
 
 
-def test_warm_fast_start_uses_fresh_cache_without_gamma_discovery(tmp_path):
+def test_fresh_full_startup_cache_skips_gamma_discovery_without_token_cap(tmp_path):
     cfg = replace(
         scan_config(tmp_path),
         fast_start_enabled=True,
@@ -374,30 +386,97 @@ def test_warm_fast_start_uses_fresh_cache_without_gamma_discovery(tmp_path):
 
     assert client.slice_calls == []
     assert client.full_calls == 0
-    assert [market.market_id for market in universe.markets] == ["m1"]
+    assert [market.market_id for market in universe.markets] == ["m1", "m2"]
     assert universe.events_fetched == 2
     assert universe.raw_markets == 2
 
 
-def test_corrupt_fast_start_cache_falls_back_to_live_slice(tmp_path, caplog):
+def test_corrupt_startup_cache_rebuilds_full_universe(tmp_path, caplog):
     cfg = replace(scan_config(tmp_path), fast_start_enabled=True)
     cfg.market_universe_cache_path.parent.mkdir(parents=True)
     cfg.market_universe_cache_path.write_text("{not-json", encoding="utf-8")
     client = RecordingDiscoveryClient(
         startup_rows=[TwoMarketClient._market_row("m1", "yes-1", "no-1")],
+        full_rows=[TwoMarketClient._market_row("m2", "yes-2", "no-2")],
     )
     scanner = scanner_for(tmp_path, client, cfg=cfg)
 
     with caplog.at_level(logging.WARNING, logger="test_scanner"):
         universe = scanner._fetch_startup_market_universe()
 
-    assert [market.market_id for market in universe.markets] == ["m1"]
-    assert len(client.slice_calls) == 1
+    assert [market.market_id for market in universe.markets] == ["m2"]
+    assert client.slice_calls == []
+    assert client.full_calls == 1
     assert "market_universe_cache_ignored reason=invalid" in caplog.text
 
 
-def test_background_backfill_adds_tokens_updates_ws_and_writes_cache(tmp_path):
+def test_stale_startup_cache_rebuilds_full_universe(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    cached_markets = tradable_markets_for_rows([TwoMarketClient._market_row("old", "yes-old", "no-old")])
+    write_market_universe_cache(
+        cfg.market_universe_cache_path,
+        markets=cached_markets,
+        events_fetched=1,
+        raw_markets=1,
+        gamma_query={"closed": "false", "discovery": "full_active_events"},
+        fetched_at=datetime.now(timezone.utc) - timedelta(seconds=7200),
+    )
+    client = RecordingDiscoveryClient(full_rows=[TwoMarketClient._market_row("new", "yes-new", "no-new")])
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    with caplog.at_level(logging.WARNING, logger="test_scanner"):
+        universe = scanner._fetch_startup_market_universe()
+
+    assert [market.market_id for market in universe.markets] == ["new"]
+    assert client.full_calls == 1
+    assert "market_universe_cache_ignored reason=stale" in caplog.text
+
+
+def test_partial_discovery_cache_is_not_usable_for_startup_gate(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    cached_markets = tradable_markets_for_rows([TwoMarketClient._market_row("slice", "yes-s", "no-s")])
+    write_market_universe_cache(
+        cfg.market_universe_cache_path,
+        markets=cached_markets,
+        events_fetched=1,
+        raw_markets=1,
+        gamma_query={"closed": "false", "order": "volume24hr"},
+        fetched_at=datetime.now(timezone.utc),
+    )
+    client = RecordingDiscoveryClient(full_rows=[TwoMarketClient._market_row("full", "yes-f", "no-f")])
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    with caplog.at_level(logging.WARNING, logger="test_scanner"):
+        universe = scanner._fetch_startup_market_universe()
+
+    assert [market.market_id for market in universe.markets] == ["full"]
+    assert client.full_calls == 1
+    assert "market_universe_cache_ignored reason=not_full" in caplog.text
+
+
+def test_startup_cache_write_failure_blocks_book_seed_and_evaluation(tmp_path, monkeypatch):
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client)
+    monkeypatch.setattr(scanner, "_write_market_universe_cache", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="failed to write startup market universe cache"):
+        scanner._run_startup_rest_cycle()
+
+    assert client.fetch_ask_books_calls == 0
+    assert not scanner.config.paper_portfolio_instance_path.exists()
+
+
+def test_background_refresh_adds_tokens_updates_ws_and_writes_cache(tmp_path):
     cfg = replace(scan_config(tmp_path), fast_start_enabled=True, fast_start_token_limit=2)
+    cached_markets = tradable_markets_for_rows([TwoMarketClient._market_row("m1", "yes-1", "no-1")])
+    write_market_universe_cache(
+        cfg.market_universe_cache_path,
+        markets=cached_markets,
+        events_fetched=1,
+        raw_markets=1,
+        gamma_query={"closed": "false", "discovery": "full_active_events"},
+        fetched_at=datetime.now(timezone.utc),
+    )
     client = RecordingDiscoveryClient(
         startup_rows=[TwoMarketClient._market_row("m1", "yes-1", "no-1")],
         full_rows=[
@@ -418,7 +497,7 @@ def test_background_backfill_adds_tokens_updates_ws_and_writes_cache(tmp_path):
             cache,
             manager,
             dirty_queue,
-            reason="fast_start_backfill",
+            reason="periodic_market_refresh",
         )
     )
 
@@ -432,6 +511,15 @@ def test_background_backfill_adds_tokens_updates_ws_and_writes_cache(tmp_path):
 
 def test_dirty_token_evaluation_runs_while_slow_full_refresh_is_in_progress(tmp_path):
     cfg = replace(scan_config(tmp_path), fast_start_enabled=True, fast_start_token_limit=2)
+    cached_markets = tradable_markets_for_rows([TwoMarketClient._market_row("m1", "yes-1", "no-1")])
+    write_market_universe_cache(
+        cfg.market_universe_cache_path,
+        markets=cached_markets,
+        events_fetched=1,
+        raw_markets=1,
+        gamma_query={"closed": "false", "discovery": "full_active_events"},
+        fetched_at=datetime.now(timezone.utc),
+    )
     client = RecordingDiscoveryClient(
         startup_rows=[TwoMarketClient._market_row("m1", "yes-1", "no-1")],
         full_rows=[
@@ -508,6 +596,137 @@ def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
     assert state["executions"][0]["market_id"] == "m1"
     assert state["executions"][0]["quantity_redeemed"] == 10.0
     assert state["inventory"] == {}
+
+
+def test_runtime_status_records_warmup_progress_before_startup_evaluation(tmp_path):
+    cfg = scan_config(tmp_path)
+    client = RecordingDiscoveryClient(
+        full_rows=[
+            TwoMarketClient._market_row("m1", "yes-1", "no-1"),
+            TwoMarketClient._market_row("m2", "yes-2", "no-2"),
+        ],
+    )
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    scanner._start_runtime(detail="test warmup")
+    try:
+        universe = scanner._fetch_startup_market_universe()
+        runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    finally:
+        scanner._stop_runtime()
+
+    assert [market.market_id for market in universe.markets] == ["m1", "m2"]
+    assert client.fetch_ask_books_calls == 0
+    assert runtime["phase"] == "warmup"
+    assert runtime["events_fetched"] == 1
+    assert runtime["raw_markets"] == 2
+    assert runtime["tradable_markets"] == 2
+    assert runtime["tokens"] == 4
+    assert runtime["cache_fetched_at_utc"] is not None
+    assert runtime["last_cycle_started_at_utc"] is None
+
+
+def test_runtime_status_records_online_after_startup_evaluation(tmp_path):
+    cfg = scan_config(tmp_path)
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    scanner._start_runtime(detail="test warmup")
+    try:
+        result = scanner._run_startup_rest_cycle()
+        runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    finally:
+        scanner._stop_runtime()
+
+    assert result["summary"]["executions"] == 2
+    assert client.fetch_ask_books_calls == 1
+    assert runtime["phase"] == "online"
+    assert runtime["detail"] == "online"
+    assert runtime["last_evaluation_reason"] == "rest_bootstrap"
+    assert runtime["last_cycle_completed_at_utc"] is not None
+    assert runtime["last_cycle_evaluated_markets"] == 2
+    assert runtime["last_cycle_executions"] == 2
+
+
+def test_status_state_derives_online_warmup_and_dead(monkeypatch):
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+    }
+
+    assert derive_runtime_state(runtime, now=now) == "ONLINE"
+    assert derive_runtime_state({**runtime, "phase": "warmup"}, now=now) == "WARMUP"
+    assert derive_runtime_state(None, now=now) == "DEAD"
+    assert derive_runtime_state(
+        {**runtime, "heartbeat_at_utc": utc_iso(now - timedelta(seconds=16))},
+        now=now,
+    ) == "DEAD"
+
+    monkeypatch.setattr(PortfolioDataLock, "_process_is_alive", staticmethod(lambda _pid: False))
+    assert derive_runtime_state(runtime, now=now) == "DEAD"
+
+
+def test_status_dashboard_formats_online_warmup_and_dead():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "online",
+        "events_fetched": 3,
+        "raw_markets": 5,
+        "tradable_markets": 2,
+        "tokens": 4,
+        "cache_path": "data/market_universe_cache.json",
+        "cache_fetched_at_utc": utc_iso(now),
+        "last_evaluation_reason": "ws_bootstrap",
+        "last_cycle_completed_at_utc": utc_iso(now),
+        "last_cycle_evaluated_markets": 2,
+        "last_cycle_executions": 1,
+        "last_cycle_skips": 1,
+    }
+    portfolio_status = {
+        "cash": 1001.0,
+        "realized_pnl": 1.0,
+        "total_equity": 1001.0,
+        "return_pct": 0.1,
+        "trade_count": 1,
+        "win_rate_pct": 100.0,
+        "costs": {"fees_usd": 0.0, "slippage_usd": 0.1, "tax_usd": 0.0, "merge_usd": 0.02},
+        "last_execution_at_utc": utc_iso(now),
+        "unmatched_inventory": [],
+    }
+
+    online = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+    warmup = format_status_dashboard(runtime={**runtime, "phase": "warmup"}, portfolio=portfolio_status, now=now)
+    dead = format_status_dashboard(runtime=None, portfolio=portfolio_status, now=now)
+
+    assert "Paper Portfolio Status [ONLINE]" in online
+    assert "Last cycle: reason=ws_bootstrap; completed=2026-06-10T12:00:00Z; evaluated=2; executions=1; skips=1" in online
+    assert "Paper Portfolio Status [WARMUP]" in warmup
+    assert "Paper Portfolio Status [DEAD]" in dead
+
+
+def test_status_watch_loop_can_be_bounded():
+    rendered: list[str] = []
+    sleeps: list[float] = []
+
+    run_status_watch(
+        render=lambda: "snapshot",
+        refresh_seconds=0.2,
+        output=rendered.append,
+        sleep=sleeps.append,
+        iterations=2,
+    )
+
+    assert rendered == ["\x1b[2J\x1b[Hsnapshot", "\x1b[2J\x1b[Hsnapshot"]
+    assert sleeps == [0.2]
 
 
 def test_rest_cycle_retries_and_recovers_after_book_failure(tmp_path, caplog):
@@ -736,12 +955,12 @@ def test_cli_status_reads_state_without_lock_or_mutation(tmp_path, monkeypatch, 
     before = state_path.read_text(encoding="utf-8")
     lock = PortfolioDataLock(state_path).acquire()
     try:
-        main(["status"])
+        main(["status", "--once"])
     finally:
         lock.release()
     after = state_path.read_text(encoding="utf-8")
 
-    assert "Paper Portfolio Status" in capsys.readouterr().out
+    assert "Paper Portfolio Status [DEAD]" in capsys.readouterr().out
     assert before == after
 
 
@@ -754,7 +973,7 @@ def test_cli_status_reports_corrupt_state_without_traceback(tmp_path, monkeypatc
     state_path.write_text("{not json", encoding="utf-8")
 
     with pytest.raises(SystemExit) as excinfo:
-        main(["status"])
+        main(["status", "--once"])
 
     captured = capsys.readouterr()
     assert excinfo.value.code == 2

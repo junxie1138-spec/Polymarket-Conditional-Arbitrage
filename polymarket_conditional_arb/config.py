@@ -34,7 +34,7 @@ DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION = 500
 DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_REST_RECONCILE_INTERVAL_SECONDS = 60
 DEFAULT_WS_STALE_SECONDS = 5.0
-DEFAULT_FAST_START_ENABLED = True
+DEFAULT_FAST_START_ENABLED = False
 DEFAULT_FAST_START_EVENT_LIMIT = 20
 DEFAULT_FAST_START_TOKEN_LIMIT = 500
 DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS = 3600
@@ -265,6 +265,10 @@ def paper_portfolio_events_path(base_data_dir: Path | None = None) -> Path:
     return (base_data_dir or data_dir()) / "paper_portfolio_events.jsonl"
 
 
+def paper_portfolio_runtime_path(base_data_dir: Path | None = None) -> Path:
+    return (base_data_dir or data_dir()) / "paper_portfolio_runtime.json"
+
+
 def scan_log_path(base_log_dir: Path | None = None) -> Path:
     return (base_log_dir or log_dir()) / "conditional_arb_scan.log"
 
@@ -315,6 +319,10 @@ class ScanConfig:
     @property
     def paper_portfolio_events_path(self) -> Path:
         return paper_portfolio_events_path(self.data_dir)
+
+    @property
+    def paper_portfolio_runtime_path(self) -> Path:
+        return paper_portfolio_runtime_path(self.data_dir)
 
     @property
     def scan_log_path(self) -> Path:

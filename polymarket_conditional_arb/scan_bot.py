@@ -24,6 +24,12 @@ from .market_universe_cache import (
 )
 from .paper import PaperPortfolio, PaperPortfolioDecision, PaperPortfolioLoadError, PaperPortfolioParams
 from .portfolio_lock import PortfolioDataLock, PortfolioLockError
+from .runtime_status import (
+    RuntimeStatusWriter,
+    format_status_dashboard,
+    read_runtime_and_portfolio_status,
+    run_status_watch,
+)
 
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
 
@@ -157,6 +163,11 @@ class ConditionalArbScanner:
         self.logger = logger or logging.getLogger("polymarket_conditional_arb.portfolio")
         self.retry_policy = retry_policy or ScannerRetryPolicy()
         self.running = True
+        self.runtime = RuntimeStatusWriter(
+            self.config.paper_portfolio_runtime_path,
+            cache_path=self.config.market_universe_cache_path,
+        )
+        self._runtime_started = False
 
     def _should_retry(self, failed_attempt: int) -> bool:
         return self.running and (
@@ -189,6 +200,23 @@ class ConditionalArbScanner:
         if not self.running:
             raise ScannerStopped("scanner stopped")
         return True
+
+    def _start_runtime(self, *, detail: str) -> None:
+        self._runtime_started = True
+        self.runtime.start(phase="warmup", detail=detail)
+
+    def _stop_runtime(self, *, detail: str = "stopping") -> None:
+        if not self._runtime_started:
+            return
+        self.runtime.stop(detail=detail)
+        self._runtime_started = False
+
+    def _runtime_update(self, **fields: Any) -> None:
+        if self._runtime_started:
+            self.runtime.update(**fields)
+
+    def _runtime_error(self, exc: Exception) -> None:
+        self._runtime_update(last_error=f"{type(exc).__name__}: {exc}")
 
     def _run_with_retries(
         self,
@@ -277,9 +305,9 @@ class ConditionalArbScanner:
                 "include_neg_risk": False,
                 "market_ws_enabled": self.config.market_ws_enabled,
                 "market_ws_endpoint": self.config.market_ws_endpoint,
-                "fast_start_enabled": self.config.fast_start_enabled,
-                "fast_start_event_limit": self.config.fast_start_event_limit,
-                "fast_start_token_limit": self.config.fast_start_token_limit,
+                "startup_gate": "fresh_full_cache_or_full_gamma_rebuild",
+                "market_universe_cache_path": str(self.config.market_universe_cache_path),
+                "legacy_fast_start_enabled": self.config.fast_start_enabled,
                 "universe_cache_max_age_seconds": self.config.universe_cache_max_age_seconds,
                 "min_net_profit_usd": self.params.min_net_profit_usd,
                 "min_net_return_bps": self.params.min_net_return_bps,
@@ -298,14 +326,20 @@ class ConditionalArbScanner:
 
     def run_once(self) -> dict[str, Any]:
         self.bootstrap()
+        self._start_runtime(detail="starting one-shot warmup")
         try:
-            return self.run_one_cycle()
+            return self._run_startup_rest_cycle()
+        except Exception as exc:
+            self._runtime_error(exc)
+            raise
         finally:
+            self._stop_runtime(detail="one-shot run stopped")
             self.portfolio.save()
 
     def run_forever(self) -> None:
         self.bootstrap()
         self.install_signal_handlers()
+        self._start_runtime(detail="starting warmup")
         try:
             if self.config.market_ws_enabled:
                 asyncio.run(self._run_market_ws_forever())
@@ -313,19 +347,42 @@ class ConditionalArbScanner:
                 self._run_rest_forever()
         except ScannerStopped:
             self.logger.info("scanner_stopped")
+        except Exception as exc:
+            self._runtime_error(exc)
+            raise
         finally:
+            self._stop_runtime()
             self.portfolio.save()
 
     def _run_rest_forever(self) -> None:
+        first_cycle = True
         while self.running:
             try:
-                self.run_one_cycle()
+                if first_cycle:
+                    self._run_startup_rest_cycle()
+                    first_cycle = False
+                else:
+                    self.run_one_cycle()
             except ScannerStopped:
                 break
             except Exception as exc:
                 self.logger.warning("rest_cycle_failed_after_retries error=%r", exc)
+                self._runtime_error(exc)
             if self.running:
                 time.sleep(self.config.poll_interval_seconds)
+
+    def _run_startup_rest_cycle(self) -> dict[str, Any]:
+        universe = self._fetch_startup_market_universe_with_retry_sync()
+        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids)
+        result = self._evaluate_universe(
+            universe,
+            books_by_token,
+            dirty_token_ids=None,
+            evaluation_reason="rest_bootstrap",
+            params=self.params,
+        )
+        self._runtime_update(phase="online", detail="online", last_error=None)
+        return result
 
     async def _run_market_ws_forever(self) -> None:
         cache = MarketDataCache()
@@ -387,7 +444,15 @@ class ConditionalArbScanner:
 
         try:
             universe = await self._fetch_startup_market_universe_with_retry()
+            self._runtime_update(
+                detail="seeding startup REST ask books",
+                events_fetched=universe.events_fetched,
+                raw_markets=universe.raw_markets,
+                tradable_markets=len(universe.markets),
+                tokens=len(universe.token_ids),
+            )
             await self._seed_rest_books_with_retry(cache, universe.token_ids, reason="ws_bootstrap")
+            self._runtime_update(detail="starting market websocket subscriptions")
             await self._run_async_with_retries(
                 "market_ws_start",
                 lambda: manager.start(universe.token_ids),
@@ -403,12 +468,11 @@ class ConditionalArbScanner:
                 evaluation_reason="ws_bootstrap",
                 params=ws_params,
             )
+            self._runtime_update(phase="online", detail="online", last_error=None)
 
             loop = asyncio.get_running_loop()
             next_refresh = loop.time() + self.config.market_refresh_interval_seconds
             next_reconcile = loop.time() + self.config.rest_reconcile_interval_seconds
-            if self.config.fast_start_enabled:
-                _start_refresh_task(universe, reason="fast_start_backfill")
 
             while self.running:
                 universe = _finish_refresh_task_if_ready(universe)
@@ -474,6 +538,7 @@ class ConditionalArbScanner:
     async def _seed_rest_books(self, cache: MarketDataCache, token_ids: list[str], *, reason: str) -> set[str]:
         if not token_ids:
             return set()
+        self._runtime_update(detail=f"seeding REST ask books: {reason}", tokens=len(token_ids))
         books = await asyncio.to_thread(self.client.fetch_ask_books, token_ids)
         updated = cache.seed_ask_books(books)
         self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(updated))
@@ -504,6 +569,7 @@ class ConditionalArbScanner:
         *,
         reason: str = "market_refresh",
     ) -> MarketUniverse:
+        self._runtime_update(detail=f"refreshing market universe: {reason}")
         fetched_universe = await self._fetch_market_universe_with_retry()
         new_universe = self._priority_merged_universe(old_universe, fetched_universe)
         old_tokens = set(old_universe.token_ids)
@@ -553,15 +619,18 @@ class ConditionalArbScanner:
         return new_universe
 
     def run_one_cycle(self) -> dict[str, Any]:
+        self._runtime_update(detail="running REST cycle")
         universe = self._fetch_market_universe_with_retry_sync()
         books_by_token = self._fetch_ask_books_with_retry(universe.token_ids)
-        return self._evaluate_universe(
+        result = self._evaluate_universe(
             universe,
             books_by_token,
             dirty_token_ids=None,
             evaluation_reason="rest_cycle",
             params=self.params,
         )
+        self._runtime_update(phase="online", detail="online", last_error=None)
+        return result
 
     def _apply_market_limits(
         self,
@@ -578,6 +647,13 @@ class ConditionalArbScanner:
         return self._run_with_retries(
             "market_universe_fetch",
             self._fetch_market_universe,
+            summary=self._universe_retry_summary,
+        )
+
+    def _fetch_startup_market_universe_with_retry_sync(self) -> MarketUniverse:
+        return self._run_with_retries(
+            "market_universe_startup_fetch",
+            self._fetch_startup_market_universe,
             summary=self._universe_retry_summary,
         )
 
@@ -604,6 +680,7 @@ class ConditionalArbScanner:
         )
 
     def _fetch_market_universe(self) -> MarketUniverse:
+        self._runtime_update(detail="fetching full Gamma active universe")
         self.logger.info("market_universe_fetch_start market_limit=%s", self.config.market_limit)
         events = self.client.fetch_active_events(
             on_page=self._log_market_event_page,
@@ -617,39 +694,18 @@ class ConditionalArbScanner:
             len(universe.markets),
             len(universe.token_ids),
         )
-        return universe
-
-    def _fetch_fast_start_market_universe(self) -> MarketUniverse:
-        self.logger.info(
-            "market_universe_fast_start_fetch_start event_limit=%s token_limit=%s market_limit=%s",
-            self.config.fast_start_event_limit,
-            self.config.fast_start_token_limit,
-            self.config.market_limit,
-        )
-        events = self.client.fetch_active_events_slice(
-            limit=self.config.fast_start_event_limit,
-            order="volume24hr",
-            ascending=False,
-            on_page=self._log_market_event_page,
-            should_continue=self._ensure_running,
-        )
-        universe = self._market_universe_from_events(
-            events,
-            token_limit=self.config.fast_start_token_limit,
-        )
-        self.logger.info(
-            "market_universe_fast_start_fetch_complete events=%s raw_markets=%s tradable_markets=%s tokens=%s",
-            universe.events_fetched,
-            universe.raw_markets,
-            len(universe.markets),
-            len(universe.token_ids),
+        self._runtime_update(
+            events_fetched=universe.events_fetched,
+            raw_markets=universe.raw_markets,
+            tradable_markets=len(universe.markets),
+            tokens=len(universe.token_ids),
+            detail="full Gamma active universe fetched",
         )
         return universe
 
     def _market_universe_from_cache_record(self, record: MarketUniverseCacheRecord) -> MarketUniverse:
         markets = self._apply_market_limits(
             list(record.markets),
-            token_limit=self.config.fast_start_token_limit,
         )
         universe = _build_market_universe(
             events_fetched=record.events_fetched,
@@ -663,6 +719,14 @@ class ConditionalArbScanner:
             len(universe.markets),
             len(universe.token_ids),
         )
+        self._runtime_update(
+            detail="loaded fresh full market-universe cache",
+            events_fetched=universe.events_fetched,
+            raw_markets=universe.raw_markets,
+            tradable_markets=len(universe.markets),
+            tokens=len(universe.token_ids),
+            cache_fetched_at_utc=utc_iso(record.fetched_at),
+        )
         return universe
 
     def _load_cached_market_universe(self) -> MarketUniverse | None:
@@ -673,23 +737,35 @@ class ConditionalArbScanner:
         )
         if record is None:
             return None
+        if record.gamma_query.get("discovery") != "full_active_events":
+            self.logger.warning(
+                "market_universe_cache_ignored reason=not_full path=%s discovery=%r",
+                self.config.market_universe_cache_path,
+                record.gamma_query.get("discovery"),
+            )
+            return None
         return self._market_universe_from_cache_record(record)
 
     def _fetch_startup_market_universe(self) -> MarketUniverse:
-        if not self.config.fast_start_enabled:
-            return self._fetch_market_universe()
-
         cached = self._load_cached_market_universe()
         if cached is not None:
             return cached
-        return self._fetch_fast_start_market_universe()
+        self._runtime_update(detail="building full market-universe cache")
+        universe = self._fetch_market_universe()
+        if self._write_market_universe_cache(
+            universe,
+            gamma_query={"closed": "false", "discovery": "full_active_events"},
+        ) is None:
+            raise RuntimeError(f"failed to write startup market universe cache: {self.config.market_universe_cache_path}")
+        return universe
 
     def _write_market_universe_cache(
         self,
         universe: MarketUniverse,
         *,
         gamma_query: Mapping[str, Any],
-    ) -> None:
+    ) -> datetime | None:
+        fetched_at = datetime.now(timezone.utc)
         try:
             write_market_universe_cache(
                 self.config.market_universe_cache_path,
@@ -697,16 +773,26 @@ class ConditionalArbScanner:
                 events_fetched=universe.events_fetched,
                 raw_markets=universe.raw_markets,
                 gamma_query=gamma_query,
+                fetched_at=fetched_at,
             )
         except Exception as exc:
             self.logger.warning("market_universe_cache_write_failed path=%s error=%r", self.config.market_universe_cache_path, exc)
-            return
+            return None
         self.logger.info(
             "market_universe_cache_written path=%s tradable_markets=%s tokens=%s",
             self.config.market_universe_cache_path,
             len(universe.markets),
             len(universe.token_ids),
         )
+        self._runtime_update(
+            detail="market-universe cache written",
+            events_fetched=universe.events_fetched,
+            raw_markets=universe.raw_markets,
+            tradable_markets=len(universe.markets),
+            tokens=len(universe.token_ids),
+            cache_fetched_at_utc=utc_iso(fetched_at),
+        )
+        return fetched_at
 
     def _priority_merged_universe(self, priority_universe: MarketUniverse, backfill_universe: MarketUniverse) -> MarketUniverse:
         merged_markets = _merge_markets_by_priority(
@@ -725,6 +811,10 @@ class ConditionalArbScanner:
             offset,
             rows,
             total_events,
+        )
+        self._runtime_update(
+            detail=f"fetching Gamma active events offset={offset} rows={rows}",
+            events_fetched=total_events,
         )
 
     async def _fetch_startup_market_universe_with_retry(self) -> MarketUniverse:
@@ -777,6 +867,15 @@ class ConditionalArbScanner:
         params: PaperPortfolioParams,
     ) -> dict[str, Any]:
         cycle_started = datetime.now(timezone.utc)
+        self._runtime_update(
+            last_cycle_started_at_utc=utc_iso(cycle_started),
+            last_evaluation_reason=evaluation_reason,
+            detail=f"evaluating {evaluation_reason}",
+            events_fetched=universe.events_fetched,
+            raw_markets=universe.raw_markets,
+            tradable_markets=len(universe.markets),
+            tokens=len(universe.token_ids),
+        )
         self.logger.info("cycle_start reason=%s at=%s", evaluation_reason, cycle_started.isoformat())
         self.portfolio.append_event(
             "paper_portfolio_cycle_started",
@@ -825,6 +924,18 @@ class ConditionalArbScanner:
             "skip_counts": skip_counts,
         }
         self.portfolio.append_event("paper_portfolio_cycle_completed", summary)
+        self._runtime_update(
+            last_cycle_completed_at_utc=utc_iso(),
+            last_evaluation_reason=evaluation_reason,
+            last_cycle_evaluated_markets=len(standard_markets),
+            last_cycle_executions=len(executions),
+            last_cycle_skips=sum(skip_counts.values()),
+            events_fetched=universe.events_fetched,
+            raw_markets=universe.raw_markets,
+            tradable_markets=len(universe.markets),
+            tokens=len(universe.token_ids),
+            detail=f"completed {evaluation_reason}",
+        )
         self.logger.info(
             "cycle_end reason=%s events=%s raw_markets=%s tradable=%s evaluated_binary=%s executions=%s skipped=%s",
             evaluation_reason,
@@ -900,7 +1011,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a local paper Polymarket arbitrage portfolio")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("run", help="Run the continuous paper portfolio instance")
-    subparsers.add_parser("status", help="Print paper portfolio performance")
+    status_parser = subparsers.add_parser("status", help="Watch paper portfolio runtime status")
+    status_parser.add_argument("--once", action="store_true", help="Print one status snapshot and exit")
+    status_parser.add_argument(
+        "--refresh-seconds",
+        type=float,
+        default=2.0,
+        help="Refresh cadence for watch mode",
+    )
     reset_parser = subparsers.add_parser("reset", help="Reset the local paper portfolio state")
     reset_parser.add_argument("--yes", action="store_true", help="Confirm resetting the paper portfolio")
     return parser
@@ -915,29 +1033,12 @@ def _money(value: float) -> str:
     return f"${value:,.2f}"
 
 
-def _format_status(status: dict[str, Any]) -> str:
-    costs = status["costs"]
-    unmatched = status["unmatched_inventory"]
-    unmatched_text = "none" if not unmatched else f"{len(unmatched)} positions"
-    return "\n".join(
-        [
-            "Paper Portfolio Status",
-            f"Starting capital: {_money(status['starting_capital_usd'])}",
-            f"Cash: {_money(status['cash'])}",
-            f"Realized PnL: {_money(status['realized_pnl'])}",
-            f"Total equity: {_money(status['total_equity'])}",
-            f"Return: {status['return_pct']:.2f}%",
-            f"Trades: {status['trade_count']}",
-            f"Win rate: {status['win_rate_pct']:.2f}%",
-            "Costs: "
-            f"fees {_money(costs['fees_usd'])}, "
-            f"slippage {_money(costs['slippage_usd'])}, "
-            f"tax {_money(costs['tax_usd'])}, "
-            f"merge {_money(costs['merge_usd'])}",
-            f"Last execution: {status['last_execution_at_utc'] or 'never'}",
-            f"Unmatched inventory: {unmatched_text}",
-        ]
+def _render_status_dashboard(scan_config: config.ScanConfig, portfolio: PaperPortfolio) -> str:
+    runtime, portfolio_status = read_runtime_and_portfolio_status(
+        runtime_path=scan_config.paper_portfolio_runtime_path,
+        portfolio_status=portfolio.status,
     )
+    return format_status_dashboard(runtime=runtime, portfolio=portfolio_status)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -953,8 +1054,18 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if command == "status":
+        refresh_seconds = max(0.1, float(getattr(args, "refresh_seconds", 2.0)))
+
+        def render() -> str:
+            return _render_status_dashboard(scan_config, portfolio)
+
         try:
-            print(_format_status(portfolio.status()))
+            if getattr(args, "once", False):
+                print(render())
+            else:
+                run_status_watch(render=render, refresh_seconds=refresh_seconds)
+        except KeyboardInterrupt:
+            return
         except PaperPortfolioLoadError as exc:
             parser.exit(2, f"{exc}\n")
         return

@@ -42,6 +42,8 @@ class PortfolioDataLock:
         while True:
             try:
                 fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except PermissionError as exc:
+                raise PortfolioLockError(self._locked_message(self._read_existing())) from exc
             except FileExistsError:
                 existing = self._read_existing()
                 if self._is_stale_same_host_lock(existing):
