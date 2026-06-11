@@ -188,6 +188,12 @@ class RuntimeStatusWriter:
             "book_seed_elapsed_seconds": None,
             "book_seed_rate_tokens_per_second": None,
             "book_seed_eta_seconds": None,
+            "book_seed_batch_number": 0,
+            "book_seed_total_batches": 0,
+            "book_seed_batch_start_token": 0,
+            "book_seed_batch_end_token": 0,
+            "book_seed_batch_status": None,
+            "book_seed_batch_started_at_utc": None,
             "events_fetched": 0,
             "raw_markets": 0,
             "tradable_markets": 0,
@@ -407,6 +413,12 @@ def _format_warmup_progress_line(
         reason = runtime_row.get("book_seed_reason") or "n/a"
         eta_seconds = _float_value(runtime_row.get("book_seed_eta_seconds"))
         rate = _float_value(runtime_row.get("book_seed_rate_tokens_per_second"))
+        batch_line = _format_book_seed_batch_line(
+            runtime_row=runtime_row,
+            current_time=current_time,
+            total_tokens=total_tokens,
+            completed_tokens=completed_tokens,
+        )
         parts.extend(
             [
                 (
@@ -420,10 +432,41 @@ def _format_warmup_progress_line(
                 f"ETA={_format_age(eta_seconds)}",
             ]
         )
+        if batch_line is not None:
+            parts.append(batch_line)
     if not parts:
         return None
     prefix = "Warmup progress" if phase == "warmup" else "Book seed progress"
     return f"{prefix}: " + "; ".join(parts)
+
+
+def _format_book_seed_batch_line(
+    *,
+    runtime_row: Mapping[str, Any],
+    current_time: datetime,
+    total_tokens: int,
+    completed_tokens: int,
+) -> str | None:
+    if total_tokens <= 0 or completed_tokens >= total_tokens:
+        return None
+    status = str(runtime_row.get("book_seed_batch_status") or "")
+    if status != "in_flight":
+        return None
+    batch_number = _int_value(runtime_row.get("book_seed_batch_number"))
+    total_batches = _int_value(runtime_row.get("book_seed_total_batches"))
+    start_token = _int_value(runtime_row.get("book_seed_batch_start_token"))
+    end_token = _int_value(runtime_row.get("book_seed_batch_end_token"))
+    if batch_number <= 0 or total_batches <= 0 or start_token <= 0 or end_token <= 0:
+        return None
+    in_flight_seconds = _seconds_since(
+        runtime_row.get("book_seed_batch_started_at_utc"),
+        now=current_time,
+    )
+    return (
+        f"batch={_format_count(batch_number)}/{_format_count(total_batches)} "
+        f"tokens {_format_count(start_token)}-{_format_count(end_token)} "
+        f"in_flight={_format_age(in_flight_seconds)}"
+    )
 
 
 def _format_runtime_status_write_failures_line(runtime_row: Mapping[str, Any]) -> str | None:

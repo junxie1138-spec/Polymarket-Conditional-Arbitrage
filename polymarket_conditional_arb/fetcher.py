@@ -29,18 +29,36 @@ def _emit_ask_book_progress(
     completed_tokens: int,
     received_books: int,
     failed_tokens: int,
+    current_batch_number: int | None = None,
+    total_batches: int | None = None,
+    current_batch_start_token: int | None = None,
+    current_batch_end_token: int | None = None,
+    current_batch_status: str | None = None,
+    current_batch_started_at_utc: str | None = None,
 ) -> None:
     if on_progress is None:
         return
-    on_progress(
-        {
-            "total_tokens": total_tokens,
-            "completed_tokens": completed_tokens,
-            "remaining_tokens": max(0, total_tokens - completed_tokens),
-            "received_books": received_books,
-            "failed_tokens": failed_tokens,
-        }
-    )
+    progress = {
+        "total_tokens": total_tokens,
+        "completed_tokens": completed_tokens,
+        "remaining_tokens": max(0, total_tokens - completed_tokens),
+        "received_books": received_books,
+        "failed_tokens": failed_tokens,
+    }
+    optional = {
+        "current_batch_number": current_batch_number,
+        "total_batches": total_batches,
+        "current_batch_start_token": current_batch_start_token,
+        "current_batch_end_token": current_batch_end_token,
+        "current_batch_status": current_batch_status,
+        "current_batch_started_at_utc": current_batch_started_at_utc,
+    }
+    progress.update({key: value for key, value in optional.items() if value is not None})
+    on_progress(progress)
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class GammaClobClient:
@@ -209,7 +227,24 @@ class GammaClobClient:
         completed_tokens = 0
         failed_tokens = 0
         total_tokens = len(unique_token_ids)
-        for chunk in _chunked(unique_token_ids, self.batch_book_limit):
+        total_batches = (total_tokens + self.batch_book_limit - 1) // self.batch_book_limit
+        for batch_index, chunk in enumerate(_chunked(unique_token_ids, self.batch_book_limit), start=1):
+            batch_start_token = completed_tokens + 1
+            batch_end_token = completed_tokens + len(chunk)
+            batch_started_at_utc = _utc_iso_now()
+            _emit_ask_book_progress(
+                on_progress,
+                total_tokens=total_tokens,
+                completed_tokens=completed_tokens,
+                received_books=len(ask_books),
+                failed_tokens=failed_tokens,
+                current_batch_number=batch_index,
+                total_batches=total_batches,
+                current_batch_start_token=batch_start_token,
+                current_batch_end_token=batch_end_token,
+                current_batch_status="in_flight",
+                current_batch_started_at_utc=batch_started_at_utc,
+            )
             received_at = datetime.now(timezone.utc)
             try:
                 raw_books = self.fetch_order_books_batch(chunk)
@@ -243,6 +278,12 @@ class GammaClobClient:
                     completed_tokens=completed_tokens,
                     received_books=len(ask_books),
                     failed_tokens=failed_tokens,
+                    current_batch_number=batch_index,
+                    total_batches=total_batches,
+                    current_batch_start_token=batch_start_token,
+                    current_batch_end_token=batch_end_token,
+                    current_batch_status="complete",
+                    current_batch_started_at_utc=batch_started_at_utc,
                 )
                 if len(fallback_failures) == len(chunk):
                     raise RuntimeError(
@@ -256,5 +297,11 @@ class GammaClobClient:
                 completed_tokens=completed_tokens,
                 received_books=len(ask_books),
                 failed_tokens=failed_tokens,
+                current_batch_number=batch_index,
+                total_batches=total_batches,
+                current_batch_start_token=batch_start_token,
+                current_batch_end_token=batch_end_token,
+                current_batch_status="complete",
+                current_batch_started_at_utc=batch_started_at_utc,
             )
         return ask_books

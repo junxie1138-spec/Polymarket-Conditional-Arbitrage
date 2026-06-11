@@ -159,13 +159,59 @@ def test_fetch_ask_books_reports_batch_progress():
     books = client.fetch_ask_books(["token-a", "token-b", "token-c"], on_progress=progress.append)
 
     assert sorted(books) == ["token-a", "token-b", "token-c"]
-    assert progress == [
+    assert [
+        {
+            key: item[key]
+            for key in (
+                "total_tokens",
+                "completed_tokens",
+                "remaining_tokens",
+                "received_books",
+                "failed_tokens",
+                "current_batch_number",
+                "total_batches",
+                "current_batch_start_token",
+                "current_batch_end_token",
+                "current_batch_status",
+            )
+        }
+        for item in progress
+    ] == [
+        {
+            "total_tokens": 3,
+            "completed_tokens": 0,
+            "remaining_tokens": 3,
+            "received_books": 0,
+            "failed_tokens": 0,
+            "current_batch_number": 1,
+            "total_batches": 2,
+            "current_batch_start_token": 1,
+            "current_batch_end_token": 2,
+            "current_batch_status": "in_flight",
+        },
         {
             "total_tokens": 3,
             "completed_tokens": 2,
             "remaining_tokens": 1,
             "received_books": 2,
             "failed_tokens": 0,
+            "current_batch_number": 1,
+            "total_batches": 2,
+            "current_batch_start_token": 1,
+            "current_batch_end_token": 2,
+            "current_batch_status": "complete",
+        },
+        {
+            "total_tokens": 3,
+            "completed_tokens": 2,
+            "remaining_tokens": 1,
+            "received_books": 2,
+            "failed_tokens": 0,
+            "current_batch_number": 2,
+            "total_batches": 2,
+            "current_batch_start_token": 3,
+            "current_batch_end_token": 3,
+            "current_batch_status": "in_flight",
         },
         {
             "total_tokens": 3,
@@ -173,8 +219,14 @@ def test_fetch_ask_books_reports_batch_progress():
             "remaining_tokens": 0,
             "received_books": 3,
             "failed_tokens": 0,
+            "current_batch_number": 2,
+            "total_batches": 2,
+            "current_batch_start_token": 3,
+            "current_batch_end_token": 3,
+            "current_batch_status": "complete",
         },
     ]
+    assert all(item["current_batch_started_at_utc"].endswith("Z") for item in progress)
 
 
 def test_fetch_ask_books_falls_back_to_single_book_on_malformed_batch_response():

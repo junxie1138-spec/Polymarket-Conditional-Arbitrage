@@ -265,6 +265,8 @@ class ConditionalArbScanner:
             remaining = _progress_int(progress.get("remaining_tokens"), progress_total - completed)
             received_books = _progress_int(progress.get("received_books"))
             failed_tokens = _progress_int(progress.get("failed_tokens"))
+            current_batch_status = progress.get("current_batch_status")
+            current_batch_started_at_utc = progress.get("current_batch_started_at_utc")
             elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
             rate = completed / elapsed_seconds if completed > 0 and elapsed_seconds > 0 else None
             eta = remaining / rate if rate and remaining > 0 else (0.0 if remaining == 0 else None)
@@ -280,6 +282,14 @@ class ConditionalArbScanner:
                 book_seed_elapsed_seconds=elapsed_seconds,
                 book_seed_rate_tokens_per_second=rate,
                 book_seed_eta_seconds=eta,
+                book_seed_batch_number=_progress_int(progress.get("current_batch_number")),
+                book_seed_total_batches=_progress_int(progress.get("total_batches")),
+                book_seed_batch_start_token=_progress_int(progress.get("current_batch_start_token")),
+                book_seed_batch_end_token=_progress_int(progress.get("current_batch_end_token")),
+                book_seed_batch_status=str(current_batch_status) if current_batch_status is not None else None,
+                book_seed_batch_started_at_utc=(
+                    str(current_batch_started_at_utc) if current_batch_started_at_utc is not None else None
+                ),
             )
 
         update(

@@ -704,6 +704,41 @@ def test_runtime_status_records_online_after_startup_evaluation(tmp_path):
     assert runtime["last_cycle_executions"] == 2
 
 
+def test_runtime_status_records_book_seed_batch_progress(tmp_path):
+    cfg = scan_config(tmp_path)
+    scanner = scanner_for(tmp_path, TwoMarketClient(), cfg=cfg)
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+
+    scanner._start_runtime(detail="test warmup")
+    try:
+        progress = scanner._book_seed_progress_callback(reason="ws_bootstrap", total_tokens=1000)
+        progress(
+            {
+                "total_tokens": 1000,
+                "completed_tokens": 500,
+                "remaining_tokens": 500,
+                "received_books": 498,
+                "failed_tokens": 2,
+                "current_batch_number": 2,
+                "total_batches": 2,
+                "current_batch_start_token": 501,
+                "current_batch_end_token": 1000,
+                "current_batch_status": "in_flight",
+                "current_batch_started_at_utc": utc_iso(now),
+            }
+        )
+        runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    finally:
+        scanner._stop_runtime()
+
+    assert runtime["book_seed_batch_number"] == 2
+    assert runtime["book_seed_total_batches"] == 2
+    assert runtime["book_seed_batch_start_token"] == 501
+    assert runtime["book_seed_batch_end_token"] == 1000
+    assert runtime["book_seed_batch_status"] == "in_flight"
+    assert runtime["book_seed_batch_started_at_utc"] == "2026-06-10T12:00:00Z"
+
+
 def test_runtime_status_writer_retries_transient_replace_permission_error(tmp_path, monkeypatch):
     path = tmp_path / "data" / "paper_portfolio_runtime.json"
     writer = RuntimeStatusWriter(
@@ -854,6 +889,48 @@ def test_status_dashboard_formats_warmup_progress_eta():
         "remaining=750; received_books=240; failed=10; rate=50.0 tokens/s; ETA=15.0s"
     ) in dashboard
     assert "Runtime status writes:" not in dashboard
+
+
+def test_status_dashboard_surfaces_inflight_book_seed_batch():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "warmup_started_at_utc": utc_iso(now - timedelta(seconds=600)),
+        "phase": "warmup",
+        "detail": "seeding REST ask books: ws_bootstrap (250/1000 tokens)",
+        "book_seed_reason": "ws_bootstrap",
+        "book_seed_total_tokens": 1000,
+        "book_seed_completed_tokens": 250,
+        "book_seed_remaining_tokens": 750,
+        "book_seed_received_books": 240,
+        "book_seed_failed_tokens": 10,
+        "book_seed_rate_tokens_per_second": 50.0,
+        "book_seed_eta_seconds": 15.0,
+        "book_seed_batch_number": 2,
+        "book_seed_total_batches": 4,
+        "book_seed_batch_start_token": 251,
+        "book_seed_batch_end_token": 500,
+        "book_seed_batch_status": "in_flight",
+        "book_seed_batch_started_at_utc": utc_iso(now - timedelta(seconds=18)),
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert "batch=2/4 tokens 251-500 in_flight=18.0s" in dashboard
 
 
 def test_status_dashboard_surfaces_runtime_status_write_degradation():
