@@ -143,6 +143,30 @@ def test_price_change_without_ready_snapshot_is_ignored(caplog):
     assert "market_ws_price_change_without_ready_snapshot" in caplog.text
 
 
+def test_price_change_without_ready_snapshot_warning_is_throttled(caplog):
+    cache = MarketDataCache(skipped_snapshot_warning_interval_seconds=60.0)
+    logger = logging.getLogger("test_market_data_throttled")
+    message = {
+        "event_type": "price_change",
+        "price_changes": [
+            {"asset_id": "token-a", "side": "SELL", "price": "0.48", "size": "2"},
+        ],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="test_market_data_throttled"):
+        assert cache.apply_message(message, received_at=AS_OF, logger=logger) == set()
+        assert cache.apply_message(message, received_at=AS_OF, logger=logger) == set()
+        assert cache.apply_message(message, received_at=AS_OF, logger=logger) == set()
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "market_ws_price_change_without_ready_snapshot" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "suppressed_since_last=0" in warnings[0].getMessage()
+
+
 def test_price_change_after_stale_marking_waits_for_rest_reseed():
     cache = MarketDataCache()
     cache.apply_message(

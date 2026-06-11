@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ MarketWsSide = Literal["BUY", "SELL", "bid", "ask"]
 
 
 DEFAULT_MARKET_WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+DEFAULT_SKIPPED_SNAPSHOT_WARNING_INTERVAL_SECONDS = 60.0
 
 
 def _utc_now() -> datetime:
@@ -63,10 +65,20 @@ def _sorted_levels(side: BookSideName, levels_by_price: Mapping[float, float]) -
 class MarketDataCache:
     """Normalized in-memory orderbook cache keyed by Polymarket token id."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        skipped_snapshot_warning_interval_seconds: float = DEFAULT_SKIPPED_SNAPSHOT_WARNING_INTERVAL_SECONDS,
+    ) -> None:
         self._books: dict[tuple[str, BookSideName], OrderBookSide] = {}
         self._ready_tokens: set[str] = set()
         self._snapshot_generations: dict[str, int] = {}
+        self._skipped_snapshot_warning_interval_seconds = max(
+            0.0,
+            float(skipped_snapshot_warning_interval_seconds),
+        )
+        self._last_skipped_snapshot_warning_at: float | None = None
+        self._suppressed_skipped_snapshot_warnings = 0
         self._lock = threading.RLock()
 
     def _mark_snapshot_ready_locked(self, token_id: str) -> None:
@@ -269,9 +281,36 @@ class MarketDataCache:
                     source_revision=_source_revision(payload, change) or current.source_revision,
                 )
                 updated.add(token_id)
-        if skipped_without_snapshot and logger is not None:
-            logger.warning("market_ws_price_change_without_ready_snapshot skipped=%s", skipped_without_snapshot)
+        self._log_skipped_snapshot_warning(skipped_without_snapshot, logger)
         return updated
+
+    def _log_skipped_snapshot_warning(
+        self,
+        skipped_without_snapshot: int,
+        logger: logging.Logger | None,
+    ) -> None:
+        if skipped_without_snapshot <= 0 or logger is None:
+            return
+
+        now = time.monotonic()
+        with self._lock:
+            if (
+                self._last_skipped_snapshot_warning_at is not None
+                and now - self._last_skipped_snapshot_warning_at
+                < self._skipped_snapshot_warning_interval_seconds
+            ):
+                self._suppressed_skipped_snapshot_warnings += skipped_without_snapshot
+                return
+
+            suppressed_since_last = self._suppressed_skipped_snapshot_warnings
+            self._suppressed_skipped_snapshot_warnings = 0
+            self._last_skipped_snapshot_warning_at = now
+
+        logger.warning(
+            "market_ws_price_change_without_ready_snapshot skipped=%s suppressed_since_last=%s",
+            skipped_without_snapshot,
+            suppressed_since_last,
+        )
 
 
 def chunk_asset_ids(asset_ids: Iterable[str], max_assets_per_connection: int) -> list[list[str]]:

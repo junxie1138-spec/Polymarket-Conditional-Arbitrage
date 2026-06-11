@@ -203,16 +203,17 @@ class GammaClobClient:
         )
         if not isinstance(data, list):
             raise ValueError(f"unexpected batch order book response: {type(data).__name__}")
-        if len(data) != len(token_ids):
-            raise ValueError(
-                f"batch order book response length {len(data)} does not match request {len(token_ids)}"
-            )
 
         books: dict[str, dict[str, Any]] = {}
-        for requested_token_id, raw_book in zip(token_ids, data):
+        response_is_full_length = len(data) == len(token_ids)
+        for index, raw_book in enumerate(data):
             if not isinstance(raw_book, dict):
                 raise ValueError("batch order book response contains non-object book")
-            token_id = _book_token_id(raw_book) or requested_token_id
+            token_id = _book_token_id(raw_book)
+            if token_id is None:
+                if not response_is_full_length:
+                    raise ValueError("partial batch order book response contains row without token id")
+                token_id = token_ids[index]
             books[str(token_id)] = raw_book
         return books
 
@@ -246,19 +247,31 @@ class GammaClobClient:
                 current_batch_started_at_utc=batch_started_at_utc,
             )
             received_at = datetime.now(timezone.utc)
+            batch_exc: Exception | None = None
+            fallback_tokens: list[str] = []
             try:
                 raw_books = self.fetch_order_books_batch(chunk)
                 for token_id in chunk:
-                    raw_book = raw_books[token_id]
-                    ask_books[token_id] = asks_from_book(
-                        raw_book,
-                        token_id=token_id,
-                        source="rest_books_batch",
-                        updated_at=received_at,
-                    )
-            except Exception as batch_exc:
+                    raw_book = raw_books.get(token_id)
+                    if raw_book is None:
+                        fallback_tokens.append(token_id)
+                        continue
+                    try:
+                        ask_books[token_id] = asks_from_book(
+                            raw_book,
+                            token_id=token_id,
+                            source="rest_books_batch",
+                            updated_at=received_at,
+                        )
+                    except Exception:
+                        fallback_tokens.append(token_id)
+            except Exception as exc:
+                batch_exc = exc
+                fallback_tokens = list(chunk)
+
+            if fallback_tokens:
                 fallback_failures: dict[str, Exception] = {}
-                for token_id in chunk:
+                for token_id in fallback_tokens:
                     try:
                         raw_book = self.fetch_order_book(token_id)
                     except Exception as exc:
@@ -285,7 +298,7 @@ class GammaClobClient:
                     current_batch_status="complete",
                     current_batch_started_at_utc=batch_started_at_utc,
                 )
-                if len(fallback_failures) == len(chunk):
+                if batch_exc is not None and len(fallback_failures) == len(chunk):
                     raise RuntimeError(
                         f"failed to fetch order books for all {len(chunk)} tokens after batch failure"
                     ) from batch_exc
