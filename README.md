@@ -54,6 +54,8 @@ uv run poly-cond-arb reset --yes
 
 The runner is paper-only. It never places orders, uses API credentials, reads wallet secrets, signs transactions, or calls merge/redeem contracts.
 
+Paper sizing mirrors Polymarket's API order-size floor: each simulated YES and NO order must be at least 5 outcome shares. If market metadata advertises a stricter minimum, that higher per-market minimum takes precedence.
+
 REST polling retries market-universe and order-book fetches with capped exponential backoff before portfolio evaluation starts. Once paper execution begins, the cycle is not retried as a unit, so a post-execution logging or completion failure cannot replay the same trade. In WebSocket mode, startup cache rebuilds, REST book seeding, market refreshes, and WebSocket manager startup use the same finite recovery policy. Each retry is logged with the operation, attempt, error, and backoff seconds; after recovery, the successful fetch or bootstrap summary is logged.
 
 Startup is gated on a fresh full-universe cache. The runner uses `data/market_universe_cache.json` immediately only when it is fresh under `COND_ARB_UNIVERSE_CACHE_MAX_AGE_SECONDS` and was built from full Gamma active-event pagination. If the cache is missing, stale, corrupt, or not a full-discovery cache, the runner enters `WARMUP`, fetches the full active universe, writes a new full cache, seeds REST ask books for every startup token, starts WebSocket subscriptions, and only then runs the first paper evaluation.

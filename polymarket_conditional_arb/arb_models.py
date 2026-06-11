@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 BookSideName = Literal["bid", "ask"]
 OpportunityKind = Literal["binary_complete_set", "neg_risk_event_set"]
+POLYMARKET_MIN_API_ORDER_SIZE_SHARES = 5.0
 
 
 def json_list(value: Any) -> list[Any]:
@@ -129,6 +130,10 @@ class BinaryMarket:
             and len({self.yes_token_id, self.no_token_id}) == 2
         )
 
+    @property
+    def effective_min_order_size(self) -> float:
+        return max(POLYMARKET_MIN_API_ORDER_SIZE_SHARES, as_float(self.min_order_size) or 0.0)
+
     @classmethod
     def from_gamma_market(cls, market: dict[str, Any]) -> "BinaryMarket | None":
         mapped = outcome_token_map_from_market(market)
@@ -144,7 +149,7 @@ class BinaryMarket:
             return None
 
         tick_size = as_float(market.get("orderPriceMinTickSize") or market.get("tickSize"))
-        min_order_size = as_float(market.get("orderMinSize") or market.get("minOrderSize"))
+        min_order_size = as_float(first_present(market, "orderMinSize", "minOrderSize"))
         event_neg_risk = as_bool(market.get("_event_neg_risk"), default=False)
         market_neg_risk = first_present(market, "negRisk", "neg_risk")
         metadata = {

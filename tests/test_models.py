@@ -34,6 +34,22 @@ def test_binary_market_parses_yes_no_tokens_and_event_context():
     assert market.is_tradable is True
 
 
+def test_binary_market_effective_min_order_size_applies_polymarket_floor():
+    missing = BinaryMarket.from_gamma_market(raw_market())
+    below = BinaryMarket.from_gamma_market(raw_market(orderMinSize="1.25"))
+    above = BinaryMarket.from_gamma_market(raw_market(orderMinSize="7.5"))
+
+    assert missing is not None
+    assert below is not None
+    assert above is not None
+    assert missing.min_order_size is None
+    assert missing.effective_min_order_size == 5.0
+    assert below.min_order_size == 1.25
+    assert below.effective_min_order_size == 5.0
+    assert above.min_order_size == 7.5
+    assert above.effective_min_order_size == 7.5
+
+
 def test_binary_market_rejects_missing_or_duplicate_yes_no_mapping():
     assert BinaryMarket.from_gamma_market(raw_market(outcomes='["Up", "Down"]')) is None
     assert (

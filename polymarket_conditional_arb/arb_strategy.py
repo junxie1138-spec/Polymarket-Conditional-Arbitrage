@@ -249,7 +249,7 @@ def evaluate_binary_arbitrage(
     if max_gross_cost <= EPSILON:
         return ArbDecision.skip("invalid_capital_cap", market_id=market.market_id)
 
-    min_quantity = max(float(market.min_order_size or 0.0), 0.0)
+    min_quantity = market.effective_min_order_size
     candidates = _paired_depth_candidates(yes_asks, no_asks, max_gross_cost=max_gross_cost)
     if not candidates:
         return ArbDecision.skip("insufficient_depth", market_id=market.market_id)

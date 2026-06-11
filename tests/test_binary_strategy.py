@@ -100,6 +100,21 @@ def test_unprofitable_market_is_rejected():
     assert decision.reason == "not_profitable"
 
 
+def test_polymarket_minimum_order_size_rejects_sub_five_share_depth():
+    decision = evaluate_binary_arbitrage(
+        market(),
+        asks("yes-token", [(0.48, 4.9)]),
+        asks("no-token", [(0.49, 4.9)]),
+        as_of=AS_OF,
+        params=params(min_net_profit_usd=0.0, min_net_return_bps=0.0),
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "insufficient_depth"
+    assert decision.details["available_equal_depth"] == pytest.approx(4.9)
+    assert decision.details["min_quantity"] == 5.0
+
+
 def test_stale_book_is_rejected():
     decision = evaluate_binary_arbitrage(
         market(),

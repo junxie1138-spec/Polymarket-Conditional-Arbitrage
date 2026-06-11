@@ -119,6 +119,23 @@ def test_paired_execution_respects_trade_ceiling_and_cash():
     assert cash_limited.execution["capital_used"] == pytest.approx(5.0)
 
 
+def test_paper_execution_rejects_profitable_depth_below_polymarket_api_minimum():
+    p = params()
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 4.9)]),
+        asks("no-token", [(0.49, 4.9)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "insufficient_depth"
+    assert decision.details["available_equal_depth"] == pytest.approx(4.9)
+    assert decision.details["min_quantity"] == 5.0
+
+
 def test_costs_are_applied_before_profitability_decision():
     costly = params(slippage_buffer_bps=200.0)
     edge_lost = evaluate_binary_paper_execution(
@@ -133,11 +150,11 @@ def test_costs_are_applied_before_profitability_decision():
     assert edge_lost.action == "SKIP"
     assert edge_lost.reason == "edge_disappeared"
 
-    fixed_cost = params(merge_cost_usd=0.05)
+    fixed_cost = params(merge_cost_usd=1.0)
     too_small = evaluate_binary_paper_execution(
         market(),
-        asks("yes-token", [(0.48, 1)]),
-        asks("no-token", [(0.49, 1)]),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
         state=state_for(fixed_cost),
         params=fixed_cost,
         as_of=AS_OF,

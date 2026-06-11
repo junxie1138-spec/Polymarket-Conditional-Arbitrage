@@ -392,7 +392,7 @@ def evaluate_binary_paper_execution(
             book_fingerprint=fingerprint,
         )
 
-    min_quantity = max(_as_float(market.min_order_size), 0.0)
+    min_quantity = market.effective_min_order_size
     if quantity <= EPSILON:
         return PaperPortfolioDecision.skip(
             stop_reason,
