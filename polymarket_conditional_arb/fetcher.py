@@ -22,6 +22,27 @@ def _book_token_id(book: dict[str, Any]) -> str | None:
     return None
 
 
+def _emit_ask_book_progress(
+    on_progress: Callable[[dict[str, Any]], None] | None,
+    *,
+    total_tokens: int,
+    completed_tokens: int,
+    received_books: int,
+    failed_tokens: int,
+) -> None:
+    if on_progress is None:
+        return
+    on_progress(
+        {
+            "total_tokens": total_tokens,
+            "completed_tokens": completed_tokens,
+            "remaining_tokens": max(0, total_tokens - completed_tokens),
+            "received_books": received_books,
+            "failed_tokens": failed_tokens,
+        }
+    )
+
+
 class GammaClobClient:
     def __init__(
         self,
@@ -177,9 +198,17 @@ class GammaClobClient:
             books[str(token_id)] = raw_book
         return books
 
-    def fetch_ask_books(self, token_ids: Iterable[str]) -> dict[str, Any]:
+    def fetch_ask_books(
+        self,
+        token_ids: Iterable[str],
+        *,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         unique_token_ids = list(dict.fromkeys(str(token_id) for token_id in token_ids if token_id))
         ask_books: dict[str, Any] = {}
+        completed_tokens = 0
+        failed_tokens = 0
+        total_tokens = len(unique_token_ids)
         for chunk in _chunked(unique_token_ids, self.batch_book_limit):
             received_at = datetime.now(timezone.utc)
             try:
@@ -206,8 +235,26 @@ class GammaClobClient:
                         source="rest_book_fallback",
                         updated_at=datetime.now(timezone.utc),
                     )
+                failed_tokens += len(fallback_failures)
+                completed_tokens += len(chunk)
+                _emit_ask_book_progress(
+                    on_progress,
+                    total_tokens=total_tokens,
+                    completed_tokens=completed_tokens,
+                    received_books=len(ask_books),
+                    failed_tokens=failed_tokens,
+                )
                 if len(fallback_failures) == len(chunk):
                     raise RuntimeError(
                         f"failed to fetch order books for all {len(chunk)} tokens after batch failure"
                     ) from batch_exc
+                continue
+            completed_tokens += len(chunk)
+            _emit_ask_book_progress(
+                on_progress,
+                total_tokens=total_tokens,
+                completed_tokens=completed_tokens,
+                received_books=len(ask_books),
+                failed_tokens=failed_tokens,
+            )
         return ask_books

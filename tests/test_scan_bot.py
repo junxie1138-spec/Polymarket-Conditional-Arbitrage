@@ -72,7 +72,18 @@ class FakeClient:
         return GammaClobClient.tradable_binary_markets(markets)
 
     @staticmethod
-    def fetch_ask_books(_token_ids):
+    def fetch_ask_books(_token_ids, *, on_progress=None):
+        token_ids = list(_token_ids)
+        if on_progress is not None:
+            on_progress(
+                {
+                    "total_tokens": len(token_ids),
+                    "completed_tokens": len(token_ids),
+                    "remaining_tokens": 0,
+                    "received_books": len(token_ids),
+                    "failed_tokens": 0,
+                }
+            )
         return {
             "yes-token": asks_from_book(
                 {"asks": [{"price": "0.48", "size": "10"}]},
@@ -127,8 +138,19 @@ class TwoMarketClient:
     def tradable_binary_markets(markets):
         return GammaClobClient.tradable_binary_markets(markets)
 
-    def fetch_ask_books(self, token_ids):
+    def fetch_ask_books(self, token_ids, *, on_progress=None):
+        token_ids = list(token_ids)
         self.fetch_ask_books_calls += 1
+        if on_progress is not None:
+            on_progress(
+                {
+                    "total_tokens": len(token_ids),
+                    "completed_tokens": len(token_ids),
+                    "remaining_tokens": 0,
+                    "received_books": len(token_ids),
+                    "failed_tokens": 0,
+                }
+            )
         return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
 
 
@@ -175,8 +197,19 @@ class RecordingDiscoveryClient:
     def tradable_binary_markets(markets):
         return GammaClobClient.tradable_binary_markets(markets)
 
-    def fetch_ask_books(self, token_ids):
+    def fetch_ask_books(self, token_ids, *, on_progress=None):
+        token_ids = list(token_ids)
         self.fetch_ask_books_calls += 1
+        if on_progress is not None:
+            on_progress(
+                {
+                    "total_tokens": len(token_ids),
+                    "completed_tokens": len(token_ids),
+                    "remaining_tokens": 0,
+                    "received_books": len(token_ids),
+                    "failed_tokens": 0,
+                }
+            )
         return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
 
 
@@ -206,11 +239,22 @@ class FlakyBookClient(TwoMarketClient):
         super().__init__()
         self.failures = failures
 
-    def fetch_ask_books(self, token_ids):
+    def fetch_ask_books(self, token_ids, *, on_progress=None):
+        token_ids = list(token_ids)
         self.fetch_ask_books_calls += 1
         if self.failures > 0:
             self.failures -= 1
             raise RuntimeError("books unavailable")
+        if on_progress is not None:
+            on_progress(
+                {
+                    "total_tokens": len(token_ids),
+                    "completed_tokens": len(token_ids),
+                    "remaining_tokens": 0,
+                    "received_books": len(token_ids),
+                    "failed_tokens": 0,
+                }
+            )
         return profitable_books(token_ids, updated_at=datetime.now(timezone.utc))
 
 
@@ -644,6 +688,15 @@ def test_runtime_status_records_online_after_startup_evaluation(tmp_path):
     assert runtime["phase"] == "online"
     assert runtime["status"] == "ONLINE"
     assert runtime["detail"] == "online"
+    assert runtime["warmup_started_at_utc"] is not None
+    assert runtime["warmup_completed_at_utc"] is not None
+    assert runtime["book_seed_reason"] == "rest_bootstrap"
+    assert runtime["book_seed_total_tokens"] == 4
+    assert runtime["book_seed_completed_tokens"] == 4
+    assert runtime["book_seed_remaining_tokens"] == 0
+    assert runtime["book_seed_received_books"] == 4
+    assert runtime["book_seed_failed_tokens"] == 0
+    assert runtime["book_seed_eta_seconds"] == 0.0
     assert runtime["last_evaluation_reason"] == "rest_bootstrap"
     assert runtime["last_cycle_completed_at_utc"] is not None
     assert runtime["last_cycle_evaluated_markets"] == 2
@@ -730,6 +783,46 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     assert "Last cycle: reason=ws_bootstrap; completed=2026-06-10T12:00:00Z; evaluated=2; executions=1; skips=1" in online
     assert warmup.splitlines()[:2] == ["Paper Portfolio Status", "Current: WARMUP"]
     assert dead.splitlines()[:2] == ["Paper Portfolio Status", "Current: DEAD"]
+
+
+def test_status_dashboard_formats_warmup_progress_eta():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "warmup_started_at_utc": utc_iso(now - timedelta(seconds=600)),
+        "phase": "warmup",
+        "detail": "seeding REST ask books: ws_bootstrap (250/1000 tokens)",
+        "book_seed_reason": "ws_bootstrap",
+        "book_seed_total_tokens": 1000,
+        "book_seed_completed_tokens": 250,
+        "book_seed_remaining_tokens": 750,
+        "book_seed_received_books": 240,
+        "book_seed_failed_tokens": 10,
+        "book_seed_rate_tokens_per_second": 50.0,
+        "book_seed_eta_seconds": 15.0,
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert (
+        "Warmup progress: elapsed=10.0m; "
+        "book_seed=ws_bootstrap 250/1,000 tokens (25.0%); "
+        "remaining=750; received_books=240; failed=10; rate=50.0 tokens/s; ETA=15.0s"
+    ) in dashboard
 
 
 def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):

@@ -23,6 +23,11 @@ data/pnl_history.json
 data/live_events.jsonl
 data/market_snapshots.jsonl
 data/forecast_snapshots.jsonl
+data/paper_portfolio_instance.json
+data/paper_portfolio_events.jsonl
+data/paper_portfolio_runtime.json
+data/paper_portfolio_instance.json.lock
+data/market_universe_cache.json
 data/test_*.json
 data/test_*.jsonl
 data/*.tmp

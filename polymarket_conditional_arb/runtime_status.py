@@ -62,6 +62,30 @@ def _format_money(value: Any) -> str:
     return f"${amount:,.2f}"
 
 
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, int(default))
+
+
+def _float_value(value: Any) -> float | None:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_count(value: int) -> str:
+    return f"{max(0, int(value)):,}"
+
+
+def _format_rate(value: float | None) -> str:
+    if value is None or value <= 0.0:
+        return "n/a"
+    return f"{value:,.1f} tokens/s"
+
+
 def _read_json_object(path: Path) -> dict[str, Any] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -145,6 +169,18 @@ class RuntimeStatusWriter:
             "status": "WARMUP",
             "detail": "starting",
             "mode": self.mode,
+            "warmup_started_at_utc": None,
+            "warmup_completed_at_utc": None,
+            "book_seed_reason": None,
+            "book_seed_started_at_utc": None,
+            "book_seed_total_tokens": 0,
+            "book_seed_completed_tokens": 0,
+            "book_seed_remaining_tokens": 0,
+            "book_seed_received_books": 0,
+            "book_seed_failed_tokens": 0,
+            "book_seed_elapsed_seconds": None,
+            "book_seed_rate_tokens_per_second": None,
+            "book_seed_eta_seconds": None,
             "events_fetched": 0,
             "raw_markets": 0,
             "tradable_markets": 0,
@@ -182,6 +218,7 @@ class RuntimeStatusWriter:
     def update(self, *, force: bool = False, **fields: Any) -> None:
         _ = force
         with self._lock:
+            heartbeat_at_utc = utc_iso()
             phase = fields.get("phase")
             if phase is not None and phase not in RUNTIME_PHASES:
                 raise ValueError(f"unsupported runtime phase: {phase!r}")
@@ -192,8 +229,16 @@ class RuntimeStatusWriter:
                 fields["status"] = status
             elif phase is not None:
                 fields["status"] = _status_from_phase(phase)
+            if phase == "warmup" and not self._payload.get("warmup_started_at_utc"):
+                self._payload["warmup_started_at_utc"] = heartbeat_at_utc
+            if (
+                phase in {"online", "stopping"}
+                and self._payload.get("warmup_started_at_utc")
+                and not self._payload.get("warmup_completed_at_utc")
+            ):
+                self._payload["warmup_completed_at_utc"] = heartbeat_at_utc
             self._payload.update(fields)
-            self._payload["heartbeat_at_utc"] = utc_iso()
+            self._payload["heartbeat_at_utc"] = heartbeat_at_utc
             self._write_locked()
 
     def heartbeat(self, **fields: Any) -> None:
@@ -290,6 +335,54 @@ def _format_heartbeat_line(
     return f"Heartbeat: {_format_age(heartbeat_age)} ago; phase={phase}; {detail}"
 
 
+def _format_warmup_progress_line(
+    *,
+    runtime_row: Mapping[str, Any],
+    current_time: datetime,
+) -> str | None:
+    phase = runtime_row.get("phase")
+    detail = str(runtime_row.get("detail") or "")
+    seeding_active = detail.startswith("seeding REST ask books") or detail.startswith("REST ask books seeded")
+    if phase != "warmup" and not seeding_active:
+        return None
+
+    total_tokens = _int_value(runtime_row.get("book_seed_total_tokens"))
+    completed_tokens = min(total_tokens, _int_value(runtime_row.get("book_seed_completed_tokens")))
+    warmup_started_at = runtime_row.get("warmup_started_at_utc") or runtime_row.get("started_at_utc")
+    warmup_elapsed = _seconds_since(warmup_started_at, now=current_time)
+    parts: list[str] = []
+    if warmup_elapsed is not None and phase == "warmup":
+        parts.append(f"elapsed={_format_age(warmup_elapsed)}")
+    if total_tokens > 0:
+        remaining_tokens = _int_value(
+            runtime_row.get("book_seed_remaining_tokens"),
+            total_tokens - completed_tokens,
+        )
+        received_books = _int_value(runtime_row.get("book_seed_received_books"))
+        failed_tokens = _int_value(runtime_row.get("book_seed_failed_tokens"))
+        percent = (completed_tokens / total_tokens) * 100.0
+        reason = runtime_row.get("book_seed_reason") or "n/a"
+        eta_seconds = _float_value(runtime_row.get("book_seed_eta_seconds"))
+        rate = _float_value(runtime_row.get("book_seed_rate_tokens_per_second"))
+        parts.extend(
+            [
+                (
+                    f"book_seed={reason} {_format_count(completed_tokens)}/"
+                    f"{_format_count(total_tokens)} tokens ({percent:.1f}%)"
+                ),
+                f"remaining={_format_count(remaining_tokens)}",
+                f"received_books={_format_count(received_books)}",
+                f"failed={_format_count(failed_tokens)}",
+                f"rate={_format_rate(rate)}",
+                f"ETA={_format_age(eta_seconds)}",
+            ]
+        )
+    if not parts:
+        return None
+    prefix = "Warmup progress" if phase == "warmup" else "Book seed progress"
+    return f"{prefix}: " + "; ".join(parts)
+
+
 def format_status_dashboard(
     *,
     runtime: Mapping[str, Any] | None,
@@ -313,6 +406,10 @@ def format_status_dashboard(
         live_status=live_status,
         heartbeat_age=heartbeat_age,
     )
+    warmup_progress_line = _format_warmup_progress_line(
+        runtime_row=runtime_row,
+        current_time=current_time,
+    )
 
     lines = [
         "Paper Portfolio Status",
@@ -329,38 +426,44 @@ def format_status_dashboard(
             f"tradable={runtime_row.get('tradable_markets', 0)} "
             f"tokens={runtime_row.get('tokens', 0)}"
         ),
-        f"Cache path: {runtime_row.get('cache_path') or 'unknown'}",
-        (
-            "Portfolio: "
-            f"cash {_format_money(portfolio.get('cash'))}; "
-            f"equity {_format_money(portfolio.get('total_equity'))}; "
-            f"realized PnL {_format_money(portfolio.get('realized_pnl'))}; "
-            f"return {float(portfolio.get('return_pct') or 0.0):.2f}%"
-        ),
-        (
-            "Trades: "
-            f"{portfolio.get('trade_count', 0)}; "
-            f"win rate {float(portfolio.get('win_rate_pct') or 0.0):.2f}%; "
-            f"last execution {portfolio.get('last_execution_at_utc') or 'never'}"
-        ),
-        (
-            "Costs: "
-            f"fees {_format_money(costs.get('fees_usd') if isinstance(costs, Mapping) else 0.0)}, "
-            f"slippage {_format_money(costs.get('slippage_usd') if isinstance(costs, Mapping) else 0.0)}, "
-            f"tax {_format_money(costs.get('tax_usd') if isinstance(costs, Mapping) else 0.0)}, "
-            f"merge {_format_money(costs.get('merge_usd') if isinstance(costs, Mapping) else 0.0)}"
-        ),
-        f"Unmatched inventory: {unmatched_text}",
-        (
-            "Last cycle: "
-            f"reason={runtime_row.get('last_evaluation_reason') or 'n/a'}; "
-            f"completed={runtime_row.get('last_cycle_completed_at_utc') or 'never'}; "
-            f"evaluated={runtime_row.get('last_cycle_evaluated_markets', 0)}; "
-            f"executions={runtime_row.get('last_cycle_executions', 0)}; "
-            f"skips={skip_count}"
-        ),
-        f"Last error: {runtime_row.get('last_error') or 'none'}",
     ]
+    if warmup_progress_line is not None:
+        lines.append(warmup_progress_line)
+    lines.extend(
+        [
+            f"Cache path: {runtime_row.get('cache_path') or 'unknown'}",
+            (
+                "Portfolio: "
+                f"cash {_format_money(portfolio.get('cash'))}; "
+                f"equity {_format_money(portfolio.get('total_equity'))}; "
+                f"realized PnL {_format_money(portfolio.get('realized_pnl'))}; "
+                f"return {float(portfolio.get('return_pct') or 0.0):.2f}%"
+            ),
+            (
+                "Trades: "
+                f"{portfolio.get('trade_count', 0)}; "
+                f"win rate {float(portfolio.get('win_rate_pct') or 0.0):.2f}%; "
+                f"last execution {portfolio.get('last_execution_at_utc') or 'never'}"
+            ),
+            (
+                "Costs: "
+                f"fees {_format_money(costs.get('fees_usd') if isinstance(costs, Mapping) else 0.0)}, "
+                f"slippage {_format_money(costs.get('slippage_usd') if isinstance(costs, Mapping) else 0.0)}, "
+                f"tax {_format_money(costs.get('tax_usd') if isinstance(costs, Mapping) else 0.0)}, "
+                f"merge {_format_money(costs.get('merge_usd') if isinstance(costs, Mapping) else 0.0)}"
+            ),
+            f"Unmatched inventory: {unmatched_text}",
+            (
+                "Last cycle: "
+                f"reason={runtime_row.get('last_evaluation_reason') or 'n/a'}; "
+                f"completed={runtime_row.get('last_cycle_completed_at_utc') or 'never'}; "
+                f"evaluated={runtime_row.get('last_cycle_evaluated_markets', 0)}; "
+                f"executions={runtime_row.get('last_cycle_executions', 0)}; "
+                f"skips={skip_count}"
+            ),
+            f"Last error: {runtime_row.get('last_error') or 'none'}",
+        ]
+    )
     if show_log:
         lines.extend(["", "Status Log"])
         entries = _runtime_status_entries(runtime_row)

@@ -87,6 +87,13 @@ def _token_ids_for_markets(markets: list[BinaryMarket]) -> list[str]:
     return token_ids
 
 
+def _progress_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, int(default))
+
+
 def _cap_markets_by_token_limit(markets: list[BinaryMarket], token_limit: int | None) -> list[BinaryMarket]:
     if token_limit is None:
         return list(markets)
@@ -217,6 +224,50 @@ class ConditionalArbScanner:
 
     def _runtime_error(self, exc: Exception) -> None:
         self._runtime_update(last_error=f"{type(exc).__name__}: {exc}")
+
+    def _book_seed_progress_callback(
+        self,
+        *,
+        reason: str,
+        total_tokens: int,
+    ) -> Callable[[Mapping[str, Any]], None]:
+        started_at = datetime.now(timezone.utc)
+        started_at_utc = utc_iso(started_at)
+        total = _progress_int(total_tokens)
+
+        def update(progress: Mapping[str, Any]) -> None:
+            progress_total = _progress_int(progress.get("total_tokens"), total)
+            completed = min(progress_total, _progress_int(progress.get("completed_tokens")))
+            remaining = _progress_int(progress.get("remaining_tokens"), progress_total - completed)
+            received_books = _progress_int(progress.get("received_books"))
+            failed_tokens = _progress_int(progress.get("failed_tokens"))
+            elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+            rate = completed / elapsed_seconds if completed > 0 and elapsed_seconds > 0 else None
+            eta = remaining / rate if rate and remaining > 0 else (0.0 if remaining == 0 else None)
+            self._runtime_update(
+                detail=f"seeding REST ask books: {reason} ({completed}/{progress_total} tokens)",
+                book_seed_reason=reason,
+                book_seed_started_at_utc=started_at_utc,
+                book_seed_total_tokens=progress_total,
+                book_seed_completed_tokens=completed,
+                book_seed_remaining_tokens=remaining,
+                book_seed_received_books=received_books,
+                book_seed_failed_tokens=failed_tokens,
+                book_seed_elapsed_seconds=elapsed_seconds,
+                book_seed_rate_tokens_per_second=rate,
+                book_seed_eta_seconds=eta,
+            )
+
+        update(
+            {
+                "total_tokens": total,
+                "completed_tokens": 0,
+                "remaining_tokens": total,
+                "received_books": 0,
+                "failed_tokens": 0,
+            }
+        )
+        return update
 
     def _run_with_retries(
         self,
@@ -373,7 +424,7 @@ class ConditionalArbScanner:
 
     def _run_startup_rest_cycle(self) -> dict[str, Any]:
         universe = self._fetch_startup_market_universe_with_retry_sync()
-        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids)
+        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids, reason="rest_bootstrap")
         result = self._evaluate_universe(
             universe,
             books_by_token,
@@ -539,8 +590,16 @@ class ConditionalArbScanner:
         if not token_ids:
             return set()
         self._runtime_update(detail=f"seeding REST ask books: {reason}", tokens=len(token_ids))
-        books = await asyncio.to_thread(self.client.fetch_ask_books, token_ids)
+        progress = self._book_seed_progress_callback(reason=reason, total_tokens=len(token_ids))
+        books = await asyncio.to_thread(self.client.fetch_ask_books, token_ids, on_progress=progress)
         updated = cache.seed_ask_books(books)
+        self._runtime_update(
+            detail=f"REST ask books seeded: {reason}",
+            book_seed_completed_tokens=len(token_ids),
+            book_seed_remaining_tokens=0,
+            book_seed_received_books=len(books),
+            book_seed_eta_seconds=0.0,
+        )
         self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(updated))
         return updated
 
@@ -621,7 +680,7 @@ class ConditionalArbScanner:
     def run_one_cycle(self) -> dict[str, Any]:
         self._runtime_update(detail="running REST cycle")
         universe = self._fetch_market_universe_with_retry_sync()
-        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids)
+        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids, reason="rest_cycle")
         result = self._evaluate_universe(
             universe,
             books_by_token,
@@ -657,10 +716,27 @@ class ConditionalArbScanner:
             summary=self._universe_retry_summary,
         )
 
-    def _fetch_ask_books_with_retry(self, token_ids: list[str]) -> Mapping[str, OrderBookSide]:
+    def _fetch_ask_books_with_retry(
+        self,
+        token_ids: list[str],
+        *,
+        reason: str,
+    ) -> Mapping[str, OrderBookSide]:
+        def fetch_books() -> Mapping[str, OrderBookSide]:
+            progress = self._book_seed_progress_callback(reason=reason, total_tokens=len(token_ids))
+            books = self.client.fetch_ask_books(token_ids, on_progress=progress)
+            self._runtime_update(
+                detail=f"REST ask books seeded: {reason}",
+                book_seed_completed_tokens=len(token_ids),
+                book_seed_remaining_tokens=0,
+                book_seed_received_books=len(books),
+                book_seed_eta_seconds=0.0,
+            )
+            return books
+
         return self._run_with_retries(
             "rest_book_fetch",
-            lambda: self.client.fetch_ask_books(token_ids),
+            fetch_books,
             summary=lambda books: {"tokens": len(books)},
         )
 

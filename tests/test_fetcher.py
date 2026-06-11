@@ -137,6 +137,46 @@ def test_fetch_ask_books_uses_batch_books_successfully():
     assert books["token-a"].best_price == 0.41
 
 
+def test_fetch_ask_books_reports_batch_progress():
+    session = Session(
+        post_responses=[
+            Response(
+                [
+                    {"asset_id": "token-a", "asks": [{"price": "0.41", "size": "5"}]},
+                    {"asset_id": "token-b", "asks": [{"price": "0.42", "size": "6"}]},
+                ]
+            ),
+            Response(
+                [
+                    {"asset_id": "token-c", "asks": [{"price": "0.43", "size": "7"}]},
+                ]
+            ),
+        ]
+    )
+    client = GammaClobClient(session=session, clob_host="https://clob.example", batch_book_limit=2)
+    progress = []
+
+    books = client.fetch_ask_books(["token-a", "token-b", "token-c"], on_progress=progress.append)
+
+    assert sorted(books) == ["token-a", "token-b", "token-c"]
+    assert progress == [
+        {
+            "total_tokens": 3,
+            "completed_tokens": 2,
+            "remaining_tokens": 1,
+            "received_books": 2,
+            "failed_tokens": 0,
+        },
+        {
+            "total_tokens": 3,
+            "completed_tokens": 3,
+            "remaining_tokens": 0,
+            "received_books": 3,
+            "failed_tokens": 0,
+        },
+    ]
+
+
 def test_fetch_ask_books_falls_back_to_single_book_on_malformed_batch_response():
     session = Session(
         post_responses=[Response({"bad": "shape"})],
