@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import socket
@@ -12,10 +13,40 @@ from .event_log import utc_iso
 
 LOCK_UNLINK_ATTEMPTS = 8
 LOCK_UNLINK_BACKOFF_SECONDS = 0.01
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
+ERROR_INVALID_PARAMETER = 87
 
 
 class PortfolioLockError(RuntimeError):
     pass
+
+
+def _win32_process_is_alive(pid: int) -> bool:
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError):
+        return True
+
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+    if not handle:
+        error = ctypes.get_last_error()
+        return False if error == ERROR_INVALID_PARAMETER else True
+
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 class PortfolioDataLock:
@@ -123,8 +154,12 @@ class PortfolioDataLock:
 
     @staticmethod
     def _process_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
         if pid == os.getpid():
             return True
+        if os.name == "nt":
+            return _win32_process_is_alive(pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

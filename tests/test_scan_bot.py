@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from polymarket_conditional_arb import config, runtime_status
+from polymarket_conditional_arb import config, portfolio_lock, runtime_status
 from polymarket_conditional_arb.event_log import utc_iso
 from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
@@ -672,6 +672,22 @@ def test_status_state_derives_online_warmup_and_dead(monkeypatch):
     assert derive_runtime_state(runtime, now=now) == "DEAD"
 
 
+def test_process_liveness_uses_win32_probe_on_windows(monkeypatch):
+    pid = os.getpid() + 100_000
+    kill_calls = []
+
+    def fail_os_kill(checked_pid, signal):
+        kill_calls.append((checked_pid, signal))
+        raise OSError(87, "parameter incorrect")
+
+    monkeypatch.setattr(portfolio_lock.os, "name", "nt")
+    monkeypatch.setattr(portfolio_lock.os, "kill", fail_os_kill)
+    monkeypatch.setattr(portfolio_lock, "_win32_process_is_alive", lambda checked_pid: checked_pid == pid)
+
+    assert PortfolioDataLock._process_is_alive(pid) is True
+    assert kill_calls == []
+
+
 def test_status_dashboard_formats_online_warmup_and_dead():
     now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
     runtime = {
@@ -714,6 +730,41 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     assert "Last cycle: reason=ws_bootstrap; completed=2026-06-10T12:00:00Z; evaluated=2; executions=1; skips=1" in online
     assert warmup.splitlines()[:2] == ["Paper Portfolio Status", "Current: WARMUP"]
     assert dead.splitlines()[:2] == ["Paper Portfolio Status", "Current: DEAD"]
+
+
+def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    pid = os.getpid() + 100_000
+
+    def fail_os_kill(_pid, _signal):
+        raise OSError(87, "parameter incorrect")
+
+    monkeypatch.setattr(portfolio_lock.os, "name", "nt")
+    monkeypatch.setattr(portfolio_lock.os, "kill", fail_os_kill)
+    monkeypatch.setattr(portfolio_lock, "_win32_process_is_alive", lambda checked_pid: checked_pid == pid)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": pid,
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "online",
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert dashboard.splitlines()[:2] == ["Paper Portfolio Status", "Current: ONLINE"]
 
 
 def test_status_dashboard_labels_stale_runtime_phase_as_last_known():
@@ -976,6 +1027,35 @@ def test_portfolio_lock_rejects_second_active_holder(tmp_path):
             PortfolioDataLock(state_path).acquire()
     finally:
         first.release()
+
+
+def test_portfolio_lock_keeps_win32_alive_same_host_lock(tmp_path, monkeypatch):
+    state_path = tmp_path / "paper_portfolio_instance.json"
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    pid = os.getpid() + 100_000
+
+    def fail_os_kill(_pid, _signal):
+        raise OSError(87, "parameter incorrect")
+
+    lock_path.write_text(
+        json.dumps(
+            {
+                "host": socket.gethostname(),
+                "pid": pid,
+                "token": "active",
+                "created_at_utc": "2026-06-08T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(portfolio_lock.os, "name", "nt")
+    monkeypatch.setattr(portfolio_lock.os, "kill", fail_os_kill)
+    monkeypatch.setattr(portfolio_lock, "_win32_process_is_alive", lambda checked_pid: checked_pid == pid)
+
+    with pytest.raises(PortfolioLockError, match="paper portfolio data is locked"):
+        PortfolioDataLock(state_path).acquire()
+
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "active"
 
 
 def test_portfolio_lock_repeated_contention_retries_transient_unlink_failures(tmp_path, monkeypatch):
