@@ -72,6 +72,8 @@ The WebSocket cache evaluates price-change deltas only after a current snapshot 
 
 ## Outputs
 
+The files below are generated local operational state and are ignored by Git. Treat them as the active paper instance; use `uv run poly-cond-arb reset --yes` to intentionally reset the simulated portfolio instead of deleting runtime files during normal operation.
+
 - `logs/conditional_arb_scan.log`: human-readable portfolio runner log.
 - `data/paper_portfolio_instance.json`: current cash, equity, realized PnL, costs, executions, inventory, book fingerprints, and metadata.
 - `data/paper_portfolio_events.jsonl`: append-only portfolio lifecycle, cycle, and execution events.
