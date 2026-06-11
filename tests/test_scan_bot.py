@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from polymarket_conditional_arb import config
+from polymarket_conditional_arb import config, runtime_status
 from polymarket_conditional_arb.event_log import utc_iso
 from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
@@ -716,6 +716,35 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     assert dead.splitlines()[:2] == ["Paper Portfolio Status", "Current: DEAD"]
 
 
+def test_status_dashboard_labels_stale_runtime_phase_as_last_known():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now - timedelta(seconds=16)),
+        "phase": "warmup",
+        "detail": "warming cache",
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert dashboard.splitlines()[:2] == ["Paper Portfolio Status", "Current: DEAD"]
+    assert "Heartbeat: 16.0s ago (stale); last-known phase=warmup; last-known detail=warming cache" in dashboard
+    assert "Heartbeat: 16.0s ago; phase=warmup; warming cache" not in dashboard
+
+
 def test_status_dashboard_uses_one_live_status_value_and_hides_history_by_default():
     now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
     portfolio_status = {
@@ -784,6 +813,40 @@ def test_status_watch_loop_can_be_bounded():
     assert rendered == ["\x1b[2J\x1b[Hsnapshot", "\x1b[2J\x1b[Hsnapshot"]
     assert all(frame.count("snapshot") == 1 for frame in rendered)
     assert sleeps == [0.2]
+
+
+def test_status_watch_windows_live_terminal_uses_cls_without_ansi(monkeypatch):
+    class FakeStdout:
+        def __init__(self):
+            self.frames: list[str] = []
+            self.flushed = 0
+
+        def write(self, text: str) -> None:
+            self.frames.append(text)
+
+        def flush(self) -> None:
+            self.flushed += 1
+
+        @staticmethod
+        def isatty() -> bool:
+            return True
+
+    fake_stdout = FakeStdout()
+    clears: list[str] = []
+    monkeypatch.setattr(runtime_status.os, "name", "nt")
+    monkeypatch.setattr(runtime_status.sys, "stdout", fake_stdout)
+
+    run_status_watch(
+        render=lambda: "snapshot",
+        refresh_seconds=0.2,
+        sleep=lambda _seconds: None,
+        iterations=1,
+        clear_screen=clears.append,
+    )
+
+    assert clears == ["cls"]
+    assert fake_stdout.frames == ["snapshot"]
+    assert fake_stdout.flushed == 1
 
 
 def test_rest_cycle_retries_and_recovers_after_book_failure(tmp_path, caplog):

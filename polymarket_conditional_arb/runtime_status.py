@@ -17,6 +17,7 @@ from .portfolio_lock import PortfolioDataLock
 SCHEMA_VERSION = 1
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 STALE_HEARTBEAT_SECONDS = 15.0
+ANSI_CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
 RUNTIME_PHASES = {"warmup", "online", "stopping"}
 STATUS_STATES = {"WARMUP", "ONLINE", "DEAD"}
@@ -273,6 +274,22 @@ def read_runtime_and_portfolio_status(
     return runtime, portfolio_status()
 
 
+def _format_heartbeat_line(
+    *,
+    runtime_row: Mapping[str, Any],
+    live_status: str,
+    heartbeat_age: float | None,
+) -> str:
+    phase = runtime_row.get("phase") or "unknown"
+    detail = str(runtime_row.get("detail") or "no active runtime heartbeat")
+    if runtime_row and live_status == "DEAD" and heartbeat_age is not None and heartbeat_age > STALE_HEARTBEAT_SECONDS:
+        return (
+            f"Heartbeat: {_format_age(heartbeat_age)} ago (stale); "
+            f"last-known phase={phase}; last-known detail={detail}"
+        )
+    return f"Heartbeat: {_format_age(heartbeat_age)} ago; phase={phase}; {detail}"
+
+
 def format_status_dashboard(
     *,
     runtime: Mapping[str, Any] | None,
@@ -288,17 +305,21 @@ def format_status_dashboard(
     costs = portfolio.get("costs") if isinstance(portfolio.get("costs"), Mapping) else {}
     unmatched = portfolio.get("unmatched_inventory")
     unmatched_text = "none" if not unmatched else f"{len(unmatched)} positions"
-    detail = str(runtime_row.get("detail") or "no active runtime heartbeat")
     host = runtime_row.get("host") or "unknown"
     pid = runtime_row.get("pid") or "unknown"
     skip_count = runtime_row.get("last_cycle_skips", 0)
+    heartbeat_line = _format_heartbeat_line(
+        runtime_row=runtime_row,
+        live_status=live_status,
+        heartbeat_age=heartbeat_age,
+    )
 
     lines = [
         "Paper Portfolio Status",
         f"Current: {live_status}",
         f"Last refreshed: {utc_iso(current_time)}",
         f"PID/Host: {pid} on {host}",
-        f"Heartbeat: {_format_age(heartbeat_age)} ago; phase={runtime_row.get('phase') or 'unknown'}; {detail}",
+        heartbeat_line,
         (
             "Warmup/cache: "
             f"cache_fetched={runtime_row.get('cache_fetched_at_utc') or 'never'} "
@@ -350,6 +371,24 @@ def format_status_dashboard(
     return "\n".join(lines)
 
 
+def _status_watch_is_live_terminal(output: Callable[[str], None] | None) -> bool:
+    return output is None and sys.stdout.isatty()
+
+
+def _write_status_watch_frame(
+    *,
+    frame: str,
+    writer: Callable[[str], Any],
+    live_terminal: bool,
+    clear_screen: Callable[[str], Any] = os.system,
+) -> None:
+    if live_terminal and os.name == "nt":
+        clear_screen("cls")
+        writer(frame)
+        return
+    writer(ANSI_CLEAR_SCREEN + frame)
+
+
 def run_status_watch(
     *,
     render: Callable[[], str],
@@ -357,11 +396,18 @@ def run_status_watch(
     output: Callable[[str], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     iterations: int | None = None,
+    clear_screen: Callable[[str], Any] = os.system,
 ) -> None:
     writer = output or sys.stdout.write
+    live_terminal = _status_watch_is_live_terminal(output)
     count = 0
     while iterations is None or count < iterations:
-        writer("\x1b[2J\x1b[H" + render())
+        _write_status_watch_frame(
+            frame=render(),
+            writer=writer,
+            live_terminal=live_terminal,
+            clear_screen=clear_screen,
+        )
         flush = getattr(writer, "flush", None)
         if callable(flush):
             flush()
