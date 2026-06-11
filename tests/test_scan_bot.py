@@ -23,6 +23,7 @@ from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams
 from polymarket_conditional_arb.portfolio_lock import PortfolioDataLock, PortfolioLockError
 from polymarket_conditional_arb.runtime_status import (
+    RuntimeStatusWriter,
     derive_runtime_state,
     format_status_dashboard,
     run_status_watch,
@@ -703,6 +704,35 @@ def test_runtime_status_records_online_after_startup_evaluation(tmp_path):
     assert runtime["last_cycle_executions"] == 2
 
 
+def test_runtime_status_writer_retries_transient_replace_permission_error(tmp_path, monkeypatch):
+    path = tmp_path / "data" / "paper_portfolio_runtime.json"
+    writer = RuntimeStatusWriter(
+        path,
+        cache_path=tmp_path / "data" / "market_universe_cache.json",
+        write_retry_backoff_seconds=0.0,
+    )
+    path_type = type(path)
+    original_replace = path_type.replace
+    replace_calls = 0
+
+    def flaky_replace(self, target):
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            raise PermissionError("runtime file is temporarily locked")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(path_type, "replace", flaky_replace)
+
+    writer.update(detail="retry succeeded")
+
+    runtime = json.loads(path.read_text(encoding="utf-8"))
+    assert replace_calls == 2
+    assert runtime["detail"] == "retry succeeded"
+    assert runtime["runtime_status_write_failures"] == 0
+    assert writer.snapshot()["runtime_status_write_failures"] == 0
+
+
 def test_status_state_derives_online_warmup_and_dead(monkeypatch):
     now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
     runtime = {
@@ -823,6 +853,36 @@ def test_status_dashboard_formats_warmup_progress_eta():
         "book_seed=ws_bootstrap 250/1,000 tokens (25.0%); "
         "remaining=750; received_books=240; failed=10; rate=50.0 tokens/s; ETA=15.0s"
     ) in dashboard
+    assert "Runtime status writes:" not in dashboard
+
+
+def test_status_dashboard_surfaces_runtime_status_write_degradation():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "warmup",
+        "detail": "seeding REST ask books: ws_bootstrap (250/1000 tokens)",
+        "runtime_status_write_failures": 2,
+        "last_runtime_status_write_error": "PermissionError: temporarily locked",
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert "Runtime status writes: failures=2; last_error=PermissionError: temporarily locked" in dashboard
 
 
 def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):
@@ -1096,6 +1156,59 @@ def test_websocket_bootstrap_rest_seed_retries(tmp_path, caplog):
     assert updated == {"yes-1", "no-1"}
     assert "scanner_retry operation=rest_book_seed attempt=1" in caplog.text
     assert "scanner_recovered operation=rest_book_seed attempts=2" in caplog.text
+
+
+def test_websocket_bootstrap_rest_seed_ignores_runtime_progress_write_failure(tmp_path, caplog):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    client = TwoMarketClient()
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=client,
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=logging.getLogger("test_runtime_status_seed"),
+        params=params,
+        retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+    )
+    scanner.bootstrap()
+    scanner._runtime_started = True
+    scanner.runtime.write_retry_attempts = 1
+    scanner.runtime.write_retry_backoff_seconds = 0.0
+    cache = MarketDataCache()
+    original_write_once = scanner.runtime._write_once_locked
+    write_calls = 0
+
+    def flaky_write_once():
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 2:
+            raise PermissionError("runtime file is temporarily locked")
+        original_write_once()
+
+    scanner.runtime._write_once_locked = flaky_write_once
+
+    with caplog.at_level(logging.INFO, logger="test_runtime_status_seed"):
+        updated = asyncio.run(
+            scanner._seed_rest_books_with_retry(
+                cache,
+                ["yes-1", "no-1"],
+                reason="ws_bootstrap",
+            )
+        )
+
+    runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    assert client.fetch_ask_books_calls == 1
+    assert updated == {"yes-1", "no-1"}
+    assert cache.ask_books_snapshot(["yes-1", "no-1"]).keys() == {"yes-1", "no-1"}
+    assert "scanner_retry operation=rest_book_seed" not in caplog.text
+    assert "runtime_status_write_failed failures=1 error=PermissionError: runtime file is temporarily locked" in caplog.text
+    assert scanner.runtime.snapshot()["runtime_status_write_failures"] == 1
+    assert runtime["runtime_status_write_failures"] == 1
+    assert runtime["last_runtime_status_write_error"] == "PermissionError: runtime file is temporarily locked"
 
 
 def test_cli_help_smoke(capsys):

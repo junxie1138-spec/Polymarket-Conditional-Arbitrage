@@ -32,6 +32,7 @@ from .runtime_status import (
 )
 
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
+RUNTIME_STATUS_WARNING_INTERVAL_SECONDS = 60.0
 
 
 class ScannerStopped(RuntimeError):
@@ -175,6 +176,7 @@ class ConditionalArbScanner:
             cache_path=self.config.market_universe_cache_path,
         )
         self._runtime_started = False
+        self._last_runtime_status_warning_at: float | None = None
 
     def _should_retry(self, failed_attempt: int) -> bool:
         return self.running and (
@@ -219,8 +221,30 @@ class ConditionalArbScanner:
         self._runtime_started = False
 
     def _runtime_update(self, **fields: Any) -> None:
-        if self._runtime_started:
+        if not self._runtime_started:
+            return
+        try:
             self.runtime.update(**fields)
+        except OSError as exc:
+            self._log_runtime_status_write_failure(self.runtime.record_write_failure(exc))
+            return
+        warning = self.runtime.consume_write_failure_warning()
+        if warning is not None:
+            self._log_runtime_status_write_failure(warning)
+
+    def _log_runtime_status_write_failure(self, warning: Mapping[str, Any]) -> None:
+        now = time.monotonic()
+        if (
+            self._last_runtime_status_warning_at is not None
+            and now - self._last_runtime_status_warning_at < RUNTIME_STATUS_WARNING_INTERVAL_SECONDS
+        ):
+            return
+        self._last_runtime_status_warning_at = now
+        self.logger.warning(
+            "runtime_status_write_failed failures=%s error=%s",
+            warning.get("failures"),
+            warning.get("error"),
+        )
 
     def _runtime_error(self, exc: Exception) -> None:
         self._runtime_update(last_error=f"{type(exc).__name__}: {exc}")

@@ -17,6 +17,8 @@ from .portfolio_lock import PortfolioDataLock
 SCHEMA_VERSION = 1
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 STALE_HEARTBEAT_SECONDS = 15.0
+WRITE_RETRY_ATTEMPTS = 3
+WRITE_RETRY_BACKOFF_SECONDS = 0.05
 ANSI_CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
 RUNTIME_PHASES = {"warmup", "online", "stopping"}
@@ -145,17 +147,22 @@ class RuntimeStatusWriter:
         cache_path: str | Path,
         mode: str = "paper_portfolio_instance",
         heartbeat_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+        write_retry_attempts: int = WRITE_RETRY_ATTEMPTS,
+        write_retry_backoff_seconds: float = WRITE_RETRY_BACKOFF_SECONDS,
     ) -> None:
         self.path = Path(path)
         self.cache_path = Path(cache_path)
         self.mode = mode
         self.heartbeat_seconds = max(0.1, float(heartbeat_seconds))
+        self.write_retry_attempts = max(1, int(write_retry_attempts))
+        self.write_retry_backoff_seconds = max(0.0, float(write_retry_backoff_seconds))
         self.host = socket.gethostname()
         self.pid = os.getpid()
         self.started_at_utc = utc_iso()
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._pending_write_failure_warning: dict[str, Any] | None = None
         self._payload = self._base_payload()
 
     def _base_payload(self) -> dict[str, Any]:
@@ -194,6 +201,8 @@ class RuntimeStatusWriter:
             "last_cycle_evaluated_markets": 0,
             "last_cycle_executions": 0,
             "last_cycle_skips": 0,
+            "runtime_status_write_failures": 0,
+            "last_runtime_status_write_error": None,
         }
 
     def start(self, *, phase: str = "warmup", detail: str = "starting") -> None:
@@ -248,15 +257,49 @@ class RuntimeStatusWriter:
         with self._lock:
             return dict(self._payload)
 
+    def consume_write_failure_warning(self) -> dict[str, Any] | None:
+        with self._lock:
+            warning = self._pending_write_failure_warning
+            self._pending_write_failure_warning = None
+            return dict(warning) if warning is not None else None
+
+    def record_write_failure(self, exc: BaseException) -> dict[str, Any]:
+        with self._lock:
+            return self._record_write_failure_locked(exc)
+
     def _heartbeat_loop(self) -> None:
         while not self._stop_event.wait(self.heartbeat_seconds):
             self.heartbeat()
 
     def _write_locked(self) -> None:
+        last_exc: OSError | None = None
+        for attempt in range(1, self.write_retry_attempts + 1):
+            try:
+                self._write_once_locked()
+                return
+            except OSError as exc:
+                last_exc = exc
+                if attempt >= self.write_retry_attempts:
+                    break
+                if self.write_retry_backoff_seconds > 0.0:
+                    time.sleep(self.write_retry_backoff_seconds)
+        assert last_exc is not None
+        self._record_write_failure_locked(last_exc)
+
+    def _write_once_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(jsonable(self._payload), indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
+
+    def _record_write_failure_locked(self, exc: BaseException) -> dict[str, Any]:
+        failures = _int_value(self._payload.get("runtime_status_write_failures")) + 1
+        error = f"{type(exc).__name__}: {exc}"
+        self._payload["runtime_status_write_failures"] = failures
+        self._payload["last_runtime_status_write_error"] = error
+        warning = {"failures": failures, "error": error}
+        self._pending_write_failure_warning = warning
+        return dict(warning)
 
 
 def load_runtime_status(path: str | Path) -> dict[str, Any] | None:
@@ -383,6 +426,14 @@ def _format_warmup_progress_line(
     return f"{prefix}: " + "; ".join(parts)
 
 
+def _format_runtime_status_write_failures_line(runtime_row: Mapping[str, Any]) -> str | None:
+    failures = _int_value(runtime_row.get("runtime_status_write_failures"))
+    if failures <= 0:
+        return None
+    error = runtime_row.get("last_runtime_status_write_error") or "unknown"
+    return f"Runtime status writes: failures={_format_count(failures)}; last_error={error}"
+
+
 def format_status_dashboard(
     *,
     runtime: Mapping[str, Any] | None,
@@ -410,6 +461,7 @@ def format_status_dashboard(
         runtime_row=runtime_row,
         current_time=current_time,
     )
+    runtime_status_write_failures_line = _format_runtime_status_write_failures_line(runtime_row)
 
     lines = [
         "Paper Portfolio Status",
@@ -429,6 +481,8 @@ def format_status_dashboard(
     ]
     if warmup_progress_line is not None:
         lines.append(warmup_progress_line)
+    if runtime_status_write_failures_line is not None:
+        lines.append(runtime_status_write_failures_line)
     lines.extend(
         [
             f"Cache path: {runtime_row.get('cache_path') or 'unknown'}",
