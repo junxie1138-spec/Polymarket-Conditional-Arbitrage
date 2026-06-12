@@ -306,17 +306,16 @@ def null_logger():
     return logger
 
 
-def dashboard_rows(dashboard: str) -> list[str]:
+def assert_dashboard_frame(dashboard: str) -> list[str]:
     lines = dashboard.splitlines()
     assert len(lines) >= 4
     width = len(lines[0])
+    assert width == 102
     assert all(len(line) == width for line in lines)
-    assert lines[0] == lines[2] == lines[-1]
-    assert lines[0].startswith("+") and lines[0].endswith("+")
-    assert set(lines[0][1:-1]) == {"-"}
-    content_indexes = set(range(len(lines))) - {0, 2, len(lines) - 1}
-    assert all(lines[index].startswith("| ") and lines[index].endswith(" |") for index in content_indexes)
-    return [lines[index][2:-2].rstrip() for index in sorted(content_indexes)]
+    assert lines[0] == lines[-1] == "+" + "=" * 100 + "+"
+    assert all(line.startswith("|") and line.endswith("|") for line in lines if not line.startswith("+"))
+    assert all(line.startswith("+") and line.endswith("+") for line in lines if line.startswith("+"))
+    return lines
 
 
 def profitable_books(token_ids, *, updated_at):
@@ -856,11 +855,18 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     warmup = format_status_dashboard(runtime={**runtime, "phase": "warmup"}, portfolio=portfolio_status, now=now)
     dead = format_status_dashboard(runtime=None, portfolio=portfolio_status, now=now)
 
-    assert dashboard_rows(online)[:2] == ["Paper Portfolio Status", "Current: ONLINE"]
-    assert "Last refreshed: 2026-06-10T12:00:00Z" in online
-    assert "Last cycle: reason=ws_bootstrap; completed=2026-06-10T12:00:00Z; evaluated=2; executions=1; skips=1" in online
-    assert dashboard_rows(warmup)[:2] == ["Paper Portfolio Status", "Current: WARMUP"]
-    assert dashboard_rows(dead)[:2] == ["Paper Portfolio Status", "Current: DEAD"]
+    online_lines = assert_dashboard_frame(online)
+    assert "PAPER PORTFOLIO" in online_lines[1]
+    assert "ONLINE" in online_lines[1]
+    assert "FRESH" in online_lines[1]
+    assert "Updated 2026-06-10 12:00:00Z" in online_lines[2]
+    assert "Last cycle      ws_bootstrap" in online
+    assert "Completed       2026-06-10 12:00:00Z" in online
+    assert "Evaluated       2" in online
+    assert "Executions      1" in online
+    assert "Skips           1" in online
+    assert "WARMUP" in assert_dashboard_frame(warmup)[1]
+    assert "DEAD" in assert_dashboard_frame(dead)[1]
 
 
 def test_status_dashboard_formats_warmup_progress_eta():
@@ -896,12 +902,15 @@ def test_status_dashboard_formats_warmup_progress_eta():
 
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
-    assert (
-        "Warmup progress: elapsed=10.0m; "
-        "book_seed=ws_bootstrap 250/1,000 tokens (25.0%); "
-        "remaining=750; received_books=240; failed=10; rate=50.0 tokens/s; ETA=15.0s"
-    ) in dashboard
-    assert "Runtime status writes:" not in dashboard
+    assert assert_dashboard_frame(dashboard)
+    assert "Seed progress   250 / 1,000  (25.0%)" in dashboard
+    assert "Remaining       750" in dashboard
+    assert "Received        240" in dashboard
+    assert "Failed          10" in dashboard
+    assert "Rate            50.0 tok/s" in dashboard
+    assert "ETA             15.0s" in dashboard
+    assert "Progress [########-------------------------] 25.0%" in dashboard
+    assert "Runtime writes:" not in dashboard
 
 
 def test_status_dashboard_surfaces_inflight_book_seed_batch():
@@ -943,7 +952,10 @@ def test_status_dashboard_surfaces_inflight_book_seed_batch():
 
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
-    assert "batch=2/4 tokens 251-500 in_flight=18.0s" in dashboard
+    assert assert_dashboard_frame(dashboard)
+    assert "Batch           2 / 4" in dashboard
+    assert "Batch tokens    251 - 500" in dashboard
+    assert "In flight       18.0s" in dashboard
 
 
 def test_status_dashboard_surfaces_runtime_status_write_degradation():
@@ -972,7 +984,9 @@ def test_status_dashboard_surfaces_runtime_status_write_degradation():
 
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
-    assert "Runtime status writes: failures=2; last_error=PermissionError: temporarily locked" in dashboard
+    assert assert_dashboard_frame(dashboard)
+    assert "Runtime writes  2 failures" in dashboard
+    assert "Runtime writes: failures=2; last_error=PermissionError: temporarily locked" in dashboard
 
 
 def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):
@@ -1007,7 +1021,9 @@ def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):
 
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
-    assert dashboard_rows(dashboard)[:2] == ["Paper Portfolio Status", "Current: ONLINE"]
+    lines = assert_dashboard_frame(dashboard)
+    assert "ONLINE" in lines[1]
+    assert "FRESH" in lines[1]
 
 
 def test_status_dashboard_labels_stale_runtime_phase_as_last_known():
@@ -1034,9 +1050,13 @@ def test_status_dashboard_labels_stale_runtime_phase_as_last_known():
 
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
-    assert dashboard_rows(dashboard)[:2] == ["Paper Portfolio Status", "Current: DEAD"]
-    assert "Heartbeat: 16.0s ago (stale); last-known phase=warmup; last-known detail=warming cache" in dashboard
-    assert "Heartbeat: 16.0s ago; phase=warmup; warming cache" not in dashboard
+    lines = assert_dashboard_frame(dashboard)
+    assert "DEAD" in lines[1]
+    assert "STALE" in lines[1]
+    assert "Heartbeat       16.0s ago" in dashboard
+    assert "Status          stale" in dashboard
+    assert "Phase           warmup" in dashboard
+    assert "Detail          warming cache" in dashboard
 
 
 def test_status_dashboard_uses_one_live_status_value_and_hides_history_by_default():
@@ -1071,10 +1091,10 @@ def test_status_dashboard_uses_one_live_status_value_and_hides_history_by_defaul
         for runtime in polls
     ]
 
-    assert dashboard_rows(frames[0])[:2] == ["Paper Portfolio Status", "Current: warming cache"]
-    assert dashboard_rows(frames[-1])[:2] == ["Paper Portfolio Status", "Current: reconciling"]
-    assert all(frame.count("Current:") == 1 for frame in frames)
-    assert all("Status Log" not in frame for frame in frames)
+    assert "WARMING CACHE" in assert_dashboard_frame(frames[0])[1]
+    assert "RECONCILING" in assert_dashboard_frame(frames[-1])[1]
+    assert all(frame.count("PAPER PORTFOLIO") == 1 for frame in frames)
+    assert all("STATUS LOG" not in frame for frame in frames)
     assert "warming cache" not in frames[-1]
     assert "ONLINE" not in frames[-1]
     assert len({len(frame.splitlines()) for frame in frames}) == 1
@@ -1086,7 +1106,8 @@ def test_status_dashboard_uses_one_live_status_value_and_hides_history_by_defaul
         show_log=True,
     )
 
-    assert "Status Log" in with_log
+    assert assert_dashboard_frame(with_log)
+    assert "STATUS LOG" in with_log
     assert "- warming cache" in with_log
     assert "- ONLINE" in with_log
     assert "- reconciling" in with_log
@@ -1456,7 +1477,9 @@ def test_cli_status_reads_state_without_lock_or_mutation(tmp_path, monkeypatch, 
         lock.release()
     after = state_path.read_text(encoding="utf-8")
 
-    assert "Current: DEAD" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "PAPER PORTFOLIO" in output
+    assert "DEAD" in output
     assert before == after
 
 

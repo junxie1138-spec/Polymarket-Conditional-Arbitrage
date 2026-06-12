@@ -368,130 +368,113 @@ def read_runtime_and_portfolio_status(
     return runtime, portfolio_status()
 
 
-def _format_heartbeat_line(
+DASHBOARD_WIDTH = 100
+LEFT_CELL_WIDTH = 46
+RIGHT_CELL_WIDTH = DASHBOARD_WIDTH - LEFT_CELL_WIDTH - 1
+CELL_PADDING = 2
+LABEL_WIDTH = 16
+PROGRESS_BAR_WIDTH = 33
+
+
+def _truncate(text: Any, width: int) -> str:
+    rendered = str(text)
+    if len(rendered) <= width:
+        return rendered
+    if width <= 3:
+        return rendered[:width]
+    return rendered[: width - 3] + "..."
+
+
+def _cell(text: Any, width: int) -> str:
+    content_width = max(0, width - CELL_PADDING)
+    return f" {_truncate(text, content_width).ljust(content_width)} "
+
+
+def _full_border() -> str:
+    return "+" + "=" * DASHBOARD_WIDTH + "+"
+
+
+def _split_border() -> str:
+    return "+" + "=" * LEFT_CELL_WIDTH + "+" + "=" * RIGHT_CELL_WIDTH + "+"
+
+
+def _full_row(text: Any) -> str:
+    return "|" + _cell(text, DASHBOARD_WIDTH) + "|"
+
+
+def _split_row(left: Any = "", right: Any = "") -> str:
+    return "|" + _cell(left, LEFT_CELL_WIDTH) + "|" + _cell(right, RIGHT_CELL_WIDTH) + "|"
+
+
+def _join_left_right(left: str, right: str, width: int) -> str:
+    right = _truncate(right, width)
+    if len(right) >= width:
+        return right
+    available_left = max(0, width - len(right) - 1)
+    left = _truncate(left, available_left)
+    gap = max(1, width - len(left) - len(right))
+    return left + (" " * gap) + right
+
+
+def _format_timestamp(value: Any) -> str:
+    parsed = value.astimezone(timezone.utc) if isinstance(value, datetime) else parse_utc(value)
+    if parsed is None:
+        return "never"
+    return parsed.strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _format_status_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
+    return f"{_format_age(seconds)} ago"
+
+
+def _format_status_health(
     *,
     runtime_row: Mapping[str, Any],
     live_status: str,
     heartbeat_age: float | None,
 ) -> str:
-    phase = runtime_row.get("phase") or "unknown"
-    detail = str(runtime_row.get("detail") or "no active runtime heartbeat")
-    if runtime_row and live_status == "DEAD" and heartbeat_age is not None and heartbeat_age > STALE_HEARTBEAT_SECONDS:
-        return (
-            f"Heartbeat: {_format_age(heartbeat_age)} ago (stale); "
-            f"last-known phase={phase}; last-known detail={detail}"
-        )
-    return f"Heartbeat: {_format_age(heartbeat_age)} ago; phase={phase}; {detail}"
+    if not runtime_row:
+        return "missing"
+    if live_status == "DEAD":
+        if heartbeat_age is not None and heartbeat_age > STALE_HEARTBEAT_SECONDS:
+            return "stale"
+        return "dead"
+    return "fresh"
 
 
-def _format_warmup_progress_line(
-    *,
-    runtime_row: Mapping[str, Any],
-    current_time: datetime,
-) -> str | None:
-    phase = runtime_row.get("phase")
-    detail = str(runtime_row.get("detail") or "")
-    seeding_active = detail.startswith("seeding REST ask books") or detail.startswith("REST ask books seeded")
-    if phase != "warmup" and not seeding_active:
-        return None
-
-    total_tokens = _int_value(runtime_row.get("book_seed_total_tokens"))
-    completed_tokens = min(total_tokens, _int_value(runtime_row.get("book_seed_completed_tokens")))
-    warmup_started_at = runtime_row.get("warmup_started_at_utc") or runtime_row.get("started_at_utc")
-    warmup_elapsed = _seconds_since(warmup_started_at, now=current_time)
-    parts: list[str] = []
-    if warmup_elapsed is not None and phase == "warmup":
-        parts.append(f"elapsed={_format_age(warmup_elapsed)}")
-    if total_tokens > 0:
-        remaining_tokens = _int_value(
-            runtime_row.get("book_seed_remaining_tokens"),
-            total_tokens - completed_tokens,
-        )
-        received_books = _int_value(runtime_row.get("book_seed_received_books"))
-        failed_tokens = _int_value(runtime_row.get("book_seed_failed_tokens"))
-        percent = (completed_tokens / total_tokens) * 100.0
-        reason = runtime_row.get("book_seed_reason") or "n/a"
-        eta_seconds = _float_value(runtime_row.get("book_seed_eta_seconds"))
-        rate = _float_value(runtime_row.get("book_seed_rate_tokens_per_second"))
-        batch_line = _format_book_seed_batch_line(
-            runtime_row=runtime_row,
-            current_time=current_time,
-            total_tokens=total_tokens,
-            completed_tokens=completed_tokens,
-        )
-        parts.extend(
-            [
-                (
-                    f"book_seed={reason} {_format_count(completed_tokens)}/"
-                    f"{_format_count(total_tokens)} tokens ({percent:.1f}%)"
-                ),
-                f"remaining={_format_count(remaining_tokens)}",
-                f"received_books={_format_count(received_books)}",
-                f"failed={_format_count(failed_tokens)}",
-                f"rate={_format_rate(rate)}",
-                f"ETA={_format_age(eta_seconds)}",
-            ]
-        )
-        if batch_line is not None:
-            parts.append(batch_line)
-    if not parts:
-        return None
-    prefix = "Warmup progress" if phase == "warmup" else "Book seed progress"
-    return f"{prefix}: " + "; ".join(parts)
+def _format_dashboard_detail(value: Any) -> str:
+    detail = str(value or "no active runtime heartbeat").strip()
+    if detail.startswith("seeding REST ask books"):
+        return "seeding ask books"
+    if detail.startswith("REST ask books seeded"):
+        return "ask books seeded"
+    return detail or "no active runtime heartbeat"
 
 
-def _format_book_seed_batch_line(
-    *,
-    runtime_row: Mapping[str, Any],
-    current_time: datetime,
-    total_tokens: int,
-    completed_tokens: int,
-) -> str | None:
-    if total_tokens <= 0 or completed_tokens >= total_tokens:
-        return None
-    status = str(runtime_row.get("book_seed_batch_status") or "")
-    if status != "in_flight":
-        return None
-    batch_number = _int_value(runtime_row.get("book_seed_batch_number"))
-    total_batches = _int_value(runtime_row.get("book_seed_total_batches"))
-    start_token = _int_value(runtime_row.get("book_seed_batch_start_token"))
-    end_token = _int_value(runtime_row.get("book_seed_batch_end_token"))
-    if batch_number <= 0 or total_batches <= 0 or start_token <= 0 or end_token <= 0:
-        return None
-    in_flight_seconds = _seconds_since(
-        runtime_row.get("book_seed_batch_started_at_utc"),
-        now=current_time,
-    )
-    return (
-        f"batch={_format_count(batch_number)}/{_format_count(total_batches)} "
-        f"tokens {_format_count(start_token)}-{_format_count(end_token)} "
-        f"in_flight={_format_age(in_flight_seconds)}"
-    )
+def _format_token_rate(value: float | None) -> str:
+    if value is None or value <= 0.0:
+        return "n/a"
+    return f"{value:,.1f} tok/s"
 
 
-def _format_runtime_status_write_failures_line(runtime_row: Mapping[str, Any]) -> str | None:
-    failures = _int_value(runtime_row.get("runtime_status_write_failures"))
-    if failures <= 0:
-        return None
-    error = runtime_row.get("last_runtime_status_write_error") or "unknown"
-    return f"Runtime status writes: failures={_format_count(failures)}; last_error={error}"
+def _kv(label: str, value: Any) -> str:
+    return f"{label.ljust(LABEL_WIDTH)}{value}"
 
 
-def _format_bordered_dashboard(lines: Sequence[str]) -> str:
-    rendered_lines = list(lines)
-    if not rendered_lines:
-        return ""
-    title, *content = rendered_lines
-    width = max(len(line) for line in rendered_lines)
-    border = "+" + "-" * (width + 2) + "+"
-    panel = [
-        border,
-        f"| {title.ljust(width)} |",
-        border,
-    ]
-    panel.extend(f"| {line.ljust(width)} |" for line in content)
-    panel.append(border)
-    return "\n".join(panel)
+def _append_split_section(rows: list[str], left_lines: Sequence[str], right_lines: Sequence[str]) -> None:
+    rows.append(_split_border())
+    for index in range(max(len(left_lines), len(right_lines))):
+        left = left_lines[index] if index < len(left_lines) else ""
+        right = right_lines[index] if index < len(right_lines) else ""
+        rows.append(_split_row(left, right))
+
+
+def _format_progress_bar(percent: float) -> str:
+    clamped = min(100.0, max(0.0, percent))
+    filled = min(PROGRESS_BAR_WIDTH, int((clamped / 100.0) * PROGRESS_BAR_WIDTH))
+    return "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
 
 
 def format_status_dashboard(
@@ -511,81 +494,131 @@ def format_status_dashboard(
     unmatched_text = "none" if not unmatched else f"{len(unmatched)} positions"
     host = runtime_row.get("host") or "unknown"
     pid = runtime_row.get("pid") or "unknown"
-    skip_count = runtime_row.get("last_cycle_skips", 0)
-    heartbeat_line = _format_heartbeat_line(
+    health_status = _format_status_health(
         runtime_row=runtime_row,
         live_status=live_status,
         heartbeat_age=heartbeat_age,
     )
-    warmup_progress_line = _format_warmup_progress_line(
-        runtime_row=runtime_row,
-        current_time=current_time,
-    )
-    runtime_status_write_failures_line = _format_runtime_status_write_failures_line(runtime_row)
-
-    lines = [
-        "Paper Portfolio Status",
-        f"Current: {live_status}",
-        f"Last refreshed: {utc_iso(current_time)}",
-        f"PID/Host: {pid} on {host}",
-        heartbeat_line,
-        (
-            "Warmup/cache: "
-            f"cache_fetched={runtime_row.get('cache_fetched_at_utc') or 'never'} "
-            f"age={_format_age(cache_age)} "
-            f"events={runtime_row.get('events_fetched', 0)} "
-            f"raw_markets={runtime_row.get('raw_markets', 0)} "
-            f"tradable={runtime_row.get('tradable_markets', 0)} "
-            f"tokens={runtime_row.get('tokens', 0)}"
-        ),
+    header_width = DASHBOARD_WIDTH - CELL_PADDING
+    status_badge = _truncate(str(live_status).upper(), 24)
+    health_badge = _truncate(health_status.upper(), 14)
+    top_right = f"{status_badge}   {health_badge}   PID {pid}"
+    rows = [
+        _full_border(),
+        _full_row(_join_left_right("PAPER PORTFOLIO", top_right, header_width)),
+        _full_row(_join_left_right(f"Updated {_format_timestamp(current_time)}", f"Host {host}", header_width)),
     ]
-    if warmup_progress_line is not None:
-        lines.append(warmup_progress_line)
-    if runtime_status_write_failures_line is not None:
-        lines.append(runtime_status_write_failures_line)
-    lines.extend(
-        [
-            f"Cache path: {runtime_row.get('cache_path') or 'unknown'}",
-            (
-                "Portfolio: "
-                f"cash {_format_money(portfolio.get('cash'))}; "
-                f"equity {_format_money(portfolio.get('total_equity'))}; "
-                f"realized PnL {_format_money(portfolio.get('realized_pnl'))}; "
-                f"return {float(portfolio.get('return_pct') or 0.0):.2f}%"
-            ),
-            (
-                "Trades: "
-                f"{portfolio.get('trade_count', 0)}; "
-                f"win rate {float(portfolio.get('win_rate_pct') or 0.0):.2f}%; "
-                f"last execution {portfolio.get('last_execution_at_utc') or 'never'}"
-            ),
-            (
-                "Costs: "
-                f"fees {_format_money(costs.get('fees_usd') if isinstance(costs, Mapping) else 0.0)}, "
-                f"slippage {_format_money(costs.get('slippage_usd') if isinstance(costs, Mapping) else 0.0)}, "
-                f"tax {_format_money(costs.get('tax_usd') if isinstance(costs, Mapping) else 0.0)}, "
-                f"merge {_format_money(costs.get('merge_usd') if isinstance(costs, Mapping) else 0.0)}"
-            ),
-            f"Unmatched inventory: {unmatched_text}",
-            (
-                "Last cycle: "
-                f"reason={runtime_row.get('last_evaluation_reason') or 'n/a'}; "
-                f"completed={runtime_row.get('last_cycle_completed_at_utc') or 'never'}; "
-                f"evaluated={runtime_row.get('last_cycle_evaluated_markets', 0)}; "
-                f"executions={runtime_row.get('last_cycle_executions', 0)}; "
-                f"skips={skip_count}"
-            ),
-            f"Last error: {runtime_row.get('last_error') or 'none'}",
-        ]
+
+    failures = _int_value(runtime_row.get("runtime_status_write_failures"))
+    detail = _format_dashboard_detail(runtime_row.get("detail"))
+    health_lines = [
+        "HEALTH",
+        _kv("Heartbeat", _format_status_age(heartbeat_age)),
+        _kv("Status", health_status),
+        _kv("Phase", runtime_row.get("phase") or "unknown"),
+        _kv("Detail", detail),
+    ]
+    if failures > 0:
+        health_lines.extend(
+            [
+                _kv("Runtime writes", f"{_format_count(failures)} failures"),
+                _kv("Write error", runtime_row.get("last_runtime_status_write_error") or "unknown"),
+            ]
+        )
+
+    portfolio_lines = [
+        "PORTFOLIO",
+        _kv("Cash", _format_money(portfolio.get("cash"))),
+        _kv("Equity", _format_money(portfolio.get("total_equity"))),
+        _kv("Realized PnL", _format_money(portfolio.get("realized_pnl"))),
+        _kv("Return", f"{float(portfolio.get('return_pct') or 0.0):.2f}%"),
+        _kv("Trades", _format_count(_int_value(portfolio.get("trade_count")))),
+        _kv("Win rate", f"{float(portfolio.get('win_rate_pct') or 0.0):.2f}%"),
+    ]
+    _append_split_section(rows, health_lines, portfolio_lines)
+    if failures > 0:
+        rows.append(_full_border())
+        rows.append(
+            _full_row(
+                "Runtime writes: "
+                f"failures={_format_count(failures)}; "
+                f"last_error={runtime_row.get('last_runtime_status_write_error') or 'unknown'}"
+            )
+        )
+
+    total_tokens = _int_value(runtime_row.get("book_seed_total_tokens"))
+    completed_tokens = min(total_tokens, _int_value(runtime_row.get("book_seed_completed_tokens")))
+    percent = (completed_tokens / total_tokens) * 100.0 if total_tokens > 0 else None
+    remaining_tokens = _int_value(
+        runtime_row.get("book_seed_remaining_tokens"),
+        total_tokens - completed_tokens,
     )
+    batch_number = _int_value(runtime_row.get("book_seed_batch_number"))
+    total_batches = _int_value(runtime_row.get("book_seed_total_batches"))
+    batch_start = _int_value(runtime_row.get("book_seed_batch_start_token"))
+    batch_end = _int_value(runtime_row.get("book_seed_batch_end_token"))
+    in_flight_age = _seconds_since(runtime_row.get("book_seed_batch_started_at_utc"), now=current_time)
+
+    warmup_lines = [
+        "WARMUP",
+        _kv("Cache fetched", _format_timestamp(runtime_row.get("cache_fetched_at_utc"))),
+        _kv("Cache age", _format_age(cache_age)),
+        _kv("Events", _format_count(_int_value(runtime_row.get("events_fetched")))),
+        _kv("Raw markets", _format_count(_int_value(runtime_row.get("raw_markets")))),
+        _kv("Tradable", _format_count(_int_value(runtime_row.get("tradable_markets")))),
+        _kv("Tokens", _format_count(_int_value(runtime_row.get("tokens")))),
+    ]
+    if percent is not None:
+        warmup_lines.extend(
+            [
+                "",
+                _kv("Seed progress", f"{_format_count(completed_tokens)} / {_format_count(total_tokens)}  ({percent:.1f}%)"),
+                _kv("Remaining", _format_count(remaining_tokens)),
+                _kv("Received", _format_count(_int_value(runtime_row.get("book_seed_received_books")))),
+                _kv("Rate", _format_token_rate(_float_value(runtime_row.get("book_seed_rate_tokens_per_second")))),
+                _kv("ETA", _format_age(_float_value(runtime_row.get("book_seed_eta_seconds")))),
+            ]
+        )
+        if batch_number > 0 and total_batches > 0:
+            warmup_lines.append(_kv("Batch", f"{_format_count(batch_number)} / {_format_count(total_batches)}"))
+        if batch_start > 0 and batch_end > 0:
+            warmup_lines.append(_kv("Batch tokens", f"{_format_count(batch_start)} - {_format_count(batch_end)}"))
+        if str(runtime_row.get("book_seed_batch_status") or "") == "in_flight":
+            warmup_lines.append(_kv("In flight", _format_age(in_flight_age)))
+        warmup_lines.append(_kv("Failed", _format_count(_int_value(runtime_row.get("book_seed_failed_tokens")))))
+
+    execution_lines = [
+        "COSTS",
+        _kv("Fees", _format_money(costs.get("fees_usd") if isinstance(costs, Mapping) else 0.0)),
+        _kv("Slippage", _format_money(costs.get("slippage_usd") if isinstance(costs, Mapping) else 0.0)),
+        _kv("Tax", _format_money(costs.get("tax_usd") if isinstance(costs, Mapping) else 0.0)),
+        _kv("Merge", _format_money(costs.get("merge_usd") if isinstance(costs, Mapping) else 0.0)),
+        "",
+        "EXECUTION",
+        _kv("Last exec", _format_timestamp(portfolio.get("last_execution_at_utc"))),
+        _kv("Last cycle", runtime_row.get("last_evaluation_reason") or "n/a"),
+        _kv("Completed", _format_timestamp(runtime_row.get("last_cycle_completed_at_utc"))),
+        _kv("Evaluated", _format_count(_int_value(runtime_row.get("last_cycle_evaluated_markets")))),
+        _kv("Executions", _format_count(_int_value(runtime_row.get("last_cycle_executions")))),
+        _kv("Skips", _format_count(_int_value(runtime_row.get("last_cycle_skips")))),
+        _kv("Unmatched", unmatched_text),
+        _kv("Last error", runtime_row.get("last_error") or "none"),
+    ]
+    _append_split_section(rows, warmup_lines, execution_lines)
+
+    if percent is not None:
+        rows.append(_split_border())
+        rows.append(_full_row(f"Progress [{_format_progress_bar(percent)}] {percent:.1f}%"))
     if show_log:
-        lines.extend(["", "Status Log"])
+        rows.append(_full_border())
+        rows.append(_full_row("STATUS LOG"))
         entries = _runtime_status_entries(runtime_row)
         if entries:
-            lines.extend(f"- {entry}" for entry in entries)
+            rows.extend(_full_row(f"- {entry}") for entry in entries)
         else:
-            lines.append("- no status history")
-    return _format_bordered_dashboard(lines)
+            rows.append(_full_row("- no status history"))
+    rows.append(_full_border())
+    return "\n".join(rows)
 
 
 def _status_watch_is_live_terminal(output: Callable[[str], None] | None) -> bool:
