@@ -477,6 +477,23 @@ def _format_runtime_status_write_failures_line(runtime_row: Mapping[str, Any]) -
     return f"Runtime status writes: failures={_format_count(failures)}; last_error={error}"
 
 
+def _format_bordered_dashboard(lines: Sequence[str]) -> str:
+    rendered_lines = list(lines)
+    if not rendered_lines:
+        return ""
+    title, *content = rendered_lines
+    width = max(len(line) for line in rendered_lines)
+    border = "+" + "-" * (width + 2) + "+"
+    panel = [
+        border,
+        f"| {title.ljust(width)} |",
+        border,
+    ]
+    panel.extend(f"| {line.ljust(width)} |" for line in content)
+    panel.append(border)
+    return "\n".join(panel)
+
+
 def format_status_dashboard(
     *,
     runtime: Mapping[str, Any] | None,
@@ -568,7 +585,7 @@ def format_status_dashboard(
             lines.extend(f"- {entry}" for entry in entries)
         else:
             lines.append("- no status history")
-    return "\n".join(lines)
+    return _format_bordered_dashboard(lines)
 
 
 def _status_watch_is_live_terminal(output: Callable[[str], None] | None) -> bool:
