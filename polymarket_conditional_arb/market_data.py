@@ -491,21 +491,21 @@ class MarketWebSocketManager:
     def token_chunks(self) -> list[list[str]]:
         return [sorted(worker.asset_ids) for worker in self._workers]
 
+    def _new_worker(self, asset_ids: Iterable[str]) -> _MarketWebSocketWorker:
+        return _MarketWebSocketWorker(
+            settings=self.settings,
+            asset_ids=asset_ids,
+            cache=self.cache,
+            logger=self.logger,
+            connect_factory=self.connect_factory,
+            on_dirty_tokens=self.on_dirty_tokens,
+            on_connection_lost=self.on_connection_lost,
+        )
+
     async def start(self, asset_ids: Iterable[str]) -> None:
         await self.stop()
         chunks = chunk_asset_ids(asset_ids, self.settings.max_assets_per_connection)
-        self._workers = [
-            _MarketWebSocketWorker(
-                settings=self.settings,
-                asset_ids=chunk,
-                cache=self.cache,
-                logger=self.logger,
-                connect_factory=self.connect_factory,
-                on_dirty_tokens=self.on_dirty_tokens,
-                on_connection_lost=self.on_connection_lost,
-            )
-            for chunk in chunks
-        ]
+        self._workers = [self._new_worker(chunk) for chunk in chunks]
         self._tasks = [asyncio.create_task(worker.run()) for worker in self._workers]
 
     async def update_tokens(self, asset_ids: Iterable[str]) -> None:
@@ -513,10 +513,32 @@ class MarketWebSocketManager:
         if not chunks:
             await self.stop()
             return
-        if len(self._workers) == 1 and len(chunks) == 1:
-            await self._workers[0].update_tokens(chunks[0])
+        if not self._workers:
+            await self.start(asset_ids)
             return
-        await self.start(asset_ids)
+
+        shared_workers = min(len(self._workers), len(chunks))
+        for index in range(shared_workers):
+            await self._workers[index].update_tokens(chunks[index])
+
+        if len(chunks) > len(self._workers):
+            new_workers = [self._new_worker(chunk) for chunk in chunks[len(self._workers) :]]
+            new_tasks = [asyncio.create_task(worker.run()) for worker in new_workers]
+            self._workers.extend(new_workers)
+            self._tasks.extend(new_tasks)
+            return
+
+        if len(chunks) < len(self._workers):
+            extra_workers = self._workers[len(chunks) :]
+            extra_tasks = self._tasks[len(chunks) :]
+            self._workers = self._workers[: len(chunks)]
+            self._tasks = self._tasks[: len(chunks)]
+            for worker in extra_workers:
+                await worker.stop()
+            for task in extra_tasks:
+                task.cancel()
+            if extra_tasks:
+                await asyncio.gather(*extra_tasks, return_exceptions=True)
 
     async def stop(self) -> None:
         workers = list(self._workers)

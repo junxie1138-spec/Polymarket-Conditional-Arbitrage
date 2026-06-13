@@ -207,6 +207,9 @@ class RuntimeStatusWriter:
             "last_cycle_evaluated_markets": 0,
             "last_cycle_executions": 0,
             "last_cycle_skips": 0,
+            "dirty_tokens_pending": 0,
+            "dirty_full_universe_pending": False,
+            "dirty_update_batches_pending": 0,
             "runtime_status_write_failures": 0,
             "last_runtime_status_write_error": None,
         }
@@ -587,6 +590,16 @@ def format_status_dashboard(
             warmup_lines.append(_kv("In flight", _format_age(in_flight_age)))
         warmup_lines.append(_kv("Failed", _format_count(_int_value(runtime_row.get("book_seed_failed_tokens")))))
 
+    dirty_batches = _int_value(runtime_row.get("dirty_update_batches_pending"))
+    dirty_tokens = _int_value(runtime_row.get("dirty_tokens_pending"))
+    dirty_full_universe = bool(runtime_row.get("dirty_full_universe_pending"))
+    dirty_backlog_text: str | None = None
+    dirty_update_text = "1 update" if dirty_batches == 1 else f"{_format_count(dirty_batches)} updates"
+    if dirty_full_universe:
+        dirty_backlog_text = f"full universe ({dirty_update_text})"
+    elif dirty_tokens > 0 or dirty_batches > 0:
+        dirty_backlog_text = f"{_format_count(dirty_tokens)} tokens ({dirty_update_text})"
+
     execution_lines = [
         "COSTS",
         _kv("Fees", _format_money(costs.get("fees_usd") if isinstance(costs, Mapping) else 0.0)),
@@ -604,6 +617,8 @@ def format_status_dashboard(
         _kv("Unmatched", unmatched_text),
         _kv("Last error", runtime_row.get("last_error") or "none"),
     ]
+    if dirty_backlog_text is not None:
+        execution_lines.insert(9, _kv("Dirty backlog", dirty_backlog_text))
     _append_split_section(rows, warmup_lines, execution_lines)
 
     if percent is not None:

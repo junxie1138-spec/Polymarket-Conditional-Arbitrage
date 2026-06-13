@@ -64,6 +64,80 @@ class MarketUniverse:
         return _token_ids_for_markets(list(self.markets))
 
 
+@dataclass(frozen=True)
+class _DirtyTokenBatch:
+    token_ids: set[str] | None
+    evaluation_reason: str
+    coalesced_updates: int
+
+
+class _DirtyTokenAccumulator:
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+        self._tokens: set[str] = set()
+        self._full_universe = False
+        self._evaluation_reason = "ws_dirty_update"
+        self._coalesced_updates = 0
+
+    @property
+    def has_pending(self) -> bool:
+        return self._full_universe or bool(self._tokens)
+
+    def runtime_fields(self) -> dict[str, Any]:
+        return {
+            "dirty_tokens_pending": 0 if self._full_universe else len(self._tokens),
+            "dirty_full_universe_pending": self._full_universe,
+            "dirty_update_batches_pending": self._coalesced_updates,
+        }
+
+    def mark(self, token_ids: set[str] | list[str] | tuple[str, ...], *, reason: str = "ws_dirty_update") -> bool:
+        ids = {str(token_id) for token_id in token_ids if token_id}
+        if not ids:
+            return False
+        if not self._full_universe:
+            self._tokens.update(ids)
+            self._evaluation_reason = reason
+        self._coalesced_updates += 1
+        self._event.set()
+        return True
+
+    def mark_full_universe(self, *, reason: str = "rest_reconcile") -> None:
+        self._tokens.clear()
+        self._full_universe = True
+        self._evaluation_reason = reason
+        self._coalesced_updates += 1
+        self._event.set()
+
+    async def wait(self, *, timeout: float) -> _DirtyTokenBatch | None:
+        if not self.has_pending:
+            try:
+                await asyncio.wait_for(self._event.wait(), timeout=timeout)
+            except TimeoutError:
+                return None
+        await asyncio.sleep(DIRTY_EVALUATION_DEBOUNCE_SECONDS)
+        return self.take_nowait()
+
+    def take_nowait(self) -> _DirtyTokenBatch | None:
+        if not self.has_pending:
+            self._event.clear()
+            return None
+        if self._full_universe:
+            token_ids = None
+        else:
+            token_ids = set(self._tokens)
+        batch = _DirtyTokenBatch(
+            token_ids=token_ids,
+            evaluation_reason=self._evaluation_reason,
+            coalesced_updates=self._coalesced_updates,
+        )
+        self._tokens.clear()
+        self._full_universe = False
+        self._evaluation_reason = "ws_dirty_update"
+        self._coalesced_updates = 0
+        self._event.clear()
+        return batch
+
+
 def setup_logging(scan_config: config.ScanConfig) -> logging.Logger:
     scan_config.log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("polymarket_conditional_arb.portfolio")
@@ -471,19 +545,30 @@ class ConditionalArbScanner:
 
     async def _run_market_ws_forever(self) -> None:
         cache = MarketDataCache()
-        dirty_queue: asyncio.Queue[set[str]] = asyncio.Queue()
+        dirty_updates = _DirtyTokenAccumulator()
         ws_params = replace(self.params, max_book_age_seconds=self.config.ws_stale_seconds)
+        loop = asyncio.get_running_loop()
+        last_dirty_runtime_update_at = 0.0
+
+        def _publish_dirty_runtime_status(*, force: bool = False) -> None:
+            nonlocal last_dirty_runtime_update_at
+            now = loop.time()
+            if not force and now - last_dirty_runtime_update_at < 10.0:
+                return
+            last_dirty_runtime_update_at = now
+            self._runtime_update(**dirty_updates.runtime_fields())
 
         def _mark_dirty(token_ids: set[str]) -> None:
-            if token_ids:
-                dirty_queue.put_nowait(set(token_ids))
+            if dirty_updates.mark(token_ids):
+                _publish_dirty_runtime_status()
 
         def _mark_disconnected_stale(token_ids: set[str]) -> None:
             if not token_ids:
                 return
             stale_at = datetime.now(timezone.utc) - timedelta(seconds=self.config.ws_stale_seconds + 1.0)
             cache.mark_tokens_stale(token_ids, stale_at=stale_at)
-            dirty_queue.put_nowait(set(token_ids))
+            if dirty_updates.mark(token_ids):
+                _publish_dirty_runtime_status()
 
         manager = MarketWebSocketManager(
             settings=MarketWebSocketSettings(
@@ -520,7 +605,7 @@ class ConditionalArbScanner:
                     current_universe,
                     cache,
                     manager,
-                    dirty_queue,
+                    dirty_updates,
                     reason=reason,
                 )
             )
@@ -555,7 +640,6 @@ class ConditionalArbScanner:
             )
             self._runtime_update(phase="online", detail="online", last_error=None)
 
-            loop = asyncio.get_running_loop()
             next_refresh = loop.time() + self.config.market_refresh_interval_seconds
             next_reconcile = loop.time() + self.config.rest_reconcile_interval_seconds
 
@@ -563,20 +647,16 @@ class ConditionalArbScanner:
                 universe = _finish_refresh_task_if_ready(universe)
                 timeout = max(0.0, min(next_refresh, next_reconcile) - loop.time())
                 timeout = min(timeout, 1.0)
-                dirty_tokens: set[str] | None = None
-                try:
-                    first_dirty = await asyncio.wait_for(dirty_queue.get(), timeout=timeout)
-                    dirty_tokens = await self._collect_dirty_tokens(dirty_queue, first_dirty)
-                except TimeoutError:
-                    pass
+                dirty_batch = await dirty_updates.wait(timeout=timeout)
                 universe = _finish_refresh_task_if_ready(universe)
 
-                if dirty_tokens:
+                if dirty_batch is not None:
+                    _publish_dirty_runtime_status(force=True)
                     self._evaluate_from_cache(
                         universe,
                         cache,
-                        dirty_token_ids=dirty_tokens,
-                        evaluation_reason="ws_dirty_update",
+                        dirty_token_ids=dirty_batch.token_ids,
+                        evaluation_reason=dirty_batch.evaluation_reason,
                         params=ws_params,
                     )
 
@@ -589,36 +669,33 @@ class ConditionalArbScanner:
 
                 now = loop.time()
                 if now >= next_reconcile:
+                    dirty_batch = dirty_updates.take_nowait()
+                    if dirty_batch is not None:
+                        _publish_dirty_runtime_status(force=True)
+                        self._evaluate_from_cache(
+                            universe,
+                            cache,
+                            dirty_token_ids=dirty_batch.token_ids,
+                            evaluation_reason=dirty_batch.evaluation_reason,
+                            params=ws_params,
+                        )
+                        continue
                     try:
-                        await self._seed_rest_books_with_retry(
+                        next_reconcile = await self._seed_rest_reconcile_and_schedule_next(
                             cache,
                             universe.token_ids,
-                            reason="rest_reconcile",
+                            dirty_updates,
                         )
-                        dirty_queue.put_nowait(set(universe.token_ids))
+                        _publish_dirty_runtime_status(force=True)
                     except Exception as exc:
                         self.logger.warning("rest_reconcile_failed error=%s", exc)
-                    next_reconcile = now + self.config.rest_reconcile_interval_seconds
+                        next_reconcile = loop.time() + self.config.rest_reconcile_interval_seconds
         finally:
             if refresh_task is not None:
                 refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await refresh_task
             await manager.stop()
-
-    async def _collect_dirty_tokens(
-        self,
-        dirty_queue: asyncio.Queue[set[str]],
-        first_dirty: set[str],
-    ) -> set[str]:
-        dirty_tokens = set(first_dirty)
-        await asyncio.sleep(DIRTY_EVALUATION_DEBOUNCE_SECONDS)
-        while True:
-            try:
-                dirty_tokens.update(dirty_queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        return dirty_tokens
 
     async def _seed_rest_books(self, cache: MarketDataCache, token_ids: list[str], *, reason: str) -> set[str]:
         if not token_ids:
@@ -653,12 +730,26 @@ class ConditionalArbScanner:
             },
         )
 
+    async def _seed_rest_reconcile_and_schedule_next(
+        self,
+        cache: MarketDataCache,
+        token_ids: list[str],
+        dirty_updates: _DirtyTokenAccumulator,
+    ) -> float:
+        await self._seed_rest_books_with_retry(
+            cache,
+            token_ids,
+            reason="rest_reconcile",
+        )
+        dirty_updates.mark_full_universe(reason="rest_reconcile")
+        return asyncio.get_running_loop().time() + self.config.rest_reconcile_interval_seconds
+
     async def _refresh_market_universe(
         self,
         old_universe: MarketUniverse,
         cache: MarketDataCache,
         manager: MarketWebSocketManager,
-        dirty_queue: asyncio.Queue[set[str]],
+        dirty_updates: _DirtyTokenAccumulator,
         *,
         reason: str = "market_refresh",
     ) -> MarketUniverse:
@@ -708,7 +799,7 @@ class ConditionalArbScanner:
             len(removed_tokens),
         )
         if seeded:
-            dirty_queue.put_nowait(seeded)
+            dirty_updates.mark(seeded)
         return new_universe
 
     def run_one_cycle(self) -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+from polymarket_conditional_arb import market_universe_cache as cache_module
 from polymarket_conditional_arb.arb_models import BinaryMarket
 from polymarket_conditional_arb.market_universe_cache import (
     load_market_universe_cache,
@@ -50,6 +51,27 @@ def test_market_universe_cache_round_trips_binary_markets(tmp_path):
     assert [market.market_id for market in loaded.markets] == ["m1", "m2"]
     assert [market.yes_token_id for market in loaded.markets] == ["yes-1", "yes-2"]
     assert [market.no_token_id for market in loaded.markets] == ["no-1", "no-2"]
+
+
+def test_market_universe_cache_writer_does_not_build_one_large_json_string(tmp_path, monkeypatch):
+    path = tmp_path / "market_universe_cache.json"
+    fetched_at = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+
+    def fail_json_dumps(*_args, **_kwargs):
+        raise AssertionError("write_market_universe_cache should stream with json.dump")
+
+    monkeypatch.setattr(cache_module.json, "dumps", fail_json_dumps)
+
+    write_market_universe_cache(
+        path,
+        markets=[binary_market("m1", "yes-1", "no-1")],
+        events_fetched=1,
+        raw_markets=1,
+        gamma_query={"closed": "false"},
+        fetched_at=fetched_at,
+    )
+
+    assert path.exists()
 
 
 def test_market_universe_cache_ignores_stale_cache_with_warning(tmp_path, caplog):

@@ -336,3 +336,31 @@ class MarketWebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
             {"assets_ids": ["token-b"], "operation": "subscribe", "custom_feature_enabled": True},
             {"assets_ids": ["token-a"], "operation": "unsubscribe"},
         ]
+
+    async def test_multi_chunk_update_keeps_existing_workers_and_adds_delta_workers(self):
+        factory = FakeConnectFactory()
+        self.manager = MarketWebSocketManager(
+            settings=MarketWebSocketSettings(endpoint="ws://example", heartbeat_seconds=1, max_assets_per_connection=2),
+            cache=MarketDataCache(),
+            logger=logging.getLogger("test_market_ws"),
+            connect_factory=factory,
+        )
+
+        await self.manager.start(["token-a", "token-b", "token-c", "token-d"])
+        await wait_for(lambda: len(factory.websockets) == 2 and all(ws.sent for ws in factory.websockets))
+        original_websockets = list(factory.websockets)
+
+        await self.manager.update_tokens(["token-a", "token-b", "token-c", "token-d", "token-e"])
+        await wait_for(lambda: len(factory.websockets) == 3 and all(ws.sent for ws in factory.websockets))
+
+        assert self.manager.connection_count == 3
+        assert original_websockets[0].closed.is_set() is False
+        assert original_websockets[1].closed.is_set() is False
+        assert json.loads(factory.websockets[2].sent[0])["assets_ids"] == ["token-e"]
+
+        await self.manager.update_tokens(["token-a", "token-b"])
+
+        assert self.manager.connection_count == 1
+        assert original_websockets[0].closed.is_set() is False
+        assert original_websockets[1].closed.is_set() is True
+        assert factory.websockets[2].closed.is_set() is True
