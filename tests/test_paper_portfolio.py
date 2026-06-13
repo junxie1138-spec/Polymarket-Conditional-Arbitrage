@@ -119,6 +119,25 @@ def test_paired_execution_respects_trade_ceiling_and_cash():
     assert cash_limited.execution["capital_used"] == pytest.approx(5.0)
 
 
+def test_trade_ceiling_clamps_deep_profitable_book_instead_of_skipping():
+    p = params(trade_ceiling_usd=100.0)
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 210)]),
+        asks("no-token", [(0.49, 210)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution is not None
+    assert decision.execution["capital_used"] == pytest.approx(100.0)
+    assert decision.execution["quantity"] == pytest.approx(100.0 / 0.97)
+    assert decision.execution["quantity"] >= market().effective_min_order_size
+    assert decision.execution["stop_reason"] == "cash_or_ceiling_limit"
+
+
 def test_paper_execution_rejects_profitable_depth_below_polymarket_api_minimum():
     p = params()
     decision = evaluate_binary_paper_execution(
@@ -259,6 +278,38 @@ def test_same_executable_book_with_different_local_timestamps_does_not_duplicate
     )
 
     assert first.action == "EXECUTE"
+    assert second.action == "SKIP"
+    assert second.reason == "unchanged_book_snapshot"
+    assert len(portfolio.state["executions"]) == 1
+
+
+def test_capped_deep_book_fingerprint_prevents_duplicate_execution(tmp_path):
+    p = params(trade_ceiling_usd=100.0)
+    portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
+
+    first = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 210)]),
+        asks("no-token", [(0.49, 210)]),
+        as_of=AS_OF,
+    )
+    second = portfolio.execute_binary_complete_set(
+        market(),
+        asks_from_book(
+            {"asks": [{"price": "0.48", "size": "210"}]},
+            token_id="yes-token",
+            updated_at=AS_OF + timedelta(seconds=5),
+        ),
+        asks_from_book(
+            {"asks": [{"price": "0.49", "size": "210"}]},
+            token_id="no-token",
+            updated_at=AS_OF + timedelta(seconds=5),
+        ),
+        as_of=AS_OF + timedelta(seconds=5),
+    )
+
+    assert first.action == "EXECUTE"
+    assert first.execution["capital_used"] == pytest.approx(100.0)
     assert second.action == "SKIP"
     assert second.reason == "unchanged_book_snapshot"
     assert len(portfolio.state["executions"]) == 1
