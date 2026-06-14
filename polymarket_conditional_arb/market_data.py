@@ -377,6 +377,8 @@ class _MarketWebSocketWorker:
         connect_factory: Callable[[str], Any],
         on_dirty_tokens: Callable[[set[str]], None] | None = None,
         on_connection_lost: Callable[[set[str]], None] | None = None,
+        on_connection_error: Callable[[Exception], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self.asset_ids = set(str(asset_id) for asset_id in asset_ids if asset_id)
@@ -385,6 +387,8 @@ class _MarketWebSocketWorker:
         self.connect_factory = connect_factory
         self.on_dirty_tokens = on_dirty_tokens
         self.on_connection_lost = on_connection_lost
+        self.on_connection_error = on_connection_error
+        self.on_reconnect = on_reconnect
         self.websocket: Any | None = None
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -412,6 +416,8 @@ class _MarketWebSocketWorker:
                 raise
             except Exception as exc:
                 self.logger.warning("market_ws_connection_error error=%s", exc)
+                if self.on_connection_error is not None:
+                    self.on_connection_error(exc)
             finally:
                 if heartbeat_task is not None:
                     heartbeat_task.cancel()
@@ -423,6 +429,8 @@ class _MarketWebSocketWorker:
                     self.on_connection_lost(set(self.asset_ids))
 
             if not self._stop_event.is_set():
+                if self.on_reconnect is not None:
+                    self.on_reconnect()
                 await asyncio.sleep(backoff)
                 backoff = min(self.settings.reconnect_max_seconds, backoff * 2.0)
 
@@ -473,6 +481,8 @@ class MarketWebSocketManager:
         connect_factory: Callable[[str], Any] | None = None,
         on_dirty_tokens: Callable[[set[str]], None] | None = None,
         on_connection_lost: Callable[[set[str]], None] | None = None,
+        on_connection_error: Callable[[Exception], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self.cache = cache
@@ -480,6 +490,8 @@ class MarketWebSocketManager:
         self.connect_factory = connect_factory or _default_connect_factory
         self.on_dirty_tokens = on_dirty_tokens
         self.on_connection_lost = on_connection_lost
+        self.on_connection_error = on_connection_error
+        self.on_reconnect = on_reconnect
         self._workers: list[_MarketWebSocketWorker] = []
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -500,6 +512,8 @@ class MarketWebSocketManager:
             connect_factory=self.connect_factory,
             on_dirty_tokens=self.on_dirty_tokens,
             on_connection_lost=self.on_connection_lost,
+            on_connection_error=self.on_connection_error,
+            on_reconnect=self.on_reconnect,
         )
 
     async def start(self, asset_ids: Iterable[str]) -> None:

@@ -76,23 +76,31 @@ class _DirtyTokenAccumulator:
         self._event = asyncio.Event()
         self._tokens: set[str] = set()
         self._full_universe = False
+        self._full_reconcile_active = False
+        self._full_universe_ready = False
         self._evaluation_reason = "ws_dirty_update"
         self._coalesced_updates = 0
 
     @property
     def has_pending(self) -> bool:
-        return self._full_universe or bool(self._tokens)
+        return not self._full_reconcile_active and (bool(self._tokens) or (self._full_universe and self._full_universe_ready))
 
     def runtime_fields(self) -> dict[str, Any]:
         return {
-            "dirty_tokens_pending": 0 if self._full_universe else len(self._tokens),
+            "dirty_tokens_pending": 0 if self._full_universe or self._full_reconcile_active else len(self._tokens),
             "dirty_full_universe_pending": self._full_universe,
+            "dirty_full_reconcile_active": self._full_reconcile_active,
             "dirty_update_batches_pending": self._coalesced_updates,
         }
 
     def mark(self, token_ids: set[str] | list[str] | tuple[str, ...], *, reason: str = "ws_dirty_update") -> bool:
         ids = {str(token_id) for token_id in token_ids if token_id}
         if not ids:
+            return False
+        if self._full_reconcile_active or self._full_universe:
+            self._tokens.clear()
+            self._full_universe = True
+            self._coalesced_updates = max(1, self._coalesced_updates)
             return False
         if not self._full_universe:
             self._tokens.update(ids)
@@ -104,9 +112,36 @@ class _DirtyTokenAccumulator:
     def mark_full_universe(self, *, reason: str = "rest_reconcile") -> None:
         self._tokens.clear()
         self._full_universe = True
+        self._full_reconcile_active = False
+        self._full_universe_ready = True
         self._evaluation_reason = reason
-        self._coalesced_updates += 1
+        self._coalesced_updates = 1
         self._event.set()
+
+    def begin_full_reconcile(self, *, reason: str = "rest_reconcile") -> None:
+        self._tokens.clear()
+        self._full_universe = True
+        self._full_reconcile_active = True
+        self._full_universe_ready = False
+        self._evaluation_reason = reason
+        self._coalesced_updates = 1
+        self._event.clear()
+
+    def finish_full_reconcile(self) -> None:
+        if not self._full_universe:
+            self._full_universe = True
+        self._full_reconcile_active = False
+        self._full_universe_ready = True
+        self._coalesced_updates = 1
+        self._event.set()
+
+    def fail_full_reconcile(self) -> None:
+        if not self._full_universe:
+            self._full_universe = True
+        self._full_reconcile_active = False
+        self._full_universe_ready = False
+        self._coalesced_updates = 1
+        self._event.clear()
 
     async def wait(self, *, timeout: float) -> _DirtyTokenBatch | None:
         if not self.has_pending:
@@ -119,7 +154,8 @@ class _DirtyTokenAccumulator:
 
     def take_nowait(self) -> _DirtyTokenBatch | None:
         if not self.has_pending:
-            self._event.clear()
+            if not self._full_reconcile_active:
+                self._event.clear()
             return None
         if self._full_universe:
             token_ids = None
@@ -132,6 +168,8 @@ class _DirtyTokenAccumulator:
         )
         self._tokens.clear()
         self._full_universe = False
+        self._full_reconcile_active = False
+        self._full_universe_ready = False
         self._evaluation_reason = "ws_dirty_update"
         self._coalesced_updates = 0
         self._event.clear()
@@ -323,6 +361,33 @@ class ConditionalArbScanner:
     def _runtime_error(self, exc: Exception) -> None:
         self._runtime_update(last_error=f"{type(exc).__name__}: {exc}")
 
+    def _log_rest_book_seed_failures(self, *, reason: str) -> None:
+        if not self._runtime_started:
+            return
+        snapshot = self.runtime.snapshot()
+        failed_tokens = _progress_int(snapshot.get("book_seed_failed_tokens"))
+        failure_categories_raw = snapshot.get("book_seed_failure_categories")
+        failure_categories = (
+            dict(failure_categories_raw)
+            if isinstance(failure_categories_raw, Mapping)
+            else {}
+        )
+        if failed_tokens <= 0 and not failure_categories:
+            return
+        failed_token_sample_raw = snapshot.get("book_seed_failed_token_sample")
+        failed_token_sample = (
+            list(failed_token_sample_raw)
+            if isinstance(failed_token_sample_raw, (list, tuple))
+            else []
+        )
+        self.logger.warning(
+            "rest_book_seed_failures reason=%s failed_tokens=%s failed_token_sample=%s failure_categories=%s",
+            reason,
+            failed_tokens,
+            failed_token_sample,
+            failure_categories,
+        )
+
     def _book_seed_progress_callback(
         self,
         *,
@@ -339,6 +404,22 @@ class ConditionalArbScanner:
             remaining = _progress_int(progress.get("remaining_tokens"), progress_total - completed)
             received_books = _progress_int(progress.get("received_books"))
             failed_tokens = _progress_int(progress.get("failed_tokens"))
+            failed_token_sample_raw = progress.get("failed_token_sample")
+            failed_token_sample = (
+                [str(token_id) for token_id in failed_token_sample_raw if token_id][:5]
+                if isinstance(failed_token_sample_raw, (list, tuple))
+                else []
+            )
+            failure_categories_raw = progress.get("failure_categories")
+            failure_categories = (
+                {
+                    str(category): _progress_int(count)
+                    for category, count in failure_categories_raw.items()
+                    if category and _progress_int(count) > 0
+                }
+                if isinstance(failure_categories_raw, Mapping)
+                else {}
+            )
             current_batch_status = progress.get("current_batch_status")
             current_batch_started_at_utc = progress.get("current_batch_started_at_utc")
             elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
@@ -364,6 +445,8 @@ class ConditionalArbScanner:
                 book_seed_batch_started_at_utc=(
                     str(current_batch_started_at_utc) if current_batch_started_at_utc is not None else None
                 ),
+                book_seed_failed_token_sample=failed_token_sample,
+                book_seed_failure_categories=failure_categories,
             )
 
         update(
@@ -549,6 +632,11 @@ class ConditionalArbScanner:
         ws_params = replace(self.params, max_book_age_seconds=self.config.ws_stale_seconds)
         loop = asyncio.get_running_loop()
         last_dirty_runtime_update_at = 0.0
+        ws_reconnect_count = 0
+        ws_error_count = 0
+        ws_last_error: str | None = None
+        ws_stale_token_batches = 0
+        ws_stale_tokens = 0
 
         def _publish_dirty_runtime_status(*, force: bool = False) -> None:
             nonlocal last_dirty_runtime_update_at
@@ -558,15 +646,30 @@ class ConditionalArbScanner:
             last_dirty_runtime_update_at = now
             self._runtime_update(**dirty_updates.runtime_fields())
 
+        def _record_ws_error(exc: Exception) -> None:
+            nonlocal ws_error_count, ws_last_error
+            ws_error_count += 1
+            ws_last_error = f"{type(exc).__name__}: {exc}"
+            _publish_ws_runtime_status(force=True)
+
+        def _record_ws_reconnect() -> None:
+            nonlocal ws_reconnect_count
+            ws_reconnect_count += 1
+            _publish_ws_runtime_status(force=True)
+
         def _mark_dirty(token_ids: set[str]) -> None:
             if dirty_updates.mark(token_ids):
                 _publish_dirty_runtime_status()
 
         def _mark_disconnected_stale(token_ids: set[str]) -> None:
+            nonlocal ws_stale_token_batches, ws_stale_tokens
             if not token_ids:
                 return
+            ws_stale_token_batches += 1
+            ws_stale_tokens += len(token_ids)
             stale_at = datetime.now(timezone.utc) - timedelta(seconds=self.config.ws_stale_seconds + 1.0)
             cache.mark_tokens_stale(token_ids, stale_at=stale_at)
+            _publish_ws_runtime_status(force=True)
             if dirty_updates.mark(token_ids):
                 _publish_dirty_runtime_status()
 
@@ -580,7 +683,23 @@ class ConditionalArbScanner:
             logger=self.logger,
             on_dirty_tokens=_mark_dirty,
             on_connection_lost=_mark_disconnected_stale,
+            on_connection_error=_record_ws_error,
+            on_reconnect=_record_ws_reconnect,
         )
+
+        def _ws_runtime_fields() -> dict[str, Any]:
+            return {
+                "market_ws_connection_count": manager.connection_count,
+                "market_ws_reconnect_count": ws_reconnect_count,
+                "market_ws_error_count": ws_error_count,
+                "market_ws_last_error": ws_last_error,
+                "market_ws_stale_token_batches": ws_stale_token_batches,
+                "market_ws_stale_tokens": ws_stale_tokens,
+            }
+
+        def _publish_ws_runtime_status(*, force: bool = False) -> None:
+            _ = force
+            self._runtime_update(**_ws_runtime_fields())
 
         refresh_task: asyncio.Task[MarketUniverse] | None = None
 
@@ -631,6 +750,7 @@ class ConditionalArbScanner:
                     "connections": manager.connection_count,
                 },
             )
+            _publish_ws_runtime_status(force=True)
             self._evaluate_from_cache(
                 universe,
                 cache,
@@ -689,6 +809,8 @@ class ConditionalArbScanner:
                         _publish_dirty_runtime_status(force=True)
                     except Exception as exc:
                         self.logger.warning("rest_reconcile_failed error=%s", exc)
+                        self._runtime_error(exc)
+                        _publish_dirty_runtime_status(force=True)
                         next_reconcile = loop.time() + self.config.rest_reconcile_interval_seconds
         finally:
             if refresh_task is not None:
@@ -711,6 +833,7 @@ class ConditionalArbScanner:
             book_seed_received_books=len(books),
             book_seed_eta_seconds=0.0,
         )
+        self._log_rest_book_seed_failures(reason=reason)
         self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(updated))
         return updated
 
@@ -736,12 +859,21 @@ class ConditionalArbScanner:
         token_ids: list[str],
         dirty_updates: _DirtyTokenAccumulator,
     ) -> float:
-        await self._seed_rest_books_with_retry(
-            cache,
-            token_ids,
-            reason="rest_reconcile",
-        )
-        dirty_updates.mark_full_universe(reason="rest_reconcile")
+        dirty_updates.begin_full_reconcile(reason="rest_reconcile")
+        self._runtime_update(**dirty_updates.runtime_fields())
+        try:
+            await self._seed_rest_books_with_retry(
+                cache,
+                token_ids,
+                reason="rest_reconcile",
+            )
+        except Exception as exc:
+            dirty_updates.fail_full_reconcile()
+            self._runtime_error(exc)
+            self._runtime_update(**dirty_updates.runtime_fields())
+            raise
+        dirty_updates.finish_full_reconcile()
+        self._runtime_update(**dirty_updates.runtime_fields(), last_error=None)
         return asyncio.get_running_loop().time() + self.config.rest_reconcile_interval_seconds
 
     async def _refresh_market_universe(
@@ -769,6 +901,9 @@ class ConditionalArbScanner:
                 reason="market_refresh_added",
             )
         await manager.update_tokens(new_universe.token_ids)
+        connection_count = getattr(manager, "connection_count", None)
+        if connection_count is not None:
+            self._runtime_update(market_ws_connection_count=connection_count)
         if removed_tokens:
             cache.remove_tokens(removed_tokens)
 
@@ -857,6 +992,7 @@ class ConditionalArbScanner:
                 book_seed_received_books=len(books),
                 book_seed_eta_seconds=0.0,
             )
+            self._log_rest_book_seed_failures(reason=reason)
             return books
 
         return self._run_with_retries(

@@ -194,6 +194,8 @@ class RuntimeStatusWriter:
             "book_seed_batch_end_token": 0,
             "book_seed_batch_status": None,
             "book_seed_batch_started_at_utc": None,
+            "book_seed_failed_token_sample": [],
+            "book_seed_failure_categories": {},
             "events_fetched": 0,
             "raw_markets": 0,
             "tradable_markets": 0,
@@ -209,7 +211,14 @@ class RuntimeStatusWriter:
             "last_cycle_skips": 0,
             "dirty_tokens_pending": 0,
             "dirty_full_universe_pending": False,
+            "dirty_full_reconcile_active": False,
             "dirty_update_batches_pending": 0,
+            "market_ws_connection_count": 0,
+            "market_ws_reconnect_count": 0,
+            "market_ws_error_count": 0,
+            "market_ws_last_error": None,
+            "market_ws_stale_token_batches": 0,
+            "market_ws_stale_tokens": 0,
             "runtime_status_write_failures": 0,
             "last_runtime_status_write_error": None,
         }
@@ -462,6 +471,25 @@ def _format_token_rate(value: float | None) -> str:
     return f"{value:,.1f} tok/s"
 
 
+def _format_sample(values: Any) -> str:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        return "none"
+    sample = [str(value) for value in values if value not in (None, "")]
+    return ", ".join(sample) if sample else "none"
+
+
+def _format_category_counts(values: Any) -> str:
+    if not isinstance(values, Mapping):
+        return "none"
+    parts: list[str] = []
+    for category, count in sorted(values.items()):
+        count_value = _int_value(count)
+        if count_value <= 0:
+            continue
+        parts.append(f"{category}={_format_count(count_value)}")
+    return ", ".join(parts) if parts else "none"
+
+
 def _kv(label: str, value: Any) -> str:
     return f"{label.ljust(LABEL_WIDTH)}{value}"
 
@@ -521,6 +549,23 @@ def format_status_dashboard(
         _kv("Phase", runtime_row.get("phase") or "unknown"),
         _kv("Detail", detail),
     ]
+    ws_connection_count = _int_value(runtime_row.get("market_ws_connection_count"))
+    ws_reconnect_count = _int_value(runtime_row.get("market_ws_reconnect_count"))
+    ws_error_count = _int_value(runtime_row.get("market_ws_error_count"))
+    ws_stale_batches = _int_value(runtime_row.get("market_ws_stale_token_batches"))
+    ws_stale_tokens = _int_value(runtime_row.get("market_ws_stale_tokens"))
+    ws_last_error = runtime_row.get("market_ws_last_error")
+    if any((ws_connection_count, ws_reconnect_count, ws_error_count, ws_stale_batches, ws_last_error)):
+        health_lines.extend(
+            [
+                "",
+                _kv("WS conns", _format_count(ws_connection_count)),
+                _kv("WS reconnects", _format_count(ws_reconnect_count)),
+                _kv("WS errors", _format_count(ws_error_count)),
+                _kv("WS stale", f"{_format_count(ws_stale_batches)} batches / {_format_count(ws_stale_tokens)} tokens"),
+                _kv("WS error", ws_last_error or "none"),
+            ]
+        )
     if failures > 0:
         health_lines.extend(
             [
@@ -589,16 +634,24 @@ def format_status_dashboard(
         if str(runtime_row.get("book_seed_batch_status") or "") == "in_flight":
             warmup_lines.append(_kv("In flight", _format_age(in_flight_age)))
         warmup_lines.append(_kv("Failed", _format_count(_int_value(runtime_row.get("book_seed_failed_tokens")))))
+        failure_sample = _format_sample(runtime_row.get("book_seed_failed_token_sample"))
+        failure_categories = _format_category_counts(runtime_row.get("book_seed_failure_categories"))
+        if failure_sample != "none":
+            warmup_lines.append(_kv("Fail sample", failure_sample))
+        if failure_categories != "none":
+            warmup_lines.append(_kv("Fail types", failure_categories))
 
-    dirty_batches = _int_value(runtime_row.get("dirty_update_batches_pending"))
     dirty_tokens = _int_value(runtime_row.get("dirty_tokens_pending"))
     dirty_full_universe = bool(runtime_row.get("dirty_full_universe_pending"))
-    dirty_backlog_text: str | None = None
-    dirty_update_text = "1 update" if dirty_batches == 1 else f"{_format_count(dirty_batches)} updates"
-    if dirty_full_universe:
-        dirty_backlog_text = f"full universe ({dirty_update_text})"
-    elif dirty_tokens > 0 or dirty_batches > 0:
-        dirty_backlog_text = f"{_format_count(dirty_tokens)} tokens ({dirty_update_text})"
+    dirty_full_reconcile_active = bool(runtime_row.get("dirty_full_reconcile_active"))
+    if dirty_full_reconcile_active:
+        dirty_backlog_text = "covered by active REST reconcile"
+    elif dirty_full_universe:
+        dirty_backlog_text = "full universe"
+    elif dirty_tokens > 0:
+        dirty_backlog_text = f"{_format_count(dirty_tokens)} tokens"
+    else:
+        dirty_backlog_text = "none"
 
     execution_lines = [
         "COSTS",
@@ -610,6 +663,7 @@ def format_status_dashboard(
         "EXECUTION",
         _kv("Last exec", _format_timestamp(portfolio.get("last_execution_at_utc"))),
         _kv("Last cycle", runtime_row.get("last_evaluation_reason") or "n/a"),
+        _kv("Dirty backlog", dirty_backlog_text),
         _kv("Completed", _format_timestamp(runtime_row.get("last_cycle_completed_at_utc"))),
         _kv("Evaluated", _format_count(_int_value(runtime_row.get("last_cycle_evaluated_markets")))),
         _kv("Executions", _format_count(_int_value(runtime_row.get("last_cycle_executions")))),
@@ -617,8 +671,6 @@ def format_status_dashboard(
         _kv("Unmatched", unmatched_text),
         _kv("Last error", runtime_row.get("last_error") or "none"),
     ]
-    if dirty_backlog_text is not None:
-        execution_lines.insert(9, _kv("Dirty backlog", dirty_backlog_text))
     _append_split_section(rows, warmup_lines, execution_lines)
 
     if percent is not None:

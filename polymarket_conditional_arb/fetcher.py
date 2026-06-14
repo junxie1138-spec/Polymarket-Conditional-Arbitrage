@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
 from . import config, network
 from .arb_models import BinaryMarket, as_bool
 from .order_book import asks_from_book
+
+MAX_FAILURE_SAMPLE_TOKENS = 5
 
 
 def _chunked(values: list[str], size: int) -> Iterable[list[str]]:
@@ -35,6 +37,8 @@ def _emit_ask_book_progress(
     current_batch_end_token: int | None = None,
     current_batch_status: str | None = None,
     current_batch_started_at_utc: str | None = None,
+    failed_token_sample: Iterable[str] | None = None,
+    failure_categories: Mapping[str, int] | None = None,
 ) -> None:
     if on_progress is None:
         return
@@ -52,6 +56,8 @@ def _emit_ask_book_progress(
         "current_batch_end_token": current_batch_end_token,
         "current_batch_status": current_batch_status,
         "current_batch_started_at_utc": current_batch_started_at_utc,
+        "failed_token_sample": list(failed_token_sample) if failed_token_sample is not None else None,
+        "failure_categories": dict(failure_categories) if failure_categories is not None else None,
     }
     progress.update({key: value for key, value in optional.items() if value is not None})
     on_progress(progress)
@@ -59,6 +65,10 @@ def _emit_ask_book_progress(
 
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _error_category(stage: str, exc: Exception) -> str:
+    return f"{stage}:{type(exc).__name__}"
 
 
 class GammaClobClient:
@@ -227,8 +237,18 @@ class GammaClobClient:
         ask_books: dict[str, Any] = {}
         completed_tokens = 0
         failed_tokens = 0
+        failed_token_sample: list[str] = []
+        failure_categories: dict[str, int] = {}
         total_tokens = len(unique_token_ids)
         total_batches = (total_tokens + self.batch_book_limit - 1) // self.batch_book_limit
+
+        def add_failure_category(category: str, count: int = 1) -> None:
+            failure_categories[category] = failure_categories.get(category, 0) + max(1, int(count))
+
+        def add_failed_token_sample(token_id: str) -> None:
+            if len(failed_token_sample) < MAX_FAILURE_SAMPLE_TOKENS:
+                failed_token_sample.append(str(token_id))
+
         for batch_index, chunk in enumerate(_chunked(unique_token_ids, self.batch_book_limit), start=1):
             batch_start_token = completed_tokens + 1
             batch_end_token = completed_tokens + len(chunk)
@@ -245,16 +265,21 @@ class GammaClobClient:
                 current_batch_end_token=batch_end_token,
                 current_batch_status="in_flight",
                 current_batch_started_at_utc=batch_started_at_utc,
+                failed_token_sample=failed_token_sample,
+                failure_categories=failure_categories,
             )
             received_at = datetime.now(timezone.utc)
             batch_exc: Exception | None = None
             fallback_tokens: list[str] = []
+            fallback_reasons: dict[str, str] = {}
             try:
                 raw_books = self.fetch_order_books_batch(chunk)
                 for token_id in chunk:
                     raw_book = raw_books.get(token_id)
                     if raw_book is None:
                         fallback_tokens.append(token_id)
+                        fallback_reasons[token_id] = "batch:missing_book"
+                        add_failure_category("batch:missing_book")
                         continue
                     try:
                         ask_books[token_id] = asks_from_book(
@@ -263,11 +288,17 @@ class GammaClobClient:
                             source="rest_books_batch",
                             updated_at=received_at,
                         )
-                    except Exception:
+                    except Exception as exc:
                         fallback_tokens.append(token_id)
+                        category = _error_category("batch_parse", exc)
+                        fallback_reasons[token_id] = category
+                        add_failure_category(category)
             except Exception as exc:
                 batch_exc = exc
                 fallback_tokens = list(chunk)
+                category = _error_category("batch", exc)
+                fallback_reasons = {token_id: category for token_id in chunk}
+                add_failure_category(category, len(chunk))
 
             if fallback_tokens:
                 fallback_failures: dict[str, Exception] = {}
@@ -276,13 +307,20 @@ class GammaClobClient:
                         raw_book = self.fetch_order_book(token_id)
                     except Exception as exc:
                         fallback_failures[token_id] = exc
+                        add_failure_category(_error_category("fallback", exc))
+                        add_failed_token_sample(token_id)
                         continue
-                    ask_books[token_id] = asks_from_book(
-                        raw_book,
-                        token_id=token_id,
-                        source="rest_book_fallback",
-                        updated_at=datetime.now(timezone.utc),
-                    )
+                    try:
+                        ask_books[token_id] = asks_from_book(
+                            raw_book,
+                            token_id=token_id,
+                            source="rest_book_fallback",
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    except Exception as exc:
+                        fallback_failures[token_id] = exc
+                        add_failure_category(_error_category("fallback_parse", exc))
+                        add_failed_token_sample(token_id)
                 failed_tokens += len(fallback_failures)
                 completed_tokens += len(chunk)
                 _emit_ask_book_progress(
@@ -297,6 +335,8 @@ class GammaClobClient:
                     current_batch_end_token=batch_end_token,
                     current_batch_status="complete",
                     current_batch_started_at_utc=batch_started_at_utc,
+                    failed_token_sample=failed_token_sample,
+                    failure_categories=failure_categories,
                 )
                 if batch_exc is not None and len(fallback_failures) == len(chunk):
                     raise RuntimeError(
@@ -316,5 +356,7 @@ class GammaClobClient:
                 current_batch_end_token=batch_end_token,
                 current_batch_status="complete",
                 current_batch_started_at_utc=batch_started_at_utc,
+                failed_token_sample=failed_token_sample,
+                failure_categories=failure_categories,
             )
         return ask_books

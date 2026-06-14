@@ -71,6 +71,15 @@ class FakeConnectFactory:
         return FakeConnection(websocket)
 
 
+class FailingConnectFactory:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, _endpoint: str):
+        self.calls += 1
+        raise RuntimeError("connect failed")
+
+
 def test_book_snapshot_creates_sorted_ask_and_bid_cache():
     cache = MarketDataCache()
     updated = cache.apply_message(
@@ -317,6 +326,30 @@ class MarketWebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
             ["token-a"],
             ["token-a"],
         ]
+
+    async def test_connection_error_and_reconnect_callbacks_fire(self):
+        factory = FailingConnectFactory()
+        errors = []
+        reconnects = []
+        self.manager = MarketWebSocketManager(
+            settings=MarketWebSocketSettings(
+                endpoint="ws://example",
+                heartbeat_seconds=1,
+                max_assets_per_connection=500,
+                reconnect_initial_seconds=0.01,
+            ),
+            cache=MarketDataCache(),
+            logger=logging.getLogger("test_market_ws"),
+            connect_factory=factory,
+            on_connection_error=errors.append,
+            on_reconnect=lambda: reconnects.append(True),
+        )
+
+        await self.manager.start(["token-a"])
+        await wait_for(lambda: factory.calls >= 2 and errors and reconnects)
+
+        assert isinstance(errors[0], RuntimeError)
+        assert str(errors[0]) == "connect failed"
 
     async def test_dynamic_subscribe_and_unsubscribe_updates_token_universe(self):
         factory = FakeConnectFactory()

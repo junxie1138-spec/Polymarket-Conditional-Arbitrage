@@ -637,6 +637,7 @@ def test_dirty_token_accumulator_coalesces_updates_without_queue_growth():
     assert dirty_updates.runtime_fields() == {
         "dirty_tokens_pending": 10,
         "dirty_full_universe_pending": False,
+        "dirty_full_reconcile_active": False,
         "dirty_update_batches_pending": 1000,
     }
     dirty_batch = dirty_updates.take_nowait()
@@ -658,6 +659,7 @@ def test_dirty_token_accumulator_coalesces_updates_without_queue_growth():
     assert dirty_updates.runtime_fields() == {
         "dirty_tokens_pending": 0,
         "dirty_full_universe_pending": False,
+        "dirty_full_reconcile_active": False,
         "dirty_update_batches_pending": 0,
     }
 
@@ -671,14 +673,15 @@ def test_full_universe_dirty_accumulator_uses_bounded_sentinel():
     assert dirty_updates.runtime_fields() == {
         "dirty_tokens_pending": 0,
         "dirty_full_universe_pending": True,
-        "dirty_update_batches_pending": 3,
+        "dirty_full_reconcile_active": False,
+        "dirty_update_batches_pending": 1,
     }
     dirty_batch = dirty_updates.take_nowait()
 
     assert dirty_batch is not None
     assert dirty_batch.token_ids is None
     assert dirty_batch.evaluation_reason == "rest_reconcile"
-    assert dirty_batch.coalesced_updates == 3
+    assert dirty_batch.coalesced_updates == 1
 
 
 def test_rest_reconcile_schedules_next_interval_after_seed_completion(tmp_path):
@@ -713,6 +716,90 @@ def test_rest_reconcile_schedules_next_interval_after_seed_completion(tmp_path):
     assert dirty_batch is not None
     assert dirty_batch.token_ids is None
     assert dirty_batch.evaluation_reason == "rest_reconcile"
+
+
+def test_active_rest_reconcile_collapses_dirty_updates_until_seed_finishes(tmp_path):
+    cfg = replace(scan_config(tmp_path), rest_reconcile_interval_seconds=1)
+    scanner = scanner_for(tmp_path, TwoMarketClient(), cfg=cfg)
+    cache = MarketDataCache()
+    dirty_updates = _DirtyTokenAccumulator()
+    active_fields = []
+
+    async def slow_seed(_cache, token_ids, *, reason):
+        assert reason == "rest_reconcile"
+        for index in range(1000):
+            dirty_updates.mark({f"yes-{index}", f"no-{index}"})
+        active_fields.append(dirty_updates.runtime_fields())
+        await asyncio.sleep(0)
+        return set(token_ids)
+
+    scanner._seed_rest_books_with_retry = slow_seed
+
+    asyncio.run(
+        scanner._seed_rest_reconcile_and_schedule_next(
+            cache,
+            ["yes-1", "no-1"],
+            dirty_updates,
+        )
+    )
+
+    assert active_fields == [
+        {
+            "dirty_tokens_pending": 0,
+            "dirty_full_universe_pending": True,
+            "dirty_full_reconcile_active": True,
+            "dirty_update_batches_pending": 1,
+        }
+    ]
+    assert dirty_updates.runtime_fields() == {
+        "dirty_tokens_pending": 0,
+        "dirty_full_universe_pending": True,
+        "dirty_full_reconcile_active": False,
+        "dirty_update_batches_pending": 1,
+    }
+    dirty_batch = dirty_updates.take_nowait()
+    assert dirty_batch is not None
+    assert dirty_batch.token_ids is None
+    assert dirty_batch.evaluation_reason == "rest_reconcile"
+
+
+def test_rest_reconcile_failure_keeps_pending_full_universe_and_records_error(tmp_path):
+    cfg = replace(scan_config(tmp_path), rest_reconcile_interval_seconds=1)
+    scanner = scanner_for(tmp_path, TwoMarketClient(), cfg=cfg)
+    cache = MarketDataCache()
+    dirty_updates = _DirtyTokenAccumulator()
+
+    async def failing_seed(_cache, _token_ids, *, reason):
+        assert reason == "rest_reconcile"
+        dirty_updates.mark({"yes-during-reconcile", "no-during-reconcile"})
+        raise RuntimeError("seed unavailable")
+
+    scanner._seed_rest_books_with_retry = failing_seed
+    scanner._start_runtime(detail="test reconcile")
+    try:
+        with pytest.raises(RuntimeError, match="seed unavailable"):
+            asyncio.run(
+                scanner._seed_rest_reconcile_and_schedule_next(
+                    cache,
+                    ["yes-1", "no-1"],
+                    dirty_updates,
+                )
+            )
+        runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    finally:
+        scanner._stop_runtime()
+
+    assert dirty_updates.runtime_fields() == {
+        "dirty_tokens_pending": 0,
+        "dirty_full_universe_pending": True,
+        "dirty_full_reconcile_active": False,
+        "dirty_update_batches_pending": 1,
+    }
+    assert runtime["dirty_full_universe_pending"] is True
+    assert runtime["dirty_full_reconcile_active"] is False
+    assert runtime["dirty_update_batches_pending"] == 1
+    assert runtime["last_error"] == "RuntimeError: seed unavailable"
+    assert dirty_updates.take_nowait() is None
 
 
 def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
@@ -952,6 +1039,7 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     assert "Updated 2026-06-10 12:00:00Z" in online_lines[2]
     assert "Last cycle      ws_bootstrap" in online
     assert "Completed       2026-06-10 12:00:00Z" in online
+    assert "Dirty backlog   none" in online
     assert "Evaluated       2" in online
     assert "Executions      1" in online
     assert "Skips           1" in online
@@ -1107,7 +1195,7 @@ def test_status_dashboard_surfaces_dirty_backlog():
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
     assert assert_dashboard_frame(dashboard)
-    assert "Dirty backlog   125 tokens (8 updates)" in dashboard
+    assert "Dirty backlog   125 tokens" in dashboard
 
 
 def test_status_dashboard_surfaces_full_universe_dirty_backlog():
@@ -1138,7 +1226,115 @@ def test_status_dashboard_surfaces_full_universe_dirty_backlog():
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
     assert assert_dashboard_frame(dashboard)
-    assert "Dirty backlog   full universe (1 update)" in dashboard
+    assert "Dirty backlog   full universe" in dashboard
+
+
+def test_status_dashboard_surfaces_active_rest_reconcile_dirty_backlog():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "seeding REST ask books: rest_reconcile (250/1000 tokens)",
+        "dirty_tokens_pending": 0,
+        "dirty_full_universe_pending": True,
+        "dirty_full_reconcile_active": True,
+        "dirty_update_batches_pending": 1,
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert assert_dashboard_frame(dashboard)
+    assert "Dirty backlog   covered by active REST reconcile" in dashboard
+
+
+def test_status_dashboard_surfaces_rest_failure_samples_and_categories():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "warmup",
+        "detail": "seeding REST ask books: rest_reconcile (500/500 tokens)",
+        "book_seed_reason": "rest_reconcile",
+        "book_seed_total_tokens": 500,
+        "book_seed_completed_tokens": 500,
+        "book_seed_remaining_tokens": 0,
+        "book_seed_received_books": 498,
+        "book_seed_failed_tokens": 2,
+        "book_seed_failed_token_sample": ["token-a", "token-b"],
+        "book_seed_failure_categories": {"batch:ValueError": 500, "fallback:RuntimeError": 2},
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert assert_dashboard_frame(dashboard)
+    assert "Failed          2" in dashboard
+    assert "Fail sample     token-a, token-b" in dashboard
+    assert "Fail types      batch:ValueError=500" in dashboard
+
+
+def test_status_dashboard_surfaces_websocket_health():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "online",
+        "market_ws_connection_count": 7,
+        "market_ws_reconnect_count": 3,
+        "market_ws_error_count": 2,
+        "market_ws_last_error": "ConnectionClosedError: dropped",
+        "market_ws_stale_token_batches": 2,
+        "market_ws_stale_tokens": 1000,
+    }
+    portfolio_status = {
+        "cash": 1000.0,
+        "realized_pnl": 0.0,
+        "total_equity": 1000.0,
+        "return_pct": 0.0,
+        "trade_count": 0,
+        "win_rate_pct": 0.0,
+        "costs": {},
+        "last_execution_at_utc": None,
+        "unmatched_inventory": [],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert assert_dashboard_frame(dashboard)
+    assert "WS conns        7" in dashboard
+    assert "WS reconnects   3" in dashboard
+    assert "WS errors       2" in dashboard
+    assert "WS stale        2 batches / 1,000 tokens" in dashboard
+    assert "WS error        ConnectionClosedError:" in dashboard
 
 
 def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):
