@@ -279,6 +279,7 @@ def scan_config(tmp_path: Path):
         tax_bps=0.0,
         max_book_age_seconds=20.0,
         include_neg_risk=True,
+        paper_simulation=config.PaperExecutionSimulationConfig.zero_friction(),
     )
 
 
@@ -447,6 +448,32 @@ def test_fresh_full_startup_cache_skips_gamma_discovery_without_token_cap(tmp_pa
     assert [market.market_id for market in universe.markets] == ["m1", "m2"]
     assert universe.events_fetched == 2
     assert universe.raw_markets == 2
+
+
+def test_ws_startup_missing_full_cache_uses_priority_slice_without_writing_cache(tmp_path):
+    cfg = replace(
+        scan_config(tmp_path),
+        fast_start_event_limit=20,
+        fast_start_token_limit=2,
+    )
+    client = RecordingDiscoveryClient(
+        startup_rows=[
+            TwoMarketClient._market_row("m1", "yes-1", "no-1"),
+            TwoMarketClient._market_row("m2", "yes-2", "no-2"),
+        ],
+        full_rows=[TwoMarketClient._market_row("m3", "yes-3", "no-3")],
+    )
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+
+    selection = scanner._fetch_ws_startup_market_universe()
+
+    assert client.slice_calls == [{"limit": 20, "order": "volume24hr", "ascending": False}]
+    assert client.full_calls == 0
+    assert selection.coverage_status == "priority"
+    assert selection.coverage_complete is False
+    assert [market.market_id for market in selection.universe.markets] == ["m1"]
+    assert selection.universe.token_ids == ["yes-1", "no-1"]
+    assert not cfg.market_universe_cache_path.exists()
 
 
 def test_corrupt_startup_cache_rebuilds_full_universe(tmp_path, caplog):
@@ -628,6 +655,43 @@ def test_dirty_token_evaluation_runs_while_slow_full_refresh_is_in_progress(tmp_
     assert [market.market_id for market in refreshed_universe.markets] == ["m1", "m2"]
 
 
+def test_rest_seed_evaluates_first_completed_chunk_before_later_chunk_fetch(tmp_path):
+    events = []
+
+    class ChunkedClient(TwoMarketClient):
+        batch_book_limit = 2
+
+        def fetch_ask_books(self, token_ids, *, on_progress=None):
+            token_ids = list(token_ids)
+            events.append(("fetch", tuple(token_ids)))
+            return super().fetch_ask_books(token_ids, on_progress=on_progress)
+
+    client = ChunkedClient()
+    scanner = scanner_for(tmp_path, client)
+    universe = scanner._fetch_market_universe()
+    original_evaluate = scanner._evaluate_from_cache
+
+    def record_evaluate(universe_arg, cache, *, dirty_token_ids, evaluation_reason, params):
+        events.append(("eval", tuple(sorted(dirty_token_ids or []))))
+        return original_evaluate(
+            universe_arg,
+            cache,
+            dirty_token_ids=dirty_token_ids,
+            evaluation_reason=evaluation_reason,
+            params=params,
+        )
+
+    scanner._evaluate_from_cache = record_evaluate
+
+    result = scanner._run_incremental_rest_evaluation(universe, reason="rest_cycle")
+
+    assert result["summary"]["executions"] == 2
+    assert events[0] == ("fetch", ("yes-1", "no-1"))
+    assert events[1] == ("eval", ("no-1", "yes-1"))
+    assert events[2] == ("fetch", ("yes-2", "no-2"))
+    assert events[3] == ("eval", ("no-2", "yes-2"))
+
+
 def test_dirty_token_accumulator_coalesces_updates_without_queue_growth():
     dirty_updates = _DirtyTokenAccumulator()
 
@@ -690,12 +754,14 @@ def test_rest_reconcile_schedules_next_interval_after_seed_completion(tmp_path):
     cache = MarketDataCache()
     dirty_updates = _DirtyTokenAccumulator()
 
-    async def slow_seed(_cache, token_ids, *, reason):
+    async def slow_seed(_cache, token_ids, *, reason, on_chunk_seeded=None):
         assert reason == "rest_reconcile"
         await asyncio.sleep(0.05)
+        if on_chunk_seeded is not None:
+            on_chunk_seeded(set(token_ids))
         return set(token_ids)
 
-    scanner._seed_rest_books_with_retry = slow_seed
+    scanner._seed_rest_books_incrementally_async = slow_seed
 
     async def run_reconcile():
         loop = asyncio.get_running_loop()
@@ -714,26 +780,28 @@ def test_rest_reconcile_schedules_next_interval_after_seed_completion(tmp_path):
     assert finished - started >= 0.04
     assert next_reconcile - finished >= 0.99
     assert dirty_batch is not None
-    assert dirty_batch.token_ids is None
+    assert dirty_batch.token_ids == {"yes-1", "no-1"}
     assert dirty_batch.evaluation_reason == "rest_reconcile"
 
 
-def test_active_rest_reconcile_collapses_dirty_updates_until_seed_finishes(tmp_path):
+def test_active_rest_reconcile_keeps_dirty_updates_visible(tmp_path):
     cfg = replace(scan_config(tmp_path), rest_reconcile_interval_seconds=1)
     scanner = scanner_for(tmp_path, TwoMarketClient(), cfg=cfg)
     cache = MarketDataCache()
     dirty_updates = _DirtyTokenAccumulator()
     active_fields = []
 
-    async def slow_seed(_cache, token_ids, *, reason):
+    async def slow_seed(_cache, token_ids, *, reason, on_chunk_seeded=None):
         assert reason == "rest_reconcile"
         for index in range(1000):
             dirty_updates.mark({f"yes-{index}", f"no-{index}"})
         active_fields.append(dirty_updates.runtime_fields())
         await asyncio.sleep(0)
+        if on_chunk_seeded is not None:
+            on_chunk_seeded(set(token_ids))
         return set(token_ids)
 
-    scanner._seed_rest_books_with_retry = slow_seed
+    scanner._seed_rest_books_incrementally_async = slow_seed
 
     asyncio.run(
         scanner._seed_rest_reconcile_and_schedule_next(
@@ -745,36 +813,39 @@ def test_active_rest_reconcile_collapses_dirty_updates_until_seed_finishes(tmp_p
 
     assert active_fields == [
         {
-            "dirty_tokens_pending": 0,
-            "dirty_full_universe_pending": True,
-            "dirty_full_reconcile_active": True,
-            "dirty_update_batches_pending": 1,
+            "dirty_tokens_pending": 2000,
+            "dirty_full_universe_pending": False,
+            "dirty_full_reconcile_active": False,
+            "dirty_update_batches_pending": 1000,
         }
     ]
     assert dirty_updates.runtime_fields() == {
-        "dirty_tokens_pending": 0,
-        "dirty_full_universe_pending": True,
+        "dirty_tokens_pending": 2000,
+        "dirty_full_universe_pending": False,
         "dirty_full_reconcile_active": False,
-        "dirty_update_batches_pending": 1,
+        "dirty_update_batches_pending": 1001,
     }
     dirty_batch = dirty_updates.take_nowait()
     assert dirty_batch is not None
-    assert dirty_batch.token_ids is None
+    assert dirty_batch.token_ids is not None
+    assert {"yes-1", "no-1"}.issubset(dirty_batch.token_ids)
+    assert "yes-999" in dirty_batch.token_ids
     assert dirty_batch.evaluation_reason == "rest_reconcile"
 
 
-def test_rest_reconcile_failure_keeps_pending_full_universe_and_records_error(tmp_path):
+def test_rest_reconcile_failure_keeps_normal_dirty_updates_and_records_error(tmp_path):
     cfg = replace(scan_config(tmp_path), rest_reconcile_interval_seconds=1)
     scanner = scanner_for(tmp_path, TwoMarketClient(), cfg=cfg)
     cache = MarketDataCache()
     dirty_updates = _DirtyTokenAccumulator()
 
-    async def failing_seed(_cache, _token_ids, *, reason):
+    async def failing_seed(_cache, _token_ids, *, reason, on_chunk_seeded=None):
+        _ = on_chunk_seeded
         assert reason == "rest_reconcile"
         dirty_updates.mark({"yes-during-reconcile", "no-during-reconcile"})
         raise RuntimeError("seed unavailable")
 
-    scanner._seed_rest_books_with_retry = failing_seed
+    scanner._seed_rest_books_incrementally_async = failing_seed
     scanner._start_runtime(detail="test reconcile")
     try:
         with pytest.raises(RuntimeError, match="seed unavailable"):
@@ -790,16 +861,19 @@ def test_rest_reconcile_failure_keeps_pending_full_universe_and_records_error(tm
         scanner._stop_runtime()
 
     assert dirty_updates.runtime_fields() == {
-        "dirty_tokens_pending": 0,
-        "dirty_full_universe_pending": True,
+        "dirty_tokens_pending": 2,
+        "dirty_full_universe_pending": False,
         "dirty_full_reconcile_active": False,
         "dirty_update_batches_pending": 1,
     }
-    assert runtime["dirty_full_universe_pending"] is True
+    assert runtime["dirty_tokens_pending"] == 2
+    assert runtime["dirty_full_universe_pending"] is False
     assert runtime["dirty_full_reconcile_active"] is False
     assert runtime["dirty_update_batches_pending"] == 1
     assert runtime["last_error"] == "RuntimeError: seed unavailable"
-    assert dirty_updates.take_nowait() is None
+    dirty_batch = dirty_updates.take_nowait()
+    assert dirty_batch is not None
+    assert dirty_batch.token_ids == {"yes-during-reconcile", "no-during-reconcile"}
 
 
 def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
@@ -1258,7 +1332,8 @@ def test_status_dashboard_surfaces_active_rest_reconcile_dirty_backlog():
     dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
 
     assert assert_dashboard_frame(dashboard)
-    assert "Dirty backlog   covered by active REST reconcile" in dashboard
+    assert "Dirty backlog   full universe" in dashboard
+    assert "Reconcile       active" in dashboard
 
 
 def test_status_dashboard_surfaces_rest_failure_samples_and_categories():
@@ -1937,6 +2012,51 @@ def test_websocket_dirty_tick_does_not_fetch_rest_books(tmp_path):
     assert client.fetch_ask_books_calls == 0
 
 
+def test_dirty_token_with_missing_mate_backfills_only_paired_market(tmp_path):
+    class RecordingBookClient(TwoMarketClient):
+        def __init__(self):
+            super().__init__()
+            self.fetch_ask_books_token_calls = []
+
+        def fetch_ask_books(self, token_ids, *, on_progress=None):
+            token_ids = list(token_ids)
+            self.fetch_ask_books_token_calls.append(token_ids)
+            return super().fetch_ask_books(token_ids, on_progress=on_progress)
+
+    client = RecordingBookClient()
+    scanner = scanner_for(tmp_path, client)
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    cache.seed_ask_books(
+        {
+            "yes-1": asks_from_book(
+                {"asks": [{"price": "0.48", "size": "10"}]},
+                token_id="yes-1",
+                updated_at=datetime.now(timezone.utc),
+            )
+        }
+    )
+
+    ready_tokens, backfill_tokens = scanner._split_ready_and_backfill_dirty_tokens(
+        universe,
+        cache,
+        {"yes-1"},
+        params=scanner.params,
+    )
+    updated = asyncio.run(
+        scanner._seed_rest_books_incrementally_async(
+            cache,
+            sorted(backfill_tokens),
+            reason="dirty_pair_backfill",
+        )
+    )
+
+    assert ready_tokens == set()
+    assert backfill_tokens == {"yes-1", "no-1"}
+    assert updated == {"yes-1", "no-1"}
+    assert client.fetch_ask_books_token_calls == [["no-1", "yes-1"]]
+
+
 def test_stale_websocket_cache_skips_opportunities(tmp_path):
     client = TwoMarketClient()
     scanner = scanner_for(tmp_path, client)
@@ -1953,6 +2073,7 @@ def test_stale_websocket_cache_skips_opportunities(tmp_path):
         tax_bps=0.0,
         merge_cost_usd=0.0,
         max_book_age_seconds=5.0,
+        simulation=config.PaperExecutionSimulationConfig.zero_friction(),
     )
 
     result = scanner._evaluate_from_cache(
@@ -1983,6 +2104,7 @@ def test_rest_reconciliation_refreshes_stale_books_and_restores_evaluation(tmp_p
         tax_bps=0.0,
         merge_cost_usd=0.0,
         max_book_age_seconds=5.0,
+        simulation=config.PaperExecutionSimulationConfig.zero_friction(),
     )
 
     updated = asyncio.run(scanner._seed_rest_books(cache, universe.token_ids, reason="test_reconcile"))
@@ -1996,6 +2118,148 @@ def test_rest_reconciliation_refreshes_stale_books_and_restores_evaluation(tmp_p
 
     assert client.fetch_ask_books_calls == 1
     assert result["summary"]["executions"] == 2
+
+
+def test_fill_time_cache_recheck_blocks_moved_books(tmp_path):
+    cfg = replace(
+        scan_config(tmp_path),
+        paper_simulation=config.PaperExecutionSimulationConfig(
+            enabled=True,
+            latency_ms=0.0,
+            latency_jitter_ms=0.0,
+            signing_latency_ms=0.0,
+            settlement_latency_ms=0.0,
+            max_fill_price_move_bps=10.0,
+            queue_depth_ratio=0.0,
+            queue_fill_probability=0.0,
+            partial_fill_probability=0.0,
+            partial_fill_min_ratio=0.0,
+            submit_failure_probability=0.0,
+            accept_failure_probability=0.0,
+            fill_failure_probability=0.0,
+            cancel_failure_probability=0.0,
+            throttle_max_submissions_per_second=0,
+            throttle_quantity_ratio=0.0,
+            adverse_selection_probability=0.0,
+            adverse_depth_removal_ratio=0.0,
+            adverse_price_move_bps=0.0,
+        ),
+    )
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    updated_at = datetime.now(timezone.utc)
+    cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=updated_at))
+    original_book_side = cache.book_side
+
+    def moved_fill_book(token_id, side):
+        if token_id == "yes-1" and side == "ask":
+            return asks_from_book(
+                {"asks": [{"price": "0.50", "size": "10"}]},
+                token_id="yes-1",
+                updated_at=updated_at,
+            )
+        return original_book_side(token_id, side)
+
+    cache.book_side = moved_fill_book
+
+    result = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+
+    assert result["summary"]["executions"] == 0
+    assert result["summary"]["simulation_failure_counts"]["simulation_fill_price_moved"] == 1
+    assert result["summary"]["last_simulated_execution_failure_reason"] == "simulation_fill_price_moved"
+
+
+def test_simulation_failure_counts_are_combined_across_incremental_chunks(tmp_path):
+    cfg = replace(
+        scan_config(tmp_path),
+        paper_simulation=config.PaperExecutionSimulationConfig(
+            enabled=True,
+            latency_ms=0.0,
+            latency_jitter_ms=0.0,
+            signing_latency_ms=0.0,
+            settlement_latency_ms=0.0,
+            max_fill_price_move_bps=0.0,
+            queue_depth_ratio=0.0,
+            queue_fill_probability=0.0,
+            partial_fill_probability=0.0,
+            partial_fill_min_ratio=0.0,
+            submit_failure_probability=1.0,
+            accept_failure_probability=0.0,
+            fill_failure_probability=0.0,
+            cancel_failure_probability=0.0,
+            throttle_max_submissions_per_second=0,
+            throttle_quantity_ratio=0.0,
+            adverse_selection_probability=0.0,
+            adverse_depth_removal_ratio=0.0,
+            adverse_price_move_bps=0.0,
+        ),
+    )
+
+    class ChunkedClient(TwoMarketClient):
+        batch_book_limit = 2
+
+    scanner = scanner_for(tmp_path, ChunkedClient(), cfg=cfg)
+    universe = scanner._fetch_market_universe()
+
+    result = scanner._run_incremental_rest_evaluation(universe, reason="rest_cycle")
+
+    assert result["summary"]["executions"] == 0
+    assert result["summary"]["simulation_failure_counts"]["simulation_submit_failure"] == 2
+    assert result["summary"]["last_simulated_execution_failure_reason"] == "simulation_submit_failure"
+
+
+def test_runtime_summary_records_simulation_failure_counts(tmp_path):
+    cfg = replace(
+        scan_config(tmp_path),
+        paper_simulation=config.PaperExecutionSimulationConfig(
+            enabled=True,
+            latency_ms=0.0,
+            latency_jitter_ms=0.0,
+            signing_latency_ms=0.0,
+            settlement_latency_ms=0.0,
+            max_fill_price_move_bps=0.0,
+            queue_depth_ratio=0.0,
+            queue_fill_probability=0.0,
+            partial_fill_probability=0.0,
+            partial_fill_min_ratio=0.0,
+            submit_failure_probability=1.0,
+            accept_failure_probability=0.0,
+            fill_failure_probability=0.0,
+            cancel_failure_probability=0.0,
+            throttle_max_submissions_per_second=0,
+            throttle_quantity_ratio=0.0,
+            adverse_selection_probability=0.0,
+            adverse_depth_removal_ratio=0.0,
+            adverse_price_move_bps=0.0,
+        ),
+    )
+    scanner = scanner_for(tmp_path, TwoMarketClient(), cfg=cfg)
+    scanner._start_runtime(detail="test simulation runtime")
+    try:
+        universe = scanner._fetch_market_universe()
+        cache = MarketDataCache()
+        cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=datetime.now(timezone.utc)))
+        scanner._evaluate_from_cache(
+            universe,
+            cache,
+            dirty_token_ids={"yes-1"},
+            evaluation_reason="ws_dirty_update",
+            params=scanner.params,
+        )
+        runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    finally:
+        scanner._stop_runtime()
+
+    assert runtime["last_cycle_simulation_failure_counts"]["simulation_submit_failure"] == 1
+    assert runtime["last_simulated_execution_failure_reason"] == "simulation_submit_failure"
 
 
 def test_unchanged_book_fingerprint_does_not_duplicate_paper_execution(tmp_path):

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import urlparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DOTENV_PATH = PROJECT_ROOT / ".env"
@@ -38,6 +38,98 @@ DEFAULT_FAST_START_ENABLED = False
 DEFAULT_FAST_START_EVENT_LIMIT = 20
 DEFAULT_FAST_START_TOKEN_LIMIT = 500
 DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS = 3600
+DEFAULT_PAPER_SIMULATION_ENABLED = True
+DEFAULT_PAPER_SIM_SEED = 0
+DEFAULT_PAPER_LATENCY_MS = 250.0
+DEFAULT_PAPER_LATENCY_JITTER_MS = 50.0
+DEFAULT_PAPER_SIGNING_LATENCY_MS = 50.0
+DEFAULT_PAPER_SETTLEMENT_LATENCY_MS = 1500.0
+DEFAULT_PAPER_MAX_FILL_PRICE_MOVE_BPS = 25.0
+DEFAULT_PAPER_QUEUE_DEPTH_RATIO = 0.75
+DEFAULT_PAPER_QUEUE_FILL_PROBABILITY = 0.95
+DEFAULT_PAPER_PARTIAL_FILL_PROBABILITY = 0.15
+DEFAULT_PAPER_PARTIAL_FILL_MIN_RATIO = 0.50
+DEFAULT_PAPER_SUBMIT_FAILURE_PROBABILITY = 0.005
+DEFAULT_PAPER_ACCEPT_FAILURE_PROBABILITY = 0.0025
+DEFAULT_PAPER_FILL_FAILURE_PROBABILITY = 0.01
+DEFAULT_PAPER_CANCEL_FAILURE_PROBABILITY = 0.0025
+DEFAULT_PAPER_THROTTLE_MAX_SUBMISSIONS_PER_SECOND = 8
+DEFAULT_PAPER_THROTTLE_QUANTITY_RATIO = 0.50
+DEFAULT_PAPER_ADVERSE_SELECTION_PROBABILITY = 0.25
+DEFAULT_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO = 0.50
+DEFAULT_PAPER_ADVERSE_PRICE_MOVE_BPS = 10.0
+
+
+@dataclass(frozen=True)
+class PaperExecutionSimulationConfig:
+    enabled: bool = DEFAULT_PAPER_SIMULATION_ENABLED
+    seed: int = DEFAULT_PAPER_SIM_SEED
+    latency_ms: float = DEFAULT_PAPER_LATENCY_MS
+    latency_jitter_ms: float = DEFAULT_PAPER_LATENCY_JITTER_MS
+    signing_latency_ms: float = DEFAULT_PAPER_SIGNING_LATENCY_MS
+    settlement_latency_ms: float = DEFAULT_PAPER_SETTLEMENT_LATENCY_MS
+    max_fill_price_move_bps: float = DEFAULT_PAPER_MAX_FILL_PRICE_MOVE_BPS
+    queue_depth_ratio: float = DEFAULT_PAPER_QUEUE_DEPTH_RATIO
+    queue_fill_probability: float = DEFAULT_PAPER_QUEUE_FILL_PROBABILITY
+    partial_fill_probability: float = DEFAULT_PAPER_PARTIAL_FILL_PROBABILITY
+    partial_fill_min_ratio: float = DEFAULT_PAPER_PARTIAL_FILL_MIN_RATIO
+    submit_failure_probability: float = DEFAULT_PAPER_SUBMIT_FAILURE_PROBABILITY
+    accept_failure_probability: float = DEFAULT_PAPER_ACCEPT_FAILURE_PROBABILITY
+    fill_failure_probability: float = DEFAULT_PAPER_FILL_FAILURE_PROBABILITY
+    cancel_failure_probability: float = DEFAULT_PAPER_CANCEL_FAILURE_PROBABILITY
+    throttle_max_submissions_per_second: int = DEFAULT_PAPER_THROTTLE_MAX_SUBMISSIONS_PER_SECOND
+    throttle_quantity_ratio: float = DEFAULT_PAPER_THROTTLE_QUANTITY_RATIO
+    adverse_selection_probability: float = DEFAULT_PAPER_ADVERSE_SELECTION_PROBABILITY
+    adverse_depth_removal_ratio: float = DEFAULT_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO
+    adverse_price_move_bps: float = DEFAULT_PAPER_ADVERSE_PRICE_MOVE_BPS
+
+    @classmethod
+    def zero_friction(cls) -> "PaperExecutionSimulationConfig":
+        return cls(
+            enabled=False,
+            latency_ms=0.0,
+            latency_jitter_ms=0.0,
+            signing_latency_ms=0.0,
+            settlement_latency_ms=0.0,
+            max_fill_price_move_bps=0.0,
+            queue_depth_ratio=0.0,
+            queue_fill_probability=0.0,
+            partial_fill_probability=0.0,
+            partial_fill_min_ratio=0.0,
+            submit_failure_probability=0.0,
+            accept_failure_probability=0.0,
+            fill_failure_probability=0.0,
+            cancel_failure_probability=0.0,
+            throttle_max_submissions_per_second=0,
+            throttle_quantity_ratio=0.0,
+            adverse_selection_probability=0.0,
+            adverse_depth_removal_ratio=0.0,
+            adverse_price_move_bps=0.0,
+        )
+
+    @property
+    def is_zero_friction(self) -> bool:
+        if not self.enabled:
+            return True
+        return (
+            self.latency_ms <= 0.0
+            and self.latency_jitter_ms <= 0.0
+            and self.signing_latency_ms <= 0.0
+            and self.settlement_latency_ms <= 0.0
+            and self.max_fill_price_move_bps <= 0.0
+            and self.queue_depth_ratio <= 0.0
+            and self.queue_fill_probability <= 0.0
+            and self.partial_fill_probability <= 0.0
+            and self.submit_failure_probability <= 0.0
+            and self.accept_failure_probability <= 0.0
+            and self.fill_failure_probability <= 0.0
+            and self.cancel_failure_probability <= 0.0
+            and self.throttle_max_submissions_per_second <= 0
+            and self.throttle_quantity_ratio <= 0.0
+            and self.adverse_selection_probability <= 0.0
+            and self.adverse_depth_removal_ratio <= 0.0
+            and self.adverse_price_move_bps <= 0.0
+        )
 
 
 def _decode_dotenv_value(value: str) -> str:
@@ -102,6 +194,34 @@ def env_int(name: str, default: int) -> int:
     if value is None or value.strip() == "":
         return default
     return int(value)
+
+
+def _non_negative_float_env(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if value < 0.0:
+        raise ValueError(f"{name} must be greater than or equal to 0")
+    return value
+
+
+def _non_negative_int_env(name: str, default: int) -> int:
+    value = env_int(name, default)
+    if value < 0:
+        raise ValueError(f"{name} must be greater than or equal to 0")
+    return value
+
+
+def _probability_env(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
+
+def _ratio_env(name: str, default: float) -> float:
+    value = env_float(name, default)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
 
 
 def data_dir() -> Path:
@@ -249,6 +369,76 @@ def universe_cache_max_age_seconds() -> int:
     return max(0, env_int("COND_ARB_UNIVERSE_CACHE_MAX_AGE_SECONDS", DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS))
 
 
+def paper_execution_simulation_config() -> PaperExecutionSimulationConfig:
+    return PaperExecutionSimulationConfig(
+        enabled=env_bool("COND_ARB_PAPER_SIMULATION_ENABLED", DEFAULT_PAPER_SIMULATION_ENABLED),
+        seed=env_int("COND_ARB_PAPER_SIM_SEED", DEFAULT_PAPER_SIM_SEED),
+        latency_ms=_non_negative_float_env("COND_ARB_PAPER_LATENCY_MS", DEFAULT_PAPER_LATENCY_MS),
+        latency_jitter_ms=_non_negative_float_env("COND_ARB_PAPER_LATENCY_JITTER_MS", DEFAULT_PAPER_LATENCY_JITTER_MS),
+        signing_latency_ms=_non_negative_float_env(
+            "COND_ARB_PAPER_SIGNING_LATENCY_MS",
+            DEFAULT_PAPER_SIGNING_LATENCY_MS,
+        ),
+        settlement_latency_ms=_non_negative_float_env(
+            "COND_ARB_PAPER_SETTLEMENT_LATENCY_MS",
+            DEFAULT_PAPER_SETTLEMENT_LATENCY_MS,
+        ),
+        max_fill_price_move_bps=_non_negative_float_env(
+            "COND_ARB_PAPER_MAX_FILL_PRICE_MOVE_BPS",
+            DEFAULT_PAPER_MAX_FILL_PRICE_MOVE_BPS,
+        ),
+        queue_depth_ratio=_ratio_env("COND_ARB_PAPER_QUEUE_DEPTH_RATIO", DEFAULT_PAPER_QUEUE_DEPTH_RATIO),
+        queue_fill_probability=_probability_env(
+            "COND_ARB_PAPER_QUEUE_FILL_PROBABILITY",
+            DEFAULT_PAPER_QUEUE_FILL_PROBABILITY,
+        ),
+        partial_fill_probability=_probability_env(
+            "COND_ARB_PAPER_PARTIAL_FILL_PROBABILITY",
+            DEFAULT_PAPER_PARTIAL_FILL_PROBABILITY,
+        ),
+        partial_fill_min_ratio=_ratio_env(
+            "COND_ARB_PAPER_PARTIAL_FILL_MIN_RATIO",
+            DEFAULT_PAPER_PARTIAL_FILL_MIN_RATIO,
+        ),
+        submit_failure_probability=_probability_env(
+            "COND_ARB_PAPER_SUBMIT_FAILURE_PROBABILITY",
+            DEFAULT_PAPER_SUBMIT_FAILURE_PROBABILITY,
+        ),
+        accept_failure_probability=_probability_env(
+            "COND_ARB_PAPER_ACCEPT_FAILURE_PROBABILITY",
+            DEFAULT_PAPER_ACCEPT_FAILURE_PROBABILITY,
+        ),
+        fill_failure_probability=_probability_env(
+            "COND_ARB_PAPER_FILL_FAILURE_PROBABILITY",
+            DEFAULT_PAPER_FILL_FAILURE_PROBABILITY,
+        ),
+        cancel_failure_probability=_probability_env(
+            "COND_ARB_PAPER_CANCEL_FAILURE_PROBABILITY",
+            DEFAULT_PAPER_CANCEL_FAILURE_PROBABILITY,
+        ),
+        throttle_max_submissions_per_second=_non_negative_int_env(
+            "COND_ARB_PAPER_THROTTLE_MAX_SUBMISSIONS_PER_SECOND",
+            DEFAULT_PAPER_THROTTLE_MAX_SUBMISSIONS_PER_SECOND,
+        ),
+        throttle_quantity_ratio=_ratio_env(
+            "COND_ARB_PAPER_THROTTLE_QUANTITY_RATIO",
+            DEFAULT_PAPER_THROTTLE_QUANTITY_RATIO,
+        ),
+        adverse_selection_probability=_probability_env(
+            "COND_ARB_PAPER_ADVERSE_SELECTION_PROBABILITY",
+            DEFAULT_PAPER_ADVERSE_SELECTION_PROBABILITY,
+        ),
+        adverse_depth_removal_ratio=_ratio_env(
+            "COND_ARB_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO",
+            DEFAULT_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO,
+        ),
+        adverse_price_move_bps=_non_negative_float_env(
+            "COND_ARB_PAPER_ADVERSE_PRICE_MOVE_BPS",
+            DEFAULT_PAPER_ADVERSE_PRICE_MOVE_BPS,
+        ),
+    )
+
+
 def event_log_path(base_data_dir: Path | None = None) -> Path:
     return (base_data_dir or data_dir()) / "conditional_arb_events.jsonl"
 
@@ -303,6 +493,7 @@ class ScanConfig:
     fast_start_event_limit: int = DEFAULT_FAST_START_EVENT_LIMIT
     fast_start_token_limit: int = DEFAULT_FAST_START_TOKEN_LIMIT
     universe_cache_max_age_seconds: int = DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS
+    paper_simulation: PaperExecutionSimulationConfig = field(default_factory=PaperExecutionSimulationConfig)
 
     @property
     def event_log_path(self) -> Path:
@@ -359,4 +550,5 @@ def load_scan_config() -> ScanConfig:
         fast_start_event_limit=fast_start_event_limit(),
         fast_start_token_limit=fast_start_token_limit(),
         universe_cache_max_age_seconds=universe_cache_max_age_seconds(),
+        paper_simulation=paper_execution_simulation_config(),
     )

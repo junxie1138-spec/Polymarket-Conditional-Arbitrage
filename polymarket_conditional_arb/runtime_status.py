@@ -176,6 +176,10 @@ class RuntimeStatusWriter:
             "status": "WARMUP",
             "detail": "starting",
             "mode": self.mode,
+            "executor_status": "warming",
+            "coverage_status": "unknown",
+            "coverage_complete": False,
+            "coverage_source": None,
             "warmup_started_at_utc": None,
             "warmup_completed_at_utc": None,
             "book_seed_reason": None,
@@ -209,6 +213,9 @@ class RuntimeStatusWriter:
             "last_cycle_evaluated_markets": 0,
             "last_cycle_executions": 0,
             "last_cycle_skips": 0,
+            "last_cycle_skip_counts": {},
+            "last_cycle_simulation_failure_counts": {},
+            "last_simulated_execution_failure_reason": None,
             "dirty_tokens_pending": 0,
             "dirty_full_universe_pending": False,
             "dirty_full_reconcile_active": False,
@@ -258,6 +265,12 @@ class RuntimeStatusWriter:
                 fields["status"] = _status_from_phase(phase)
             if phase == "warmup" and not self._payload.get("warmup_started_at_utc"):
                 self._payload["warmup_started_at_utc"] = heartbeat_at_utc
+            if phase is not None and "executor_status" not in fields:
+                fields["executor_status"] = {
+                    "warmup": "warming",
+                    "online": "online",
+                    "stopping": "stopping",
+                }[phase]
             if (
                 phase in {"online", "stopping"}
                 and self._payload.get("warmup_started_at_utc")
@@ -542,11 +555,21 @@ def format_status_dashboard(
 
     failures = _int_value(runtime_row.get("runtime_status_write_failures"))
     detail = _format_dashboard_detail(runtime_row.get("detail"))
+    executor_status = str(runtime_row.get("executor_status") or runtime_row.get("phase") or "unknown")
+    coverage_status = str(runtime_row.get("coverage_status") or "unknown")
+    coverage_complete = bool(runtime_row.get("coverage_complete"))
+    coverage_text = coverage_status
+    if coverage_complete and coverage_status != "unknown":
+        coverage_text = f"{coverage_status} complete"
+    elif coverage_status == "priority":
+        coverage_text = "priority, background full"
     health_lines = [
         "HEALTH",
         _kv("Heartbeat", _format_status_age(heartbeat_age)),
         _kv("Status", health_status),
         _kv("Phase", runtime_row.get("phase") or "unknown"),
+        _kv("Executor", executor_status),
+        _kv("Coverage", coverage_text),
         _kv("Detail", detail),
     ]
     ws_connection_count = _int_value(runtime_row.get("market_ws_connection_count"))
@@ -644,14 +667,17 @@ def format_status_dashboard(
     dirty_tokens = _int_value(runtime_row.get("dirty_tokens_pending"))
     dirty_full_universe = bool(runtime_row.get("dirty_full_universe_pending"))
     dirty_full_reconcile_active = bool(runtime_row.get("dirty_full_reconcile_active"))
-    if dirty_full_reconcile_active:
-        dirty_backlog_text = "covered by active REST reconcile"
-    elif dirty_full_universe:
+    if dirty_full_universe:
         dirty_backlog_text = "full universe"
     elif dirty_tokens > 0:
         dirty_backlog_text = f"{_format_count(dirty_tokens)} tokens"
     else:
         dirty_backlog_text = "none"
+    reconcile_text = "active" if dirty_full_reconcile_active else "idle"
+    if str(runtime_row.get("book_seed_reason") or "") == "rest_reconcile" and total_tokens > 0:
+        reconcile_text = f"{_format_count(completed_tokens)} / {_format_count(total_tokens)} seeded"
+    simulation_failure_text = _format_category_counts(runtime_row.get("last_cycle_simulation_failure_counts"))
+    last_simulation_failure_reason = runtime_row.get("last_simulated_execution_failure_reason") or "none"
 
     execution_lines = [
         "COSTS",
@@ -664,10 +690,13 @@ def format_status_dashboard(
         _kv("Last exec", _format_timestamp(portfolio.get("last_execution_at_utc"))),
         _kv("Last cycle", runtime_row.get("last_evaluation_reason") or "n/a"),
         _kv("Dirty backlog", dirty_backlog_text),
+        _kv("Reconcile", reconcile_text),
         _kv("Completed", _format_timestamp(runtime_row.get("last_cycle_completed_at_utc"))),
         _kv("Evaluated", _format_count(_int_value(runtime_row.get("last_cycle_evaluated_markets")))),
         _kv("Executions", _format_count(_int_value(runtime_row.get("last_cycle_executions")))),
         _kv("Skips", _format_count(_int_value(runtime_row.get("last_cycle_skips")))),
+        _kv("Sim failures", simulation_failure_text),
+        _kv("Last sim fail", last_simulation_failure_reason),
         _kv("Unmatched", unmatched_text),
         _kv("Last error", runtime_row.get("last_error") or "none"),
     ]

@@ -65,10 +65,25 @@ class MarketUniverse:
 
 
 @dataclass(frozen=True)
+class _StartupUniverseSelection:
+    universe: MarketUniverse
+    coverage_status: str
+    coverage_complete: bool
+
+
+@dataclass(frozen=True)
 class _DirtyTokenBatch:
     token_ids: set[str] | None
     evaluation_reason: str
     coalesced_updates: int
+
+
+@dataclass(frozen=True)
+class _BookChunkResult:
+    books: Mapping[str, OrderBookSide]
+    failed_tokens: int
+    failed_token_sample: tuple[str, ...]
+    failure_categories: Mapping[str, int]
 
 
 class _DirtyTokenAccumulator:
@@ -83,11 +98,11 @@ class _DirtyTokenAccumulator:
 
     @property
     def has_pending(self) -> bool:
-        return not self._full_reconcile_active and (bool(self._tokens) or (self._full_universe and self._full_universe_ready))
+        return bool(self._tokens) or (self._full_universe and self._full_universe_ready)
 
     def runtime_fields(self) -> dict[str, Any]:
         return {
-            "dirty_tokens_pending": 0 if self._full_universe or self._full_reconcile_active else len(self._tokens),
+            "dirty_tokens_pending": 0 if self._full_universe else len(self._tokens),
             "dirty_full_universe_pending": self._full_universe,
             "dirty_full_reconcile_active": self._full_reconcile_active,
             "dirty_update_batches_pending": self._coalesced_updates,
@@ -97,7 +112,7 @@ class _DirtyTokenAccumulator:
         ids = {str(token_id) for token_id in token_ids if token_id}
         if not ids:
             return False
-        if self._full_reconcile_active or self._full_universe:
+        if self._full_universe:
             self._tokens.clear()
             self._full_universe = True
             self._coalesced_updates = max(1, self._coalesced_updates)
@@ -460,6 +475,314 @@ class ConditionalArbScanner:
         )
         return update
 
+    def _book_seed_token_chunks(self, token_ids: list[str]) -> list[list[str]]:
+        unique_token_ids = list(dict.fromkeys(str(token_id) for token_id in token_ids if token_id))
+        chunk_limit = max(1, int(getattr(self.client, "batch_book_limit", config.CLOB_BATCH_BOOK_LIMIT)))
+        return [unique_token_ids[index : index + chunk_limit] for index in range(0, len(unique_token_ids), chunk_limit)]
+
+    def _fetch_ask_books_chunk(self, token_ids: list[str]) -> _BookChunkResult:
+        captured_progress: dict[str, Any] = {}
+
+        def capture(progress: Mapping[str, Any]) -> None:
+            captured_progress.update(dict(progress))
+
+        books = self.client.fetch_ask_books(token_ids, on_progress=capture)
+        failed_tokens = _progress_int(
+            captured_progress.get("failed_tokens"),
+            max(0, len(token_ids) - len(books)),
+        )
+        failed_token_sample_raw = captured_progress.get("failed_token_sample")
+        failed_token_sample = (
+            tuple(str(token_id) for token_id in failed_token_sample_raw if token_id)
+            if isinstance(failed_token_sample_raw, (list, tuple))
+            else ()
+        )
+        failure_categories_raw = captured_progress.get("failure_categories")
+        failure_categories = (
+            {
+                str(category): _progress_int(count)
+                for category, count in failure_categories_raw.items()
+                if category and _progress_int(count) > 0
+            }
+            if isinstance(failure_categories_raw, Mapping)
+            else {}
+        )
+        return _BookChunkResult(
+            books=books,
+            failed_tokens=failed_tokens,
+            failed_token_sample=failed_token_sample,
+            failure_categories=failure_categories,
+        )
+
+    @staticmethod
+    def _merge_failure_categories(
+        target: dict[str, int],
+        source: Mapping[str, int],
+    ) -> None:
+        for category, count in source.items():
+            normalized = str(category)
+            amount = _progress_int(count)
+            if normalized and amount > 0:
+                target[normalized] = target.get(normalized, 0) + amount
+
+    def _seed_rest_books_incrementally_sync(
+        self,
+        cache: MarketDataCache,
+        token_ids: list[str],
+        *,
+        reason: str,
+        on_chunk_seeded: Callable[[set[str]], Any] | None = None,
+    ) -> set[str]:
+        chunks = self._book_seed_token_chunks(token_ids)
+        if not chunks:
+            return set()
+
+        total_tokens = sum(len(chunk) for chunk in chunks)
+        total_batches = len(chunks)
+        progress = self._book_seed_progress_callback(reason=reason, total_tokens=total_tokens)
+        completed_tokens = 0
+        received_books = 0
+        failed_tokens = 0
+        failed_token_sample: list[str] = []
+        failure_categories: dict[str, int] = {}
+        all_updated: set[str] = set()
+
+        for batch_number, chunk in enumerate(chunks, start=1):
+            batch_start_token = completed_tokens + 1
+            batch_end_token = completed_tokens + len(chunk)
+            batch_started_at_utc = utc_iso()
+            progress(
+                {
+                    "total_tokens": total_tokens,
+                    "completed_tokens": completed_tokens,
+                    "remaining_tokens": total_tokens - completed_tokens,
+                    "received_books": received_books,
+                    "failed_tokens": failed_tokens,
+                    "current_batch_number": batch_number,
+                    "total_batches": total_batches,
+                    "current_batch_start_token": batch_start_token,
+                    "current_batch_end_token": batch_end_token,
+                    "current_batch_status": "in_flight",
+                    "current_batch_started_at_utc": batch_started_at_utc,
+                    "failed_token_sample": failed_token_sample,
+                    "failure_categories": failure_categories,
+                }
+            )
+            try:
+                chunk_result = self._run_with_retries(
+                    "rest_book_fetch",
+                    lambda chunk=chunk: self._fetch_ask_books_chunk(chunk),
+                    summary=lambda result: {"reason": reason, "tokens": len(result.books)},
+                )
+            except Exception as exc:
+                if isinstance(exc, ScannerStopped) or not self.running:
+                    raise
+                completed_tokens += len(chunk)
+                failed_tokens += len(chunk)
+                category = f"chunk:{type(exc).__name__}"
+                failure_categories[category] = failure_categories.get(category, 0) + len(chunk)
+                for token_id in chunk:
+                    if len(failed_token_sample) < 5:
+                        failed_token_sample.append(str(token_id))
+                self.logger.warning(
+                    "rest_book_seed_chunk_failed reason=%s batch=%s tokens=%s error=%r",
+                    reason,
+                    batch_number,
+                    len(chunk),
+                    exc,
+                )
+                progress(
+                    {
+                        "total_tokens": total_tokens,
+                        "completed_tokens": completed_tokens,
+                        "remaining_tokens": total_tokens - completed_tokens,
+                        "received_books": received_books,
+                        "failed_tokens": failed_tokens,
+                        "current_batch_number": batch_number,
+                        "total_batches": total_batches,
+                        "current_batch_start_token": batch_start_token,
+                        "current_batch_end_token": batch_end_token,
+                        "current_batch_status": "failed",
+                        "current_batch_started_at_utc": batch_started_at_utc,
+                        "failed_token_sample": failed_token_sample,
+                        "failure_categories": failure_categories,
+                    }
+                )
+                continue
+
+            completed_tokens += len(chunk)
+            received_books += len(chunk_result.books)
+            failed_tokens += chunk_result.failed_tokens
+            for token_id in chunk_result.failed_token_sample:
+                if len(failed_token_sample) < 5:
+                    failed_token_sample.append(str(token_id))
+            self._merge_failure_categories(failure_categories, chunk_result.failure_categories)
+            updated = cache.seed_ask_books(chunk_result.books)
+            all_updated.update(updated)
+            progress(
+                {
+                    "total_tokens": total_tokens,
+                    "completed_tokens": completed_tokens,
+                    "remaining_tokens": total_tokens - completed_tokens,
+                    "received_books": received_books,
+                    "failed_tokens": failed_tokens,
+                    "current_batch_number": batch_number,
+                    "total_batches": total_batches,
+                    "current_batch_start_token": batch_start_token,
+                    "current_batch_end_token": batch_end_token,
+                    "current_batch_status": "complete",
+                    "current_batch_started_at_utc": batch_started_at_utc,
+                    "failed_token_sample": failed_token_sample,
+                    "failure_categories": failure_categories,
+                }
+            )
+            if updated and on_chunk_seeded is not None:
+                on_chunk_seeded(set(updated))
+
+        self._runtime_update(
+            detail=f"REST ask books seeded: {reason}",
+            book_seed_completed_tokens=total_tokens,
+            book_seed_remaining_tokens=0,
+            book_seed_received_books=received_books,
+            book_seed_failed_tokens=failed_tokens,
+            book_seed_eta_seconds=0.0,
+        )
+        self._log_rest_book_seed_failures(reason=reason)
+        self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(all_updated))
+        if total_tokens > 0 and not all_updated:
+            raise RuntimeError(f"failed to seed any REST ask books for {reason}")
+        return all_updated
+
+    async def _seed_rest_books_incrementally_async(
+        self,
+        cache: MarketDataCache,
+        token_ids: list[str],
+        *,
+        reason: str,
+        on_chunk_seeded: Callable[[set[str]], Any] | None = None,
+    ) -> set[str]:
+        chunks = self._book_seed_token_chunks(token_ids)
+        if not chunks:
+            return set()
+
+        total_tokens = sum(len(chunk) for chunk in chunks)
+        total_batches = len(chunks)
+        progress = self._book_seed_progress_callback(reason=reason, total_tokens=total_tokens)
+        completed_tokens = 0
+        received_books = 0
+        failed_tokens = 0
+        failed_token_sample: list[str] = []
+        failure_categories: dict[str, int] = {}
+        all_updated: set[str] = set()
+
+        for batch_number, chunk in enumerate(chunks, start=1):
+            batch_start_token = completed_tokens + 1
+            batch_end_token = completed_tokens + len(chunk)
+            batch_started_at_utc = utc_iso()
+            progress(
+                {
+                    "total_tokens": total_tokens,
+                    "completed_tokens": completed_tokens,
+                    "remaining_tokens": total_tokens - completed_tokens,
+                    "received_books": received_books,
+                    "failed_tokens": failed_tokens,
+                    "current_batch_number": batch_number,
+                    "total_batches": total_batches,
+                    "current_batch_start_token": batch_start_token,
+                    "current_batch_end_token": batch_end_token,
+                    "current_batch_status": "in_flight",
+                    "current_batch_started_at_utc": batch_started_at_utc,
+                    "failed_token_sample": failed_token_sample,
+                    "failure_categories": failure_categories,
+                }
+            )
+            try:
+                chunk_result = await self._run_async_with_retries(
+                    "rest_book_seed",
+                    lambda chunk=chunk: asyncio.to_thread(self._fetch_ask_books_chunk, chunk),
+                    summary=lambda result: {"reason": reason, "tokens": len(result.books)},
+                )
+            except Exception as exc:
+                if isinstance(exc, ScannerStopped) or not self.running:
+                    raise
+                completed_tokens += len(chunk)
+                failed_tokens += len(chunk)
+                category = f"chunk:{type(exc).__name__}"
+                failure_categories[category] = failure_categories.get(category, 0) + len(chunk)
+                for token_id in chunk:
+                    if len(failed_token_sample) < 5:
+                        failed_token_sample.append(str(token_id))
+                self.logger.warning(
+                    "rest_book_seed_chunk_failed reason=%s batch=%s tokens=%s error=%r",
+                    reason,
+                    batch_number,
+                    len(chunk),
+                    exc,
+                )
+                progress(
+                    {
+                        "total_tokens": total_tokens,
+                        "completed_tokens": completed_tokens,
+                        "remaining_tokens": total_tokens - completed_tokens,
+                        "received_books": received_books,
+                        "failed_tokens": failed_tokens,
+                        "current_batch_number": batch_number,
+                        "total_batches": total_batches,
+                        "current_batch_start_token": batch_start_token,
+                        "current_batch_end_token": batch_end_token,
+                        "current_batch_status": "failed",
+                        "current_batch_started_at_utc": batch_started_at_utc,
+                        "failed_token_sample": failed_token_sample,
+                        "failure_categories": failure_categories,
+                    }
+                )
+                continue
+
+            completed_tokens += len(chunk)
+            received_books += len(chunk_result.books)
+            failed_tokens += chunk_result.failed_tokens
+            for token_id in chunk_result.failed_token_sample:
+                if len(failed_token_sample) < 5:
+                    failed_token_sample.append(str(token_id))
+            self._merge_failure_categories(failure_categories, chunk_result.failure_categories)
+            updated = cache.seed_ask_books(chunk_result.books)
+            all_updated.update(updated)
+            progress(
+                {
+                    "total_tokens": total_tokens,
+                    "completed_tokens": completed_tokens,
+                    "remaining_tokens": total_tokens - completed_tokens,
+                    "received_books": received_books,
+                    "failed_tokens": failed_tokens,
+                    "current_batch_number": batch_number,
+                    "total_batches": total_batches,
+                    "current_batch_start_token": batch_start_token,
+                    "current_batch_end_token": batch_end_token,
+                    "current_batch_status": "complete",
+                    "current_batch_started_at_utc": batch_started_at_utc,
+                    "failed_token_sample": failed_token_sample,
+                    "failure_categories": failure_categories,
+                }
+            )
+            if updated and on_chunk_seeded is not None:
+                callback_result = on_chunk_seeded(set(updated))
+                if hasattr(callback_result, "__await__"):
+                    await callback_result
+
+        self._runtime_update(
+            detail=f"REST ask books seeded: {reason}",
+            book_seed_completed_tokens=total_tokens,
+            book_seed_remaining_tokens=0,
+            book_seed_received_books=received_books,
+            book_seed_failed_tokens=failed_tokens,
+            book_seed_eta_seconds=0.0,
+        )
+        self._log_rest_book_seed_failures(reason=reason)
+        self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(all_updated))
+        if total_tokens > 0 and not all_updated:
+            raise RuntimeError(f"failed to seed any REST ask books for {reason}")
+        return all_updated
+
     def _run_with_retries(
         self,
         operation: str,
@@ -547,7 +870,7 @@ class ConditionalArbScanner:
                 "include_neg_risk": False,
                 "market_ws_enabled": self.config.market_ws_enabled,
                 "market_ws_endpoint": self.config.market_ws_endpoint,
-                "startup_gate": "fresh_full_cache_or_full_gamma_rebuild",
+                "startup_gate": "fresh_full_cache_or_ws_priority_slice_with_background_coverage",
                 "market_universe_cache_path": str(self.config.market_universe_cache_path),
                 "legacy_fast_start_enabled": self.config.fast_start_enabled,
                 "universe_cache_max_age_seconds": self.config.universe_cache_max_age_seconds,
@@ -615,13 +938,9 @@ class ConditionalArbScanner:
 
     def _run_startup_rest_cycle(self) -> dict[str, Any]:
         universe = self._fetch_startup_market_universe_with_retry_sync()
-        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids, reason="rest_bootstrap")
-        result = self._evaluate_universe(
+        result = self._run_incremental_rest_evaluation(
             universe,
-            books_by_token,
-            dirty_token_ids=None,
-            evaluation_reason="rest_bootstrap",
-            params=self.params,
+            reason="rest_bootstrap",
         )
         self._runtime_update(phase="online", detail="online", last_error=None)
         return result
@@ -702,6 +1021,9 @@ class ConditionalArbScanner:
             self._runtime_update(**_ws_runtime_fields())
 
         refresh_task: asyncio.Task[MarketUniverse] | None = None
+        reconcile_task: asyncio.Task[float] | None = None
+        targeted_backfill_task: asyncio.Task[None] | None = None
+        targeted_backfill_tokens: set[str] = set()
 
         def _finish_refresh_task_if_ready(current_universe: MarketUniverse) -> MarketUniverse:
             nonlocal refresh_task
@@ -712,6 +1034,12 @@ class ConditionalArbScanner:
             except Exception as exc:
                 self.logger.warning("market_universe_refresh_failed error=%s", exc)
                 refreshed_universe = current_universe
+            else:
+                self._runtime_update(
+                    coverage_status="full",
+                    coverage_complete=True,
+                    coverage_source="full_background_refresh",
+                )
             refresh_task = None
             return refreshed_universe
 
@@ -731,17 +1059,73 @@ class ConditionalArbScanner:
             self.logger.info("market_universe_refresh_scheduled reason=%s", reason)
             return True
 
+        def _mark_backfill_seeded(updated: set[str]) -> None:
+            if dirty_updates.mark(updated, reason="dirty_pair_backfill"):
+                _publish_dirty_runtime_status(force=True)
+
+        async def _run_targeted_backfill() -> None:
+            while self.running and targeted_backfill_tokens:
+                token_ids = sorted(targeted_backfill_tokens)
+                targeted_backfill_tokens.clear()
+                await self._seed_rest_books_incrementally_async(
+                    cache,
+                    token_ids,
+                    reason="dirty_pair_backfill",
+                    on_chunk_seeded=_mark_backfill_seeded,
+                )
+
+        def _schedule_targeted_backfill(token_ids: set[str]) -> None:
+            nonlocal targeted_backfill_task
+            if not token_ids:
+                return
+            targeted_backfill_tokens.update(token_ids)
+            if targeted_backfill_task is None or targeted_backfill_task.done():
+                targeted_backfill_task = asyncio.create_task(_run_targeted_backfill())
+
+        def _finish_targeted_backfill_if_ready() -> None:
+            nonlocal targeted_backfill_task
+            if targeted_backfill_task is None or not targeted_backfill_task.done():
+                return
+            try:
+                targeted_backfill_task.result()
+            except Exception as exc:
+                self.logger.warning("dirty_pair_backfill_failed error=%s", exc)
+                self._runtime_error(exc)
+            targeted_backfill_task = None
+
+        def _evaluate_dirty_batch(
+            current_universe: MarketUniverse,
+            dirty_batch: _DirtyTokenBatch,
+        ) -> None:
+            ready_tokens, backfill_tokens = self._split_ready_and_backfill_dirty_tokens(
+                current_universe,
+                cache,
+                dirty_batch.token_ids,
+                params=ws_params,
+            )
+            if ready_tokens is None or ready_tokens:
+                self._evaluate_from_cache(
+                    current_universe,
+                    cache,
+                    dirty_token_ids=ready_tokens,
+                    evaluation_reason=dirty_batch.evaluation_reason,
+                    params=ws_params,
+                )
+            if backfill_tokens:
+                _schedule_targeted_backfill(backfill_tokens)
+
         try:
-            universe = await self._fetch_startup_market_universe_with_retry()
+            startup_selection = await self._fetch_ws_startup_market_universe_with_retry()
+            universe = startup_selection.universe
             self._runtime_update(
-                detail="seeding startup REST ask books",
+                detail="starting market websocket subscriptions",
                 events_fetched=universe.events_fetched,
                 raw_markets=universe.raw_markets,
                 tradable_markets=len(universe.markets),
                 tokens=len(universe.token_ids),
+                coverage_status=startup_selection.coverage_status,
+                coverage_complete=startup_selection.coverage_complete,
             )
-            await self._seed_rest_books_with_retry(cache, universe.token_ids, reason="ws_bootstrap")
-            self._runtime_update(detail="starting market websocket subscriptions")
             await self._run_async_with_retries(
                 "market_ws_start",
                 lambda: manager.start(universe.token_ids),
@@ -751,34 +1135,97 @@ class ConditionalArbScanner:
                 },
             )
             _publish_ws_runtime_status(force=True)
-            self._evaluate_from_cache(
-                universe,
+
+            startup_evaluated = False
+            startup_coverage_refresh_started = False
+
+            def evaluate_startup_chunk(updated: set[str]) -> None:
+                nonlocal startup_evaluated, startup_coverage_refresh_started
+                ready_tokens, backfill_tokens = self._split_ready_and_backfill_dirty_tokens(
+                    universe,
+                    cache,
+                    updated,
+                    params=ws_params,
+                )
+                if ready_tokens:
+                    result = self._evaluate_from_cache(
+                        universe,
+                        cache,
+                        dirty_token_ids=ready_tokens,
+                        evaluation_reason="ws_bootstrap",
+                        params=ws_params,
+                    )
+                    if not startup_evaluated and result["summary"]["evaluated_standard_binary_markets"] > 0:
+                        startup_evaluated = True
+                        self._runtime_update(
+                            phase="online",
+                            detail="online",
+                            executor_status="online",
+                            last_error=None,
+                            coverage_status=startup_selection.coverage_status,
+                            coverage_complete=startup_selection.coverage_complete,
+                        )
+                        if not startup_selection.coverage_complete and not startup_coverage_refresh_started:
+                            startup_coverage_refresh_started = _start_refresh_task(
+                                universe,
+                                reason="startup_full_coverage",
+                            )
+                if backfill_tokens:
+                    _schedule_targeted_backfill(backfill_tokens)
+
+            self._runtime_update(detail="seeding startup REST ask books")
+            await self._seed_rest_books_incrementally_async(
                 cache,
-                dirty_token_ids=None,
-                evaluation_reason="ws_bootstrap",
-                params=ws_params,
+                universe.token_ids,
+                reason="ws_bootstrap",
+                on_chunk_seeded=evaluate_startup_chunk,
             )
-            self._runtime_update(phase="online", detail="online", last_error=None)
+            if not startup_evaluated:
+                self._evaluate_from_cache(
+                    universe,
+                    cache,
+                    dirty_token_ids=None,
+                    evaluation_reason="ws_bootstrap",
+                    params=ws_params,
+                )
+                self._runtime_update(
+                    phase="online",
+                    detail="online",
+                    executor_status="online",
+                    last_error=None,
+                    coverage_status=startup_selection.coverage_status,
+                    coverage_complete=startup_selection.coverage_complete,
+                )
+            if not startup_selection.coverage_complete and not startup_coverage_refresh_started:
+                startup_coverage_refresh_started = _start_refresh_task(universe, reason="startup_full_coverage")
 
             next_refresh = loop.time() + self.config.market_refresh_interval_seconds
             next_reconcile = loop.time() + self.config.rest_reconcile_interval_seconds
 
             while self.running:
+                _finish_targeted_backfill_if_ready()
                 universe = _finish_refresh_task_if_ready(universe)
-                timeout = max(0.0, min(next_refresh, next_reconcile) - loop.time())
+                if reconcile_task is not None and reconcile_task.done():
+                    try:
+                        next_reconcile = reconcile_task.result()
+                    except Exception as exc:
+                        self.logger.warning("rest_reconcile_failed error=%s", exc)
+                        self._runtime_error(exc)
+                        next_reconcile = loop.time() + self.config.rest_reconcile_interval_seconds
+                    reconcile_task = None
+                    _publish_dirty_runtime_status(force=True)
+                deadlines = [next_refresh]
+                if reconcile_task is None:
+                    deadlines.append(next_reconcile)
+                timeout = max(0.0, min(deadlines) - loop.time())
                 timeout = min(timeout, 1.0)
                 dirty_batch = await dirty_updates.wait(timeout=timeout)
+                _finish_targeted_backfill_if_ready()
                 universe = _finish_refresh_task_if_ready(universe)
 
                 if dirty_batch is not None:
                     _publish_dirty_runtime_status(force=True)
-                    self._evaluate_from_cache(
-                        universe,
-                        cache,
-                        dirty_token_ids=dirty_batch.token_ids,
-                        evaluation_reason=dirty_batch.evaluation_reason,
-                        params=ws_params,
-                    )
+                    _evaluate_dirty_batch(universe, dirty_batch)
 
                 now = loop.time()
                 if now >= next_refresh:
@@ -788,25 +1235,20 @@ class ConditionalArbScanner:
                         next_refresh = now + 1.0
 
                 now = loop.time()
-                if now >= next_reconcile:
+                if reconcile_task is None and now >= next_reconcile:
                     dirty_batch = dirty_updates.take_nowait()
                     if dirty_batch is not None:
                         _publish_dirty_runtime_status(force=True)
-                        self._evaluate_from_cache(
-                            universe,
-                            cache,
-                            dirty_token_ids=dirty_batch.token_ids,
-                            evaluation_reason=dirty_batch.evaluation_reason,
-                            params=ws_params,
-                        )
+                        _evaluate_dirty_batch(universe, dirty_batch)
                         continue
                     try:
-                        next_reconcile = await self._seed_rest_reconcile_and_schedule_next(
-                            cache,
-                            universe.token_ids,
-                            dirty_updates,
+                        reconcile_task = asyncio.create_task(
+                            self._seed_rest_reconcile_and_schedule_next(
+                                cache,
+                                universe.token_ids,
+                                dirty_updates,
+                            )
                         )
-                        _publish_dirty_runtime_status(force=True)
                     except Exception as exc:
                         self.logger.warning("rest_reconcile_failed error=%s", exc)
                         self._runtime_error(exc)
@@ -817,25 +1259,18 @@ class ConditionalArbScanner:
                 refresh_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await refresh_task
+            if reconcile_task is not None:
+                reconcile_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await reconcile_task
+            if targeted_backfill_task is not None:
+                targeted_backfill_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await targeted_backfill_task
             await manager.stop()
 
     async def _seed_rest_books(self, cache: MarketDataCache, token_ids: list[str], *, reason: str) -> set[str]:
-        if not token_ids:
-            return set()
-        self._runtime_update(detail=f"seeding REST ask books: {reason}", tokens=len(token_ids))
-        progress = self._book_seed_progress_callback(reason=reason, total_tokens=len(token_ids))
-        books = await asyncio.to_thread(self.client.fetch_ask_books, token_ids, on_progress=progress)
-        updated = cache.seed_ask_books(books)
-        self._runtime_update(
-            detail=f"REST ask books seeded: {reason}",
-            book_seed_completed_tokens=len(token_ids),
-            book_seed_remaining_tokens=0,
-            book_seed_received_books=len(books),
-            book_seed_eta_seconds=0.0,
-        )
-        self._log_rest_book_seed_failures(reason=reason)
-        self.logger.info("rest_books_seeded reason=%s tokens=%s", reason, len(updated))
-        return updated
+        return await self._seed_rest_books_incrementally_async(cache, token_ids, reason=reason)
 
     async def _seed_rest_books_with_retry(
         self,
@@ -844,14 +1279,7 @@ class ConditionalArbScanner:
         *,
         reason: str,
     ) -> set[str]:
-        return await self._run_async_with_retries(
-            "rest_book_seed",
-            lambda: self._seed_rest_books(cache, token_ids, reason=reason),
-            summary=lambda updated: {
-                "reason": reason,
-                "tokens": len(updated),
-            },
-        )
+        return await self._seed_rest_books(cache, token_ids, reason=reason)
 
     async def _seed_rest_reconcile_and_schedule_next(
         self,
@@ -859,20 +1287,21 @@ class ConditionalArbScanner:
         token_ids: list[str],
         dirty_updates: _DirtyTokenAccumulator,
     ) -> float:
-        dirty_updates.begin_full_reconcile(reason="rest_reconcile")
-        self._runtime_update(**dirty_updates.runtime_fields())
+        def mark_seeded_chunk(updated: set[str]) -> None:
+            if dirty_updates.mark(updated, reason="rest_reconcile"):
+                self._runtime_update(**dirty_updates.runtime_fields())
+
         try:
-            await self._seed_rest_books_with_retry(
+            await self._seed_rest_books_incrementally_async(
                 cache,
                 token_ids,
                 reason="rest_reconcile",
+                on_chunk_seeded=mark_seeded_chunk,
             )
         except Exception as exc:
-            dirty_updates.fail_full_reconcile()
             self._runtime_error(exc)
             self._runtime_update(**dirty_updates.runtime_fields())
             raise
-        dirty_updates.finish_full_reconcile()
         self._runtime_update(**dirty_updates.runtime_fields(), last_error=None)
         return asyncio.get_running_loop().time() + self.config.rest_reconcile_interval_seconds
 
@@ -895,7 +1324,7 @@ class ConditionalArbScanner:
 
         seeded: set[str] = set()
         if added_tokens:
-            seeded = await self._seed_rest_books_with_retry(
+            seeded = await self._seed_rest_books_incrementally_async(
                 cache,
                 added_tokens,
                 reason="market_refresh_added",
@@ -940,13 +1369,9 @@ class ConditionalArbScanner:
     def run_one_cycle(self) -> dict[str, Any]:
         self._runtime_update(detail="running REST cycle")
         universe = self._fetch_market_universe_with_retry_sync()
-        books_by_token = self._fetch_ask_books_with_retry(universe.token_ids, reason="rest_cycle")
-        result = self._evaluate_universe(
+        result = self._run_incremental_rest_evaluation(
             universe,
-            books_by_token,
-            dirty_token_ids=None,
-            evaluation_reason="rest_cycle",
-            params=self.params,
+            reason="rest_cycle",
         )
         self._runtime_update(phase="online", detail="online", last_error=None)
         return result
@@ -982,24 +1407,99 @@ class ConditionalArbScanner:
         *,
         reason: str,
     ) -> Mapping[str, OrderBookSide]:
-        def fetch_books() -> Mapping[str, OrderBookSide]:
-            progress = self._book_seed_progress_callback(reason=reason, total_tokens=len(token_ids))
-            books = self.client.fetch_ask_books(token_ids, on_progress=progress)
-            self._runtime_update(
-                detail=f"REST ask books seeded: {reason}",
-                book_seed_completed_tokens=len(token_ids),
-                book_seed_remaining_tokens=0,
-                book_seed_received_books=len(books),
-                book_seed_eta_seconds=0.0,
-            )
-            self._log_rest_book_seed_failures(reason=reason)
-            return books
+        cache = MarketDataCache()
+        self._seed_rest_books_incrementally_sync(cache, token_ids, reason=reason)
+        return cache.ask_books_snapshot(token_ids)
 
-        return self._run_with_retries(
-            "rest_book_fetch",
-            fetch_books,
-            summary=lambda books: {"tokens": len(books)},
+    def _run_incremental_rest_evaluation(
+        self,
+        universe: MarketUniverse,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        cache = MarketDataCache()
+        results: list[dict[str, Any]] = []
+
+        def evaluate_seeded_chunk(updated_token_ids: set[str]) -> None:
+            results.append(
+                self._evaluate_from_cache(
+                    universe,
+                    cache,
+                    dirty_token_ids=updated_token_ids,
+                    evaluation_reason=reason,
+                    params=self.params,
+                )
+            )
+
+        self._seed_rest_books_incrementally_sync(
+            cache,
+            universe.token_ids,
+            reason=reason,
+            on_chunk_seeded=evaluate_seeded_chunk,
         )
+        if not results:
+            results.append(
+                self._evaluate_from_cache(
+                    universe,
+                    cache,
+                    dirty_token_ids=None,
+                    evaluation_reason=reason,
+                    params=self.params,
+                )
+            )
+        combined = self._combine_evaluation_results(results)
+        summary = combined.get("summary", {})
+        skip_counts = summary.get("skip_counts") if isinstance(summary.get("skip_counts"), Mapping) else {}
+        simulation_failure_counts = (
+            summary.get("simulation_failure_counts")
+            if isinstance(summary.get("simulation_failure_counts"), Mapping)
+            else {}
+        )
+        self._runtime_update(
+            last_cycle_completed_at_utc=utc_iso(),
+            last_evaluation_reason=reason,
+            last_cycle_evaluated_markets=_progress_int(summary.get("evaluated_standard_binary_markets")),
+            last_cycle_executions=_progress_int(summary.get("executions")),
+            last_cycle_skips=sum(_progress_int(count) for count in skip_counts.values()),
+            last_cycle_skip_counts=dict(skip_counts),
+            last_cycle_simulation_failure_counts=dict(simulation_failure_counts),
+            last_simulated_execution_failure_reason=summary.get("last_simulated_execution_failure_reason"),
+            detail=f"completed {reason}",
+        )
+        return combined
+
+    @staticmethod
+    def _combine_evaluation_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+        if len(results) == 1:
+            return results[0]
+        combined_executions: list[dict[str, Any]] = []
+        combined_skip_counts: dict[str, int] = {}
+        combined_simulation_failure_counts: dict[str, int] = {}
+        last_simulation_failure_reason: str | None = None
+        evaluated_markets = 0
+        for result in results:
+            summary = result.get("summary", {})
+            combined_executions.extend(result.get("executions", []))
+            evaluated_markets += _progress_int(summary.get("evaluated_standard_binary_markets"))
+            skip_counts = summary.get("skip_counts")
+            if isinstance(skip_counts, Mapping):
+                for reason, count in skip_counts.items():
+                    combined_skip_counts[str(reason)] = combined_skip_counts.get(str(reason), 0) + _progress_int(count)
+            simulation_failure_counts = summary.get("simulation_failure_counts")
+            if isinstance(simulation_failure_counts, Mapping):
+                for reason, count in simulation_failure_counts.items():
+                    combined_simulation_failure_counts[str(reason)] = (
+                        combined_simulation_failure_counts.get(str(reason), 0) + _progress_int(count)
+                    )
+            if summary.get("last_simulated_execution_failure_reason"):
+                last_simulation_failure_reason = str(summary["last_simulated_execution_failure_reason"])
+        summary = dict(results[-1].get("summary", {}))
+        summary["evaluated_standard_binary_markets"] = evaluated_markets
+        summary["executions"] = len(combined_executions)
+        summary["skip_counts"] = combined_skip_counts
+        summary["simulation_failure_counts"] = combined_simulation_failure_counts
+        summary["last_simulated_execution_failure_reason"] = last_simulation_failure_reason
+        return {"summary": summary, "executions": combined_executions}
 
     def _market_universe_from_events(
         self,
@@ -1096,6 +1596,68 @@ class ConditionalArbScanner:
             raise RuntimeError(f"failed to write startup market universe cache: {self.config.market_universe_cache_path}")
         return universe
 
+    def _fetch_ws_startup_market_universe(self) -> _StartupUniverseSelection:
+        cached = self._load_cached_market_universe()
+        if cached is not None:
+            self._runtime_update(
+                executor_status="warming",
+                coverage_status="full",
+                coverage_complete=True,
+                coverage_source="fresh_full_cache",
+            )
+            return _StartupUniverseSelection(
+                universe=cached,
+                coverage_status="full",
+                coverage_complete=True,
+            )
+
+        self._runtime_update(
+            detail="fetching priority Gamma active universe",
+            executor_status="warming",
+            coverage_status="priority",
+            coverage_complete=False,
+            coverage_source="priority_volume24hr_slice",
+        )
+        self.logger.info(
+            "market_universe_priority_fetch_start event_limit=%s token_limit=%s",
+            self.config.fast_start_event_limit,
+            self.config.fast_start_token_limit,
+        )
+        events = self.client.fetch_active_events_slice(
+            limit=self.config.fast_start_event_limit,
+            order="volume24hr",
+            ascending=False,
+            on_page=self._log_market_event_page,
+            should_continue=self._ensure_running,
+        )
+        universe = self._market_universe_from_events(
+            events,
+            token_limit=self.config.fast_start_token_limit,
+        )
+        self.logger.info(
+            "market_universe_priority_fetch_complete events=%s raw_markets=%s tradable_markets=%s tokens=%s",
+            universe.events_fetched,
+            universe.raw_markets,
+            len(universe.markets),
+            len(universe.token_ids),
+        )
+        self._runtime_update(
+            events_fetched=universe.events_fetched,
+            raw_markets=universe.raw_markets,
+            tradable_markets=len(universe.markets),
+            tokens=len(universe.token_ids),
+            detail="priority Gamma active universe fetched",
+            executor_status="warming",
+            coverage_status="priority",
+            coverage_complete=False,
+            coverage_source="priority_volume24hr_slice",
+        )
+        return _StartupUniverseSelection(
+            universe=universe,
+            coverage_status="priority",
+            coverage_complete=False,
+        )
+
     def _write_market_universe_cache(
         self,
         universe: MarketUniverse,
@@ -1161,6 +1723,16 @@ class ConditionalArbScanner:
             summary=self._universe_retry_summary,
         )
 
+    async def _fetch_ws_startup_market_universe_with_retry(self) -> _StartupUniverseSelection:
+        return await self._run_async_with_retries(
+            "market_universe_startup_fetch",
+            lambda: asyncio.to_thread(self._fetch_ws_startup_market_universe),
+            summary=lambda selection: {
+                **self._universe_retry_summary(selection.universe),
+                "coverage_complete": int(selection.coverage_complete),
+            },
+        )
+
     async def _fetch_market_universe_with_retry(self) -> MarketUniverse:
         return await self._run_async_with_retries(
             "market_universe_fetch",
@@ -1186,13 +1758,77 @@ class ConditionalArbScanner:
         evaluation_reason: str,
         params: PaperPortfolioParams,
     ) -> dict[str, Any]:
+        def fill_time_book_reader(
+            market: BinaryMarket,
+            fill_time: datetime,
+        ) -> tuple[OrderBookSide | None, OrderBookSide | None]:
+            _ = fill_time
+            return cache.book_side(market.yes_token_id, "ask"), cache.book_side(market.no_token_id, "ask")
+
         return self._evaluate_universe(
             universe,
             cache.ask_books_snapshot(universe.token_ids),
             dirty_token_ids=dirty_token_ids,
             evaluation_reason=evaluation_reason,
             params=params,
+            fill_time_book_reader=fill_time_book_reader,
         )
+
+    @staticmethod
+    def _ensure_aware_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
+    def _cached_ask_book_is_ready(
+        self,
+        cache: MarketDataCache,
+        token_id: str,
+        *,
+        params: PaperPortfolioParams,
+        now: datetime,
+    ) -> bool:
+        book = cache.book_side(token_id, "ask")
+        if book is None or not cache.is_snapshot_ready(token_id):
+            return False
+        if book.updated_at is None:
+            return True
+        age = (
+            self._ensure_aware_datetime(now)
+            - self._ensure_aware_datetime(book.updated_at)
+        ).total_seconds()
+        return age <= params.max_book_age_seconds
+
+    def _split_ready_and_backfill_dirty_tokens(
+        self,
+        universe: MarketUniverse,
+        cache: MarketDataCache,
+        dirty_token_ids: set[str] | None,
+        *,
+        params: PaperPortfolioParams,
+    ) -> tuple[set[str] | None, set[str]]:
+        if dirty_token_ids is None:
+            return None, set()
+        now = datetime.now(timezone.utc)
+        ready_tokens: set[str] = set()
+        backfill_tokens: set[str] = set()
+        seen_markets: set[str] = set()
+        for token_id in dirty_token_ids:
+            for market in universe.markets_by_token.get(token_id, ()):
+                if market.market_id in seen_markets:
+                    continue
+                seen_markets.add(market.market_id)
+                if market.neg_risk:
+                    continue
+                pair_tokens = {market.yes_token_id, market.no_token_id}
+                if all(
+                    self._cached_ask_book_is_ready(cache, pair_token, params=params, now=now)
+                    for pair_token in pair_tokens
+                ):
+                    ready_tokens.update(pair_tokens)
+                else:
+                    backfill_tokens.update(pair_tokens)
+        return ready_tokens, backfill_tokens
 
     def _evaluate_universe(
         self,
@@ -1202,6 +1838,8 @@ class ConditionalArbScanner:
         dirty_token_ids: set[str] | None,
         evaluation_reason: str,
         params: PaperPortfolioParams,
+        fill_time_book_reader: Callable[[BinaryMarket, datetime], tuple[OrderBookSide | None, OrderBookSide | None]]
+        | None = None,
     ) -> dict[str, Any]:
         cycle_started = datetime.now(timezone.utc)
         self._runtime_update(
@@ -1224,6 +1862,8 @@ class ConditionalArbScanner:
         )
 
         skip_counts: dict[str, int] = {}
+        simulation_failure_counts: dict[str, int] = {}
+        last_simulation_failure_reason: str | None = None
         standard_markets = self._evaluation_targets(
             universe,
             dirty_token_ids=dirty_token_ids,
@@ -1243,8 +1883,16 @@ class ConditionalArbScanner:
                 no_book,
                 as_of=cycle_started,
                 params=params,
+                fill_time_book_reader=fill_time_book_reader,
             )
-            self._handle_decision(decision, executions, skip_counts)
+            last_reason = self._handle_decision(
+                decision,
+                executions,
+                skip_counts,
+                simulation_failure_counts=simulation_failure_counts,
+            )
+            if last_reason is not None:
+                last_simulation_failure_reason = last_reason
 
         neg_risk_markets = sum(1 for market in universe.markets if market.neg_risk)
         summary = {
@@ -1259,6 +1907,8 @@ class ConditionalArbScanner:
             "evaluated_standard_binary_markets": len(standard_markets),
             "executions": len(executions),
             "skip_counts": skip_counts,
+            "simulation_failure_counts": simulation_failure_counts,
+            "last_simulated_execution_failure_reason": last_simulation_failure_reason,
         }
         self.portfolio.append_event("paper_portfolio_cycle_completed", summary)
         self._runtime_update(
@@ -1267,6 +1917,9 @@ class ConditionalArbScanner:
             last_cycle_evaluated_markets=len(standard_markets),
             last_cycle_executions=len(executions),
             last_cycle_skips=sum(skip_counts.values()),
+            last_cycle_skip_counts=skip_counts,
+            last_cycle_simulation_failure_counts=simulation_failure_counts,
+            last_simulated_execution_failure_reason=last_simulation_failure_reason,
             events_fetched=universe.events_fetched,
             raw_markets=universe.raw_markets,
             tradable_markets=len(universe.markets),
@@ -1316,7 +1969,9 @@ class ConditionalArbScanner:
         decision: PaperPortfolioDecision,
         executions: list[dict[str, Any]],
         skip_counts: dict[str, int],
-    ) -> None:
+        *,
+        simulation_failure_counts: dict[str, int] | None = None,
+    ) -> str | None:
         if decision.action == "EXECUTE" and decision.execution is not None:
             execution = decision.execution
             executions.append(execution)
@@ -1339,9 +1994,13 @@ class ConditionalArbScanner:
                 execution["ceiling_used_usd"],
                 execution["stop_reason"],
             )
-            return
+            return None
         reason = decision.reason or "unknown"
         skip_counts[reason] = skip_counts.get(reason, 0) + 1
+        if decision.details.get("simulation_failure") and simulation_failure_counts is not None:
+            simulation_failure_counts[reason] = simulation_failure_counts.get(reason, 0) + 1
+            return reason
+        return None
 
 
 def build_parser() -> argparse.ArgumentParser:

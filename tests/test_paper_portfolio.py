@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from polymarket_conditional_arb import config
 from polymarket_conditional_arb.arb_models import BinaryMarket
 from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import (
@@ -58,6 +59,7 @@ def params(**overrides) -> PaperPortfolioParams:
         "min_net_profit_usd": 0.0,
         "min_net_return_bps": 0.0,
         "max_book_age_seconds": 20.0,
+        "simulation": config.PaperExecutionSimulationConfig.zero_friction(),
     }
     values.update(overrides)
     return PaperPortfolioParams(**values)
@@ -69,6 +71,33 @@ def state_for(p: PaperPortfolioParams | None = None, *, cash: float | None = Non
     if cash is not None:
         state["cash"] = cash
     return state
+
+
+def simulation(**overrides):
+    values = {
+        "enabled": True,
+        "seed": 0,
+        "latency_ms": 0.0,
+        "latency_jitter_ms": 0.0,
+        "signing_latency_ms": 0.0,
+        "settlement_latency_ms": 0.0,
+        "max_fill_price_move_bps": 0.0,
+        "queue_depth_ratio": 0.0,
+        "queue_fill_probability": 0.0,
+        "partial_fill_probability": 0.0,
+        "partial_fill_min_ratio": 0.0,
+        "submit_failure_probability": 0.0,
+        "accept_failure_probability": 0.0,
+        "fill_failure_probability": 0.0,
+        "cancel_failure_probability": 0.0,
+        "throttle_max_submissions_per_second": 0,
+        "throttle_quantity_ratio": 0.0,
+        "adverse_selection_probability": 0.0,
+        "adverse_depth_removal_ratio": 0.0,
+        "adverse_price_move_bps": 0.0,
+    }
+    values.update(overrides)
+    return config.PaperExecutionSimulationConfig(**values)
 
 
 def test_paired_execution_consumes_multiple_levels_until_edge_disappears():
@@ -281,6 +310,216 @@ def test_same_executable_book_with_different_local_timestamps_does_not_duplicate
     assert second.action == "SKIP"
     assert second.reason == "unchanged_book_snapshot"
     assert len(portfolio.state["executions"]) == 1
+
+
+def test_zero_friction_simulation_preserves_legacy_fill_and_fingerprint(tmp_path):
+    legacy = params()
+    simulated = params(simulation=config.PaperExecutionSimulationConfig.zero_friction())
+    legacy_portfolio = PaperPortfolio(tmp_path / "legacy.json", events_path=tmp_path / "legacy.jsonl", params=legacy).load()
+    simulated_portfolio = PaperPortfolio(
+        tmp_path / "simulated.json",
+        events_path=tmp_path / "simulated.jsonl",
+        params=simulated,
+    ).load()
+
+    legacy_decision = legacy_portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        as_of=AS_OF,
+    )
+    simulated_decision = simulated_portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        as_of=AS_OF,
+    )
+
+    assert legacy_decision.action == "EXECUTE"
+    assert simulated_decision.action == "EXECUTE"
+    for field in ("quantity", "quantity_redeemed", "gross_cost", "capital_used", "net_profit"):
+        assert simulated_decision.execution[field] == pytest.approx(legacy_decision.execution[field])
+    assert simulated_decision.execution["book_fingerprint"] == legacy_decision.execution["book_fingerprint"]
+    assert "simulation" not in simulated_decision.execution
+    assert simulated_portfolio.state["cash"] == pytest.approx(legacy_portfolio.state["cash"])
+
+
+def test_simulated_latency_makes_stale_fill_time_books_skip():
+    p = params(
+        max_book_age_seconds=1.0,
+        simulation=simulation(latency_ms=1500.0),
+    )
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_stale_fill_time_book"
+    assert decision.details["simulation_failure"] is True
+    assert decision.details["simulation"]["fill_latency_ms"] == pytest.approx(1500.0)
+
+
+def test_moved_fill_time_books_skip_when_price_move_exceeds_limit():
+    p = params(
+        simulation=simulation(max_fill_price_move_bps=10.0),
+    )
+
+    def fill_reader(_market, _fill_time):
+        return asks("yes-token", [(0.50, 10)]), asks("no-token", [(0.49, 10)])
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+        fill_time_book_reader=fill_reader,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_fill_price_moved"
+    assert decision.details["simulation_failure"] is True
+    assert decision.details["fill_unit_cost"] > decision.details["signal_unit_cost"]
+
+
+def test_queue_depth_ratio_reduces_available_fill_size():
+    p = params(simulation=simulation(queue_depth_ratio=0.5, queue_fill_probability=1.0))
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 20)]),
+        asks("no-token", [(0.49, 20)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution["quantity"] == pytest.approx(10.0)
+    assert decision.execution["simulation"]["queue"]["depth_ratio"] == 0.5
+
+
+def test_partial_fill_redeems_matched_quantity_and_leaves_unmatched_inventory(tmp_path):
+    p = params(
+        trade_ceiling_usd=100.0,
+        simulation=simulation(partial_fill_probability=1.0, partial_fill_min_ratio=0.5),
+    )
+    portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 100)]),
+        asks("no-token", [(0.49, 100)]),
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    execution = decision.execution
+    assert execution["yes_filled_quantity"] <= execution["quantity"]
+    assert execution["no_filled_quantity"] <= execution["quantity"]
+    assert execution["quantity_redeemed"] == pytest.approx(
+        min(execution["yes_filled_quantity"], execution["no_filled_quantity"])
+    )
+    unmatched_total = execution["unmatched_yes_quantity"] + execution["unmatched_no_quantity"]
+    assert unmatched_total > 0.0
+    status = portfolio.status()
+    assert status["unmatched_inventory"]
+
+
+def test_queue_degraded_pair_below_minimum_does_not_create_execution():
+    p = params(simulation=simulation(queue_depth_ratio=0.4, queue_fill_probability=1.0))
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_queue_min_size"
+    assert decision.details["available_equal_depth"] == pytest.approx(4.0)
+
+
+def test_seeded_simulated_submit_failure_is_reproducible():
+    p = params(simulation=simulation(seed=123, submit_failure_probability=1.0))
+
+    first = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+    second = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert first.action == "SKIP"
+    assert second.action == "SKIP"
+    assert first.reason == second.reason == "simulation_submit_failure"
+    assert first.details["simulation"] == second.details["simulation"]
+
+
+def test_throttle_saturation_reduces_quantity_and_skips_below_minimum():
+    p = params(
+        simulation=simulation(
+            throttle_max_submissions_per_second=1,
+            throttle_quantity_ratio=0.4,
+        )
+    )
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_throttle_min_size"
+    assert decision.details["degraded_quantity"] == pytest.approx(4.0)
+
+
+def test_simulated_execution_failure_writes_audit_event_without_mutating_state(tmp_path):
+    p = params(simulation=simulation(submit_failure_probability=1.0))
+    path = tmp_path / "portfolio.json"
+    events_path = tmp_path / "events.jsonl"
+    portfolio = PaperPortfolio(path, events_path=events_path, params=p).load()
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_submit_failure"
+    assert not path.exists()
+    assert portfolio.state["executions"] == []
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert events[0]["event_type"] == "paper_portfolio_execution_failed"
+    assert events[0]["reason"] == "simulation_submit_failure"
+    assert events[0]["failure_stage"] == "simulation_submit_failure"
+    assert events[0]["simulation"]["failure_reason"] == "simulation_submit_failure"
 
 
 def test_capped_deep_book_fingerprint_prevents_duplicate_execution(tmp_path):

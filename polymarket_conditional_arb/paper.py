@@ -5,18 +5,19 @@ import json
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from . import config
-from .arb_models import BinaryMarket, OrderBookSide
+from .arb_models import BinaryMarket, BookLevel, OrderBookSide
 from .event_log import AppendOnlyJsonl, jsonable, utc_iso
 
 EPSILON = 1e-9
 SCHEMA_VERSION = 1
 PORTFOLIO_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
+FillTimeBookReader = Callable[[BinaryMarket, datetime], tuple[OrderBookSide | None, OrderBookSide | None]]
 
 
 class PaperPortfolioLoadError(RuntimeError):
@@ -34,6 +35,7 @@ class PaperPortfolioParams:
     min_net_profit_usd: float = 0.0
     min_net_return_bps: float = 0.0
     max_book_age_seconds: float = config.DEFAULT_MAX_BOOK_AGE_SECONDS
+    simulation: config.PaperExecutionSimulationConfig = field(default_factory=config.PaperExecutionSimulationConfig)
 
     @property
     def slippage_buffer_rate(self) -> float:
@@ -64,6 +66,7 @@ class PaperPortfolioParams:
             min_net_profit_usd=loaded.min_net_profit_usd,
             min_net_return_bps=loaded.min_net_return_bps,
             max_book_age_seconds=loaded.max_book_age_seconds,
+            simulation=loaded.paper_simulation,
         )
 
 
@@ -151,12 +154,17 @@ def book_pair_fingerprint(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _cost_breakdown(gross_cost: float, params: PaperPortfolioParams) -> dict[str, float]:
+def _cost_breakdown(
+    gross_cost: float,
+    params: PaperPortfolioParams,
+    *,
+    merge_cost_usd: float | None = None,
+) -> dict[str, float]:
     return {
         "fees_usd": gross_cost * params.taker_fee_rate,
         "slippage_usd": gross_cost * params.slippage_buffer_rate,
         "tax_usd": gross_cost * params.tax_rate,
-        "merge_usd": params.merge_cost_usd,
+        "merge_usd": params.merge_cost_usd if merge_cost_usd is None else merge_cost_usd,
     }
 
 
@@ -249,6 +257,7 @@ def _simulate_paired_tranches(
     *,
     cash: float,
     params: PaperPortfolioParams,
+    max_quantity: float | None = None,
 ) -> tuple[float, float, float, tuple[dict[str, float], ...], str]:
     spend_limit = _simulation_budget(cash, params)
     if spend_limit <= EPSILON:
@@ -286,12 +295,19 @@ def _simulate_paired_tranches(
             break
 
         available_equal_depth = min(yes_remaining, no_remaining)
+        remaining_quantity = None if max_quantity is None else max(0.0, max_quantity - quantity)
+        if remaining_quantity is not None and remaining_quantity <= EPSILON:
+            stop_reason = "target_quantity_limit"
+            break
         step = min(available_equal_depth, remaining_budget / unit_capital_used)
+        if remaining_quantity is not None:
+            step = min(step, remaining_quantity)
         if step <= EPSILON:
             stop_reason = "cash_or_ceiling_limit"
             break
 
         budget_limited = step + EPSILON < available_equal_depth
+        quantity_limited = remaining_quantity is not None and step + EPSILON >= remaining_quantity
         yes_cost += step * yes_price
         no_cost += step * no_price
         quantity += step
@@ -304,6 +320,9 @@ def _simulate_paired_tranches(
             }
         )
 
+        if quantity_limited:
+            stop_reason = "target_quantity_limit"
+            break
         if budget_limited:
             stop_reason = "cash_or_ceiling_limit"
             break
@@ -333,7 +352,324 @@ def _known_fingerprint(state: Mapping[str, Any], market_id: str) -> str | None:
     return str(row) if row not in (None, "") else None
 
 
-def evaluate_binary_paper_execution(
+def _stable_unit_interval(*parts: Any) -> float:
+    payload = "|".join(str(part) for part in parts)
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+
+
+def _stage_random(
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    book_fingerprint: str,
+    stage: str,
+    leg: str = "",
+) -> float:
+    return _stable_unit_interval(simulation.seed, market.market_id, book_fingerprint, stage, leg)
+
+
+def _copy_book_with_levels(
+    book: OrderBookSide,
+    levels: list[BookLevel],
+    *,
+    source_suffix: str,
+) -> OrderBookSide:
+    return OrderBookSide(
+        token_id=book.token_id,
+        side=book.side,
+        levels=tuple(level for level in levels if level.size > EPSILON),
+        source=f"{book.source}_{source_suffix}",
+        updated_at=book.updated_at,
+        source_revision=book.source_revision,
+    )
+
+
+def _scale_book_depth(book: OrderBookSide, ratio: float) -> OrderBookSide:
+    scaled = max(0.0, min(1.0, ratio))
+    if scaled >= 1.0 - EPSILON:
+        return book
+    return _copy_book_with_levels(
+        book,
+        [BookLevel(price=level.price, size=level.size * scaled) for level in book.levels],
+        source_suffix="queue",
+    )
+
+
+def _adverse_adjust_book(book: OrderBookSide, *, removal_ratio: float, price_move_bps: float) -> OrderBookSide:
+    depth_ratio = max(0.0, 1.0 - max(0.0, min(1.0, removal_ratio)))
+    price_factor = 1.0 + max(0.0, price_move_bps) / 10_000.0
+    levels = [
+        BookLevel(price=min(0.999999, level.price * price_factor), size=level.size * depth_ratio)
+        for level in book.levels
+    ]
+    return _copy_book_with_levels(book, levels, source_suffix="adverse")
+
+
+def _fill_cost(book: OrderBookSide, quantity: float) -> float:
+    cost = book.cost_to_fill(quantity)
+    if cost is None:
+        raise ValueError(f"insufficient {book.side} depth for {book.token_id}")
+    return cost
+
+
+def _simulation_failure_decision(
+    reason: str,
+    *,
+    market: BinaryMarket,
+    simulation: dict[str, Any],
+    book_fingerprint: str,
+    **details: Any,
+) -> PaperPortfolioDecision:
+    simulation = dict(simulation)
+    simulation.setdefault("failure_stage", reason)
+    simulation.setdefault("failure_reason", reason)
+    return PaperPortfolioDecision.skip(
+        reason,
+        market_id=market.market_id,
+        book_fingerprint=book_fingerprint,
+        simulation=simulation,
+        simulation_failure=True,
+        **details,
+    )
+
+
+def _simulation_latency_fields(
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    book_fingerprint: str,
+    signal_time: datetime,
+) -> tuple[datetime, dict[str, Any]]:
+    jitter = 0.0
+    if simulation.latency_jitter_ms > 0.0:
+        jitter_draw = _stage_random(simulation, market, book_fingerprint, "latency_jitter")
+        jitter = (jitter_draw - 0.5) * 2.0 * simulation.latency_jitter_ms
+    submit_latency_ms = max(0.0, simulation.latency_ms + jitter)
+    signing_latency_ms = max(0.0, simulation.signing_latency_ms)
+    settlement_latency_ms = max(0.0, simulation.settlement_latency_ms)
+    fill_latency_ms = submit_latency_ms + signing_latency_ms
+    fill_time = signal_time + timedelta(milliseconds=fill_latency_ms)
+    settlement_time = fill_time + timedelta(milliseconds=settlement_latency_ms)
+    return fill_time, {
+        "seed": simulation.seed,
+        "enabled": simulation.enabled,
+        "signal_timestamp_utc": utc_iso(signal_time),
+        "submit_latency_ms": submit_latency_ms,
+        "latency_jitter_ms": jitter,
+        "signing_latency_ms": signing_latency_ms,
+        "fill_latency_ms": fill_latency_ms,
+        "settlement_latency_ms": settlement_latency_ms,
+        "fill_timestamp_utc": utc_iso(fill_time),
+        "settlement_timestamp_utc": utc_iso(settlement_time),
+    }
+
+
+def _book_timestamps(yes_asks: OrderBookSide, no_asks: OrderBookSide) -> dict[str, str | None]:
+    return {
+        "yes_book": utc_iso(yes_asks.updated_at) if yes_asks.updated_at else None,
+        "no_book": utc_iso(no_asks.updated_at) if no_asks.updated_at else None,
+    }
+
+
+def _finalize_execution_from_books(
+    market: BinaryMarket,
+    yes_asks: OrderBookSide,
+    no_asks: OrderBookSide,
+    *,
+    state: Mapping[str, Any],
+    params: PaperPortfolioParams,
+    as_of: datetime,
+    max_quantity: float | None,
+    simulation_metadata: dict[str, Any],
+    signal_execution: Mapping[str, Any],
+) -> PaperPortfolioDecision:
+    cash = _as_float(state.get("cash"), params.starting_capital_usd)
+    quantity, yes_cost, no_cost, tranches, stop_reason = _simulate_paired_tranches(
+        yes_asks,
+        no_asks,
+        cash=cash,
+        params=params,
+        max_quantity=max_quantity,
+    )
+    fingerprint = book_pair_fingerprint(market, yes_asks, no_asks, tranches=tranches)
+    simulation_metadata = dict(simulation_metadata)
+    simulation_metadata.update(
+        {
+            "fill_book_source": simulation_metadata.get("book_source", "fill_time"),
+            "fill_book_fingerprint": fingerprint,
+            "fill_source_timestamps": _book_timestamps(yes_asks, no_asks),
+        }
+    )
+
+    if _known_fingerprint(state, market.market_id) == fingerprint:
+        return PaperPortfolioDecision.skip(
+            "unchanged_book_snapshot",
+            market_id=market.market_id,
+            book_fingerprint=fingerprint,
+            simulation=simulation_metadata,
+        )
+
+    min_quantity = market.effective_min_order_size
+    if quantity <= EPSILON:
+        return _simulation_failure_decision(
+            stop_reason,
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            yes_best_ask=yes_asks.best_price,
+            no_best_ask=no_asks.best_price,
+        )
+    if quantity + EPSILON < min_quantity:
+        return _simulation_failure_decision(
+            "simulation_insufficient_depth",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            available_equal_depth=quantity,
+            min_quantity=min_quantity,
+        )
+
+    gross_cost = yes_cost + no_cost
+    signal_quantity = _as_float(signal_execution.get("quantity"))
+    signal_gross_cost = _as_float(signal_execution.get("gross_cost"))
+    if params.simulation.max_fill_price_move_bps > 0.0 and signal_quantity > EPSILON and signal_gross_cost > EPSILON:
+        signal_unit_cost = signal_gross_cost / signal_quantity
+        fill_unit_cost = gross_cost / quantity
+        move_bps = ((fill_unit_cost - signal_unit_cost) / signal_unit_cost) * 10_000.0
+        simulation_metadata["price_move_bps"] = move_bps
+        if move_bps > params.simulation.max_fill_price_move_bps + EPSILON:
+            return _simulation_failure_decision(
+                "simulation_fill_price_moved",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=fingerprint,
+                signal_unit_cost=signal_unit_cost,
+                fill_unit_cost=fill_unit_cost,
+                max_fill_price_move_bps=params.simulation.max_fill_price_move_bps,
+            )
+
+    full_fill_costs = _cost_breakdown(gross_cost, params)
+    full_fill_capital_used = gross_cost + sum(full_fill_costs.values())
+    full_fill_net_profit = quantity - full_fill_capital_used
+    full_fill_net_return_bps = (
+        (full_fill_net_profit / full_fill_capital_used) * 10_000.0 if full_fill_capital_used > 0 else 0.0
+    )
+    if (
+        full_fill_net_profit <= EPSILON
+        or full_fill_net_profit + EPSILON < params.min_net_profit_usd
+        or full_fill_net_return_bps + EPSILON < params.min_net_return_bps
+    ):
+        return _simulation_failure_decision(
+            "simulation_not_profitable_at_fill",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            quantity=quantity,
+            gross_cost=gross_cost,
+            capital_used=full_fill_capital_used,
+            net_profit=full_fill_net_profit,
+            net_return_bps=full_fill_net_return_bps,
+        )
+
+    partial_applied = False
+    yes_filled_quantity = quantity
+    no_filled_quantity = quantity
+    if (
+        params.simulation.partial_fill_probability > 0.0
+        and _stage_random(params.simulation, market, fingerprint, "partial_fill") <= params.simulation.partial_fill_probability
+    ):
+        partial_applied = True
+        min_ratio = max(0.0, min(1.0, params.simulation.partial_fill_min_ratio))
+        yes_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
+            params.simulation,
+            market,
+            fingerprint,
+            "partial_ratio",
+            "yes",
+        )
+        no_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
+            params.simulation,
+            market,
+            fingerprint,
+            "partial_ratio",
+            "no",
+        )
+        yes_filled_quantity = quantity * yes_ratio
+        no_filled_quantity = quantity * no_ratio
+
+    yes_actual_cost = _fill_cost(yes_asks, yes_filled_quantity)
+    no_actual_cost = _fill_cost(no_asks, no_filled_quantity)
+    gross_cost = yes_actual_cost + no_actual_cost
+    matched_quantity = min(yes_filled_quantity, no_filled_quantity)
+    merge_cost = params.merge_cost_usd if matched_quantity > EPSILON else 0.0
+    costs = _cost_breakdown(gross_cost, params, merge_cost_usd=merge_cost)
+    capital_used = gross_cost + sum(costs.values())
+    redeemed_value = matched_quantity
+    net_profit = redeemed_value - capital_used
+    net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > 0 else 0.0
+
+    simulation_metadata["partial_fill"] = {
+        "applied": partial_applied,
+        "target_quantity": quantity,
+        "yes_filled_quantity": yes_filled_quantity,
+        "no_filled_quantity": no_filled_quantity,
+        "matched_quantity": matched_quantity,
+        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
+        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+    }
+    execution_count = len(state.get("executions") or [])
+    execution_id = f"paper:{market.market_id}:{execution_count + 1}:{fingerprint[:12]}"
+    execution = {
+        "execution_id": execution_id,
+        "opportunity_id": f"binary:{market.market_id}:{fingerprint[:12]}",
+        "kind": "binary_complete_set",
+        "mode": "paper_portfolio_instance",
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "event_id": market.event_id,
+        "event_title": market.event_title,
+        "question": market.question,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "executed_at_utc": simulation_metadata["fill_timestamp_utc"],
+        "book_fingerprint": fingerprint,
+        "quantity": quantity,
+        "quantity_redeemed": matched_quantity,
+        "yes_filled_quantity": yes_filled_quantity,
+        "no_filled_quantity": no_filled_quantity,
+        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
+        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+        "yes_vwap": yes_actual_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
+        "no_vwap": no_actual_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
+        "yes_cost": yes_actual_cost,
+        "no_cost": no_actual_cost,
+        "gross_cost": gross_cost,
+        "estimated_fees": costs["fees_usd"],
+        "slippage_buffer": costs["slippage_usd"],
+        "tax_cost": costs["tax_usd"],
+        "merge_cost": costs["merge_usd"],
+        "capital_used": capital_used,
+        "redeemed_value": redeemed_value,
+        "net_profit": net_profit,
+        "net_return_bps": net_return_bps,
+        "trade_ceiling_usd": params.trade_ceiling_usd,
+        "ceiling_used_usd": capital_used,
+        "stop_reason": stop_reason,
+        "simulation": simulation_metadata,
+        "source_timestamps": _book_timestamps(yes_asks, no_asks),
+        "details": {
+            "yes_best_ask": yes_asks.best_price,
+            "no_best_ask": no_asks.best_price,
+            "yes_source": yes_asks.source,
+            "no_source": no_asks.source,
+            "min_order_size": min_quantity,
+            "tranches": list(tranches),
+            "signal_book_fingerprint": signal_execution.get("book_fingerprint"),
+        },
+    }
+    return PaperPortfolioDecision.execute(execution)
+
+
+def _evaluate_optimistic_binary_paper_execution(
     market: BinaryMarket,
     yes_asks: OrderBookSide,
     no_asks: OrderBookSide,
@@ -482,6 +818,257 @@ def evaluate_binary_paper_execution(
     return PaperPortfolioDecision.execute(execution)
 
 
+def _simulation_failure_triggered(
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    book_fingerprint: str,
+    *,
+    stage: str,
+    probability: float,
+) -> bool:
+    return probability > 0.0 and _stage_random(simulation, market, book_fingerprint, stage) <= probability
+
+
+def _apply_simulated_book_friction(
+    market: BinaryMarket,
+    yes_asks: OrderBookSide,
+    no_asks: OrderBookSide,
+    *,
+    simulation: config.PaperExecutionSimulationConfig,
+    signal_fingerprint: str,
+    metadata: dict[str, Any],
+) -> tuple[OrderBookSide, OrderBookSide]:
+    adjusted_yes = yes_asks
+    adjusted_no = no_asks
+    adverse_applied = False
+    if (
+        simulation.adverse_selection_probability > 0.0
+        and _stage_random(simulation, market, signal_fingerprint, "adverse_selection")
+        <= simulation.adverse_selection_probability
+    ):
+        adverse_applied = True
+        adjusted_yes = _adverse_adjust_book(
+            adjusted_yes,
+            removal_ratio=simulation.adverse_depth_removal_ratio,
+            price_move_bps=simulation.adverse_price_move_bps,
+        )
+        adjusted_no = _adverse_adjust_book(
+            adjusted_no,
+            removal_ratio=simulation.adverse_depth_removal_ratio,
+            price_move_bps=simulation.adverse_price_move_bps,
+        )
+    metadata["adverse_selection"] = {
+        "applied": adverse_applied,
+        "probability": simulation.adverse_selection_probability,
+        "depth_removal_ratio": simulation.adverse_depth_removal_ratio if adverse_applied else 0.0,
+        "price_move_bps": simulation.adverse_price_move_bps if adverse_applied else 0.0,
+    }
+
+    queue_applied = simulation.queue_depth_ratio > 0.0
+    queue_fill_draw = _stage_random(simulation, market, signal_fingerprint, "queue_fill")
+    metadata["queue"] = {
+        "applied": queue_applied,
+        "depth_ratio": simulation.queue_depth_ratio if queue_applied else 1.0,
+        "fill_probability": simulation.queue_fill_probability,
+        "fill_draw": queue_fill_draw,
+    }
+    if queue_applied:
+        adjusted_yes = _scale_book_depth(adjusted_yes, simulation.queue_depth_ratio)
+        adjusted_no = _scale_book_depth(adjusted_no, simulation.queue_depth_ratio)
+    return adjusted_yes, adjusted_no
+
+
+def evaluate_binary_paper_execution(
+    market: BinaryMarket,
+    yes_asks: OrderBookSide,
+    no_asks: OrderBookSide,
+    *,
+    state: Mapping[str, Any],
+    params: PaperPortfolioParams,
+    as_of: datetime | None = None,
+    fill_time_book_reader: FillTimeBookReader | None = None,
+) -> PaperPortfolioDecision:
+    signal_time = _ensure_aware(as_of or _utc_now())
+    signal_decision = _evaluate_optimistic_binary_paper_execution(
+        market,
+        yes_asks,
+        no_asks,
+        state=state,
+        params=params,
+        as_of=signal_time,
+    )
+    simulation = params.simulation
+    if signal_decision.action != "EXECUTE" or signal_decision.execution is None or simulation.is_zero_friction:
+        return signal_decision
+
+    signal_execution = signal_decision.execution
+    signal_fingerprint = str(signal_execution["book_fingerprint"])
+    fill_time, simulation_metadata = _simulation_latency_fields(
+        simulation,
+        market,
+        signal_fingerprint,
+        signal_time,
+    )
+    simulation_metadata["signal_book_fingerprint"] = signal_fingerprint
+    simulation_metadata["signal_source_timestamps"] = _book_timestamps(yes_asks, no_asks)
+
+    throttle_saturated = False
+    target_quantity = _as_float(signal_execution.get("quantity"))
+    if simulation.throttle_max_submissions_per_second > 0:
+        throttle_draw = _stage_random(simulation, market, signal_fingerprint, "throttle")
+        throttle_probability = min(1.0, 1.0 / max(1, simulation.throttle_max_submissions_per_second))
+        throttle_saturated = simulation.throttle_max_submissions_per_second <= 1 or throttle_draw <= throttle_probability
+        simulation_metadata["throttle"] = {
+            "saturated": throttle_saturated,
+            "draw": throttle_draw,
+            "saturation_probability": throttle_probability,
+            "max_submissions_per_second": simulation.throttle_max_submissions_per_second,
+            "quantity_ratio": simulation.throttle_quantity_ratio,
+        }
+        if throttle_saturated:
+            target_quantity *= max(0.0, min(1.0, simulation.throttle_quantity_ratio))
+            if target_quantity + EPSILON < market.effective_min_order_size:
+                return _simulation_failure_decision(
+                    "simulation_throttle_min_size",
+                    market=market,
+                    simulation=simulation_metadata,
+                    book_fingerprint=signal_fingerprint,
+                    degraded_quantity=target_quantity,
+                    min_quantity=market.effective_min_order_size,
+                )
+    else:
+        simulation_metadata["throttle"] = {
+            "saturated": False,
+            "max_submissions_per_second": simulation.throttle_max_submissions_per_second,
+            "quantity_ratio": simulation.throttle_quantity_ratio,
+        }
+
+    queued_signal_yes, queued_signal_no = _apply_simulated_book_friction(
+        market,
+        yes_asks,
+        no_asks,
+        simulation=simulation,
+        signal_fingerprint=signal_fingerprint,
+        metadata=simulation_metadata,
+    )
+    queued_signal_quantity, _, _, _, _ = _simulate_paired_tranches(
+        queued_signal_yes,
+        queued_signal_no,
+        cash=_as_float(state.get("cash"), params.starting_capital_usd),
+        params=params,
+        max_quantity=target_quantity,
+    )
+    if queued_signal_quantity + EPSILON < market.effective_min_order_size:
+        return _simulation_failure_decision(
+            "simulation_queue_min_size",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            available_equal_depth=queued_signal_quantity,
+            min_quantity=market.effective_min_order_size,
+        )
+    if (
+        simulation.queue_fill_probability > 0.0
+        and simulation_metadata["queue"]["fill_draw"] > simulation.queue_fill_probability
+    ):
+        return _simulation_failure_decision(
+            "simulation_queue_unfilled",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            fill_probability=simulation.queue_fill_probability,
+        )
+
+    for stage, probability in (
+        ("submit_failure", simulation.submit_failure_probability),
+        ("accept_failure", simulation.accept_failure_probability),
+    ):
+        if _simulation_failure_triggered(
+            simulation,
+            market,
+            signal_fingerprint,
+            stage=stage,
+            probability=probability,
+        ):
+            return _simulation_failure_decision(
+                f"simulation_{stage}",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+            )
+
+    if fill_time_book_reader is not None:
+        fill_yes, fill_no = fill_time_book_reader(market, fill_time)
+        simulation_metadata["book_source"] = "fill_time_cache"
+        if fill_yes is None or fill_no is None:
+            return _simulation_failure_decision(
+                "simulation_missing_fill_time_book",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+                yes_book_present=fill_yes is not None,
+                no_book_present=fill_no is not None,
+            )
+    else:
+        fill_yes, fill_no = yes_asks, no_asks
+        simulation_metadata["book_source"] = "signal_time_adjusted"
+
+    fill_yes, fill_no = _apply_simulated_book_friction(
+        market,
+        fill_yes,
+        fill_no,
+        simulation=simulation,
+        signal_fingerprint=signal_fingerprint,
+        metadata=simulation_metadata,
+    )
+
+    for label, book in (("yes", fill_yes), ("no", fill_no)):
+        age = _stale_seconds(book, fill_time)
+        if age is not None and (age < -EPSILON or age > params.max_book_age_seconds):
+            return _simulation_failure_decision(
+                "simulation_stale_fill_time_book",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+                side=label,
+                age_seconds=age,
+                max_age_seconds=params.max_book_age_seconds,
+            )
+
+    if _simulation_failure_triggered(
+        simulation,
+        market,
+        signal_fingerprint,
+        stage="fill_failure",
+        probability=simulation.fill_failure_probability,
+    ):
+        cancel_failed = _simulation_failure_triggered(
+            simulation,
+            market,
+            signal_fingerprint,
+            stage="cancel_failure",
+            probability=simulation.cancel_failure_probability,
+        )
+        return _simulation_failure_decision(
+            "simulation_cancel_failure" if cancel_failed else "simulation_fill_failure",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+        )
+
+    return _finalize_execution_from_books(
+        market,
+        fill_yes,
+        fill_no,
+        state=state,
+        params=params,
+        as_of=fill_time,
+        max_quantity=target_quantity,
+        simulation_metadata=simulation_metadata,
+        signal_execution=signal_execution,
+    )
+
+
 class PaperPortfolio:
     def __init__(
         self,
@@ -609,6 +1196,7 @@ class PaperPortfolio:
         *,
         as_of: datetime | None = None,
         params: PaperPortfolioParams | None = None,
+        fill_time_book_reader: FillTimeBookReader | None = None,
     ) -> PaperPortfolioDecision:
         if not self.state:
             self.load()
@@ -621,13 +1209,36 @@ class PaperPortfolio:
             state=base_state,
             params=execution_params,
             as_of=as_of,
+            fill_time_book_reader=fill_time_book_reader,
         )
         if decision.action != "EXECUTE" or decision.execution is None:
+            if decision.details.get("simulation_failure"):
+                simulation_details = decision.details.get("simulation")
+                simulation_payload = dict(simulation_details) if isinstance(simulation_details, Mapping) else {}
+                try:
+                    self.append_event(
+                        "paper_portfolio_execution_failed",
+                        {
+                            "market_id": market.market_id,
+                            "reason": decision.reason,
+                            "simulation": simulation_payload,
+                            "failure_stage": simulation_payload.get("failure_stage") or decision.reason,
+                            "failure_reason": simulation_payload.get("failure_reason") or decision.reason,
+                            "details": dict(decision.details),
+                        },
+                    )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "paper_portfolio_execution_failed_event_append_failed market_id=%s reason=%s error=%r",
+                        market.market_id,
+                        decision.reason,
+                        exc,
+                    )
             return decision
 
         working_state = deepcopy(base_state)
         execution = deepcopy(decision.execution)
-        self._apply_execution_to_state(working_state, execution)
+        self._apply_execution_to_state(working_state, execution, params=execution_params)
         try:
             self._save_state(working_state)
         except Exception:
@@ -655,9 +1266,15 @@ class PaperPortfolio:
         )
 
     def _apply_execution(self, execution: dict[str, Any]) -> None:
-        self._apply_execution_to_state(self.state, execution)
+        self._apply_execution_to_state(self.state, execution, params=self.params)
 
-    def _apply_execution_to_state(self, state: dict[str, Any], execution: dict[str, Any]) -> None:
+    def _apply_execution_to_state(
+        self,
+        state: dict[str, Any],
+        execution: dict[str, Any],
+        *,
+        params: PaperPortfolioParams,
+    ) -> None:
         preexisting_redeemed = self._redeem_completed_pairs_from_state(
             state,
             market_id=str(execution["market_id"]),
@@ -665,7 +1282,7 @@ class PaperPortfolio:
             no_token_id=str(execution["no_token_id"]),
         )
         if preexisting_redeemed > EPSILON:
-            state["cash"] = _as_float(state.get("cash"), self.params.starting_capital_usd) + preexisting_redeemed
+            state["cash"] = _as_float(state.get("cash"), params.starting_capital_usd) + preexisting_redeemed
             normalizations = state.setdefault("inventory_normalizations", [])
             if isinstance(normalizations, list):
                 normalizations.append(
@@ -679,18 +1296,19 @@ class PaperPortfolio:
                     }
                 )
 
-        cash_before = _as_float(state.get("cash"), self.params.starting_capital_usd)
+        cash_before = _as_float(state.get("cash"), params.starting_capital_usd)
         capital_used = _as_float(execution.get("capital_used"))
         state["cash"] = cash_before - capital_used
 
-        quantity = _as_float(execution.get("quantity"))
+        yes_quantity = _as_float(execution.get("yes_filled_quantity"), _as_float(execution.get("quantity")))
+        no_quantity = _as_float(execution.get("no_filled_quantity"), _as_float(execution.get("quantity")))
         self._add_inventory_to_state(
             state,
             token_id=str(execution["yes_token_id"]),
             market_id=str(execution["market_id"]),
             condition_id=execution.get("condition_id"),
             outcome="YES",
-            quantity=quantity,
+            quantity=yes_quantity,
         )
         self._add_inventory_to_state(
             state,
@@ -698,7 +1316,7 @@ class PaperPortfolio:
             market_id=str(execution["market_id"]),
             condition_id=execution.get("condition_id"),
             outcome="NO",
-            quantity=quantity,
+            quantity=no_quantity,
         )
         redeemed = self._redeem_completed_pairs_from_state(
             state,
