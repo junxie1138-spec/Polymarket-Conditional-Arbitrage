@@ -695,8 +695,8 @@ def format_status_dashboard(
         _kv("Evaluated", _format_count(_int_value(runtime_row.get("last_cycle_evaluated_markets")))),
         _kv("Executions", _format_count(_int_value(runtime_row.get("last_cycle_executions")))),
         _kv("Skips", _format_count(_int_value(runtime_row.get("last_cycle_skips")))),
-        _kv("Sim failures", simulation_failure_text),
-        _kv("Last sim fail", last_simulation_failure_reason),
+        _kv("Live sim fails", simulation_failure_text),
+        _kv("Last live sim", last_simulation_failure_reason),
         _kv("Unmatched", unmatched_text),
         _kv("Last error", runtime_row.get("last_error") or "none"),
     ]

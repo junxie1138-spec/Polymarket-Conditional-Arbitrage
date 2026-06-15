@@ -69,6 +69,14 @@ def _source_revision(book: dict[str, Any]) -> str | None:
     return None
 
 
+def _source_hash(book: dict[str, Any]) -> str | None:
+    for key in ("hash", "book_hash", "bookHash"):
+        value = book.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
 def normalize_book_side(
     book: dict[str, Any],
     *,
@@ -77,6 +85,7 @@ def normalize_book_side(
     source: str = "rest_book",
     updated_at: datetime | None = None,
     source_revision: str | None = None,
+    source_hash: str | None = None,
 ) -> OrderBookSide:
     levels: list[BookLevel] = []
     for raw_level in _raw_levels(book, side):
@@ -95,6 +104,7 @@ def normalize_book_side(
         source=source,
         updated_at=updated_at,
         source_revision=source_revision or _source_revision(book),
+        source_hash=source_hash or _source_hash(book),
     )
 
 
@@ -105,6 +115,7 @@ def asks_from_book(
     source: str = "rest_book",
     updated_at: datetime | None = None,
     source_revision: str | None = None,
+    source_hash: str | None = None,
 ) -> OrderBookSide:
     return normalize_book_side(
         book,
@@ -113,6 +124,7 @@ def asks_from_book(
         source=source,
         updated_at=updated_at,
         source_revision=source_revision,
+        source_hash=source_hash,
     )
 
 
@@ -123,6 +135,7 @@ def bids_from_book(
     source: str = "rest_book",
     updated_at: datetime | None = None,
     source_revision: str | None = None,
+    source_hash: str | None = None,
 ) -> OrderBookSide:
     return normalize_book_side(
         book,
@@ -131,6 +144,7 @@ def bids_from_book(
         source=source,
         updated_at=updated_at,
         source_revision=source_revision,
+        source_hash=source_hash,
     )
 
 

@@ -130,6 +130,87 @@ def test_price_change_updates_removes_zero_size_levels_and_preserves_ordering():
     assert asks.source == "ws_price_change"
 
 
+def test_public_evidence_snapshot_retains_price_changes_trades_ticks_and_hashes():
+    cache = MarketDataCache(recent_public_evidence_limit=2)
+    cache.apply_message(
+        {
+            "event_type": "book",
+            "asset_id": "token-a",
+            "hash": "book-hash-1",
+            "asks": [{"price": "0.50", "size": "5"}],
+        },
+        received_at=AS_OF,
+    )
+
+    cache.apply_message(
+        {
+            "event_type": "price_change",
+            "hash": "delta-hash-1",
+            "price_changes": [
+                {"asset_id": "token-a", "side": "SELL", "price": "0.50", "size": "4"},
+                {"asset_id": "token-a", "side": "SELL", "price": "0.49", "size": "2"},
+            ],
+        },
+        received_at=AS_OF,
+    )
+    cache.apply_message(
+        {
+            "event_type": "price_change",
+            "hash": "delta-hash-2",
+            "price_changes": [
+                {"asset_id": "token-a", "side": "SELL", "price": "0.49", "size": "1"},
+            ],
+        },
+        received_at=AS_OF,
+    )
+    cache.apply_message(
+        {
+            "event_type": "last_trade_price",
+            "asset_id": "token-a",
+            "price": "0.49",
+            "size": "1.5",
+            "side": "BUY",
+            "fee_rate_bps": "0",
+            "hash": "trade-hash",
+        },
+        received_at=AS_OF,
+    )
+    cache.apply_message(
+        {
+            "event_type": "tick_size_change",
+            "asset_id": "token-a",
+            "old_tick_size": "0.01",
+            "new_tick_size": "0.001",
+            "hash": "tick-hash",
+        },
+        received_at=AS_OF,
+    )
+    cache.apply_message(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "token-a",
+            "best_bid": "0.48",
+            "best_ask": "0.49",
+            "hash": "bba-hash",
+        },
+        received_at=AS_OF,
+    )
+
+    snapshot = cache.public_evidence_snapshot(["token-a"])
+    token = snapshot["token-a"]
+
+    assert token["snapshot_ready"] is True
+    assert token["books"]["ask"]["source_hash"] == "delta-hash-2"
+    assert len(token["recent_price_changes"]) == 2
+    assert token["recent_price_changes"][0]["source_hash"] == "delta-hash-1"
+    assert token["recent_price_changes"][1]["source_hash"] == "delta-hash-2"
+    assert token["recent_trade_prints"][0]["price"] == 0.49
+    assert token["recent_trade_prints"][0]["size"] == 1.5
+    assert token["recent_trade_prints"][0]["source_hash"] == "trade-hash"
+    assert token["recent_tick_size_changes"][0]["new_tick_size"] == 0.001
+    assert token["recent_best_bid_asks"][0]["best_ask"] == 0.49
+
+
 def test_price_change_without_ready_snapshot_is_ignored(caplog):
     cache = MarketDataCache()
     logger = logging.getLogger("test_market_data")

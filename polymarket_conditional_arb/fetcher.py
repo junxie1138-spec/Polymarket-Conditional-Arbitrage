@@ -11,6 +11,16 @@ from .order_book import asks_from_book
 MAX_FAILURE_SAMPLE_TOKENS = 5
 
 
+def _jsonable_request_meta(meta: Mapping[str, Any]) -> dict[str, Any]:
+    rendered: dict[str, Any] = {}
+    for key, value in meta.items():
+        if isinstance(value, datetime):
+            rendered[key] = value.isoformat().replace("+00:00", "Z")
+        else:
+            rendered[key] = value
+    return rendered
+
+
 def _chunked(values: list[str], size: int) -> Iterable[list[str]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
@@ -192,24 +202,31 @@ class GammaClobClient:
             return markets[:limit]
         return markets
 
-    def fetch_order_book(self, token_id: str) -> dict[str, Any]:
+    def fetch_order_book(self, token_id: str, *, request_meta: dict[str, Any] | None = None) -> dict[str, Any]:
         data = network.get_json_with_retries(
             self.session,
             f"{self.clob_host}/book",
             params={"token_id": token_id},
             timeout=20,
+            meta=request_meta,
         )
         if isinstance(data, dict):
             return data
         raise ValueError(f"unexpected order book response for token_id={token_id}")
 
-    def fetch_order_books_batch(self, token_ids: list[str]) -> dict[str, dict[str, Any]]:
+    def fetch_order_books_batch(
+        self,
+        token_ids: list[str],
+        *,
+        request_meta: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         payload = [{"token_id": token_id} for token_id in token_ids]
         data = network.post_json_with_retries(
             self.session,
             f"{self.clob_host}/books",
             json_body=payload,
             timeout=30,
+            meta=request_meta,
         )
         if not isinstance(data, list):
             raise ValueError(f"unexpected batch order book response: {type(data).__name__}")
@@ -360,3 +377,75 @@ class GammaClobClient:
                 failure_categories=failure_categories,
             )
         return ask_books
+
+    def fetch_ask_books_with_evidence(
+        self,
+        token_ids: Iterable[str],
+    ) -> dict[str, Any]:
+        unique_token_ids = list(dict.fromkeys(str(token_id) for token_id in token_ids if token_id))
+        ask_books: dict[str, Any] = {}
+        request_records: list[dict[str, Any]] = []
+        errors: dict[str, str] = {}
+        received_at = datetime.now(timezone.utc)
+
+        for chunk in _chunked(unique_token_ids, self.batch_book_limit):
+            batch_meta: dict[str, Any] = {
+                "endpoint_family": "clob_books",
+                "endpoint": "/books",
+                "token_count": len(chunk),
+                "documented_limit_bucket": f"batch_size<={self.batch_book_limit}",
+            }
+            fallback_tokens: list[str] = []
+            try:
+                raw_books = self.fetch_order_books_batch(chunk, request_meta=batch_meta)
+                for token_id in chunk:
+                    raw_book = raw_books.get(token_id)
+                    if raw_book is None:
+                        fallback_tokens.append(token_id)
+                        errors[token_id] = "batch:missing_book"
+                        continue
+                    try:
+                        ask_books[token_id] = asks_from_book(
+                            raw_book,
+                            token_id=token_id,
+                            source="rest_books_batch",
+                            updated_at=received_at,
+                        )
+                    except Exception as exc:
+                        fallback_tokens.append(token_id)
+                        errors[token_id] = _error_category("batch_parse", exc)
+            except Exception as exc:
+                fallback_tokens = list(chunk)
+                errors.update({token_id: _error_category("batch", exc) for token_id in chunk})
+            request_records.append(_jsonable_request_meta(batch_meta))
+
+            for token_id in fallback_tokens:
+                fallback_meta: dict[str, Any] = {
+                    "endpoint_family": "clob_book",
+                    "endpoint": "/book",
+                    "token_count": 1,
+                    "token_id": token_id,
+                    "documented_limit_bucket": "single_book",
+                }
+                try:
+                    raw_book = self.fetch_order_book(token_id, request_meta=fallback_meta)
+                    ask_books[token_id] = asks_from_book(
+                        raw_book,
+                        token_id=token_id,
+                        source="rest_book_fallback",
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                    errors.pop(token_id, None)
+                except Exception as exc:
+                    errors[token_id] = _error_category("fallback", exc)
+                    fallback_meta.setdefault("error", f"{type(exc).__name__}: {exc}")
+                request_records.append(_jsonable_request_meta(fallback_meta))
+
+        return {
+            "books": ask_books,
+            "request_records": request_records,
+            "errors": errors,
+            "total_tokens": len(unique_token_ids),
+            "received_books": len(ask_books),
+            "failed_tokens": len(errors),
+        }

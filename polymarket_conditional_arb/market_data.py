@@ -19,6 +19,7 @@ MarketWsSide = Literal["BUY", "SELL", "bid", "ask"]
 
 DEFAULT_MARKET_WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 DEFAULT_SKIPPED_SNAPSHOT_WARNING_INTERVAL_SECONDS = 60.0
+DEFAULT_RECENT_PUBLIC_EVIDENCE_LIMIT = 50
 
 
 def _utc_now() -> datetime:
@@ -52,6 +53,17 @@ def _side_name(value: Any) -> BookSideName | None:
     return None
 
 
+def _token_ids_from_payload(payload: Mapping[str, Any]) -> list[str]:
+    token_id = _token_id_from_payload(payload)
+    if token_id is not None:
+        return [token_id]
+    for key in ("asset_ids", "assetIds", "token_ids", "tokenIds"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [str(item) for item in value if item not in (None, "")]
+    return []
+
+
 def _sorted_levels(side: BookSideName, levels_by_price: Mapping[float, float]) -> tuple[BookLevel, ...]:
     levels = [
         BookLevel(price=price, size=size)
@@ -69,10 +81,16 @@ class MarketDataCache:
         self,
         *,
         skipped_snapshot_warning_interval_seconds: float = DEFAULT_SKIPPED_SNAPSHOT_WARNING_INTERVAL_SECONDS,
+        recent_public_evidence_limit: int = DEFAULT_RECENT_PUBLIC_EVIDENCE_LIMIT,
     ) -> None:
         self._books: dict[tuple[str, BookSideName], OrderBookSide] = {}
         self._ready_tokens: set[str] = set()
         self._snapshot_generations: dict[str, int] = {}
+        self._recent_price_changes: dict[str, list[dict[str, Any]]] = {}
+        self._recent_trade_prints: dict[str, list[dict[str, Any]]] = {}
+        self._recent_tick_size_changes: dict[str, list[dict[str, Any]]] = {}
+        self._recent_best_bid_asks: dict[str, list[dict[str, Any]]] = {}
+        self._recent_public_evidence_limit = max(1, int(recent_public_evidence_limit))
         self._skipped_snapshot_warning_interval_seconds = max(
             0.0,
             float(skipped_snapshot_warning_interval_seconds),
@@ -80,6 +98,18 @@ class MarketDataCache:
         self._last_skipped_snapshot_warning_at: float | None = None
         self._suppressed_skipped_snapshot_warnings = 0
         self._lock = threading.RLock()
+
+    def _append_recent_locked(
+        self,
+        target: dict[str, list[dict[str, Any]]],
+        token_id: str,
+        record: Mapping[str, Any],
+    ) -> None:
+        rows = target.setdefault(str(token_id), [])
+        rows.append(dict(record))
+        excess = len(rows) - self._recent_public_evidence_limit
+        if excess > 0:
+            del rows[:excess]
 
     def _mark_snapshot_ready_locked(self, token_id: str) -> None:
         normalized_token_id = str(token_id)
@@ -125,6 +155,10 @@ class MarketDataCache:
             for token_id in token_set:
                 self._ready_tokens.discard(token_id)
                 self._snapshot_generations.pop(token_id, None)
+                self._recent_price_changes.pop(token_id, None)
+                self._recent_trade_prints.pop(token_id, None)
+                self._recent_tick_size_changes.pop(token_id, None)
+                self._recent_best_bid_asks.pop(token_id, None)
 
     def mark_tokens_stale(self, token_ids: Iterable[str], *, stale_at: datetime) -> None:
         token_set = {str(token_id) for token_id in token_ids}
@@ -139,6 +173,7 @@ class MarketDataCache:
                         source=f"{book.source}_stale",
                         updated_at=timestamp,
                         source_revision=book.source_revision,
+                        source_hash=book.source_hash,
                     )
             for token_id in token_set:
                 self._mark_snapshot_not_ready_locked(token_id)
@@ -155,6 +190,69 @@ class MarketDataCache:
                 for (token_id, side), book in self._books.items()
                 if side == "ask" and (allowed is None or token_id in allowed)
             }
+
+    def public_evidence_snapshot(
+        self,
+        token_ids: Iterable[str] | None = None,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        allowed = {str(token_id) for token_id in token_ids} if token_ids is not None else None
+        since_aware = _ensure_aware(since) if since is not None else None
+        until_aware = _ensure_aware(until) if until is not None else None
+
+        def within_window(row: Mapping[str, Any]) -> bool:
+            observed_at = row.get("observed_at")
+            if isinstance(observed_at, datetime):
+                observed = _ensure_aware(observed_at)
+                if since_aware is not None and observed < since_aware:
+                    return False
+                if until_aware is not None and observed > until_aware:
+                    return False
+            return True
+
+        def filtered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [dict(row) for row in rows if within_window(row)]
+
+        with self._lock:
+            token_set = (
+                set(allowed)
+                if allowed is not None
+                else {
+                    *(token_id for token_id, _side in self._books),
+                    *self._recent_price_changes,
+                    *self._recent_trade_prints,
+                    *self._recent_tick_size_changes,
+                    *self._recent_best_bid_asks,
+                }
+            )
+            snapshot: dict[str, dict[str, Any]] = {}
+            for token_id in sorted(token_set):
+                books: dict[str, dict[str, Any]] = {}
+                for side in ("bid", "ask"):
+                    book = self._books.get((token_id, side))
+                    if book is None:
+                        continue
+                    books[side] = {
+                        "source": book.source,
+                        "updated_at": book.updated_at,
+                        "source_revision": book.source_revision,
+                        "source_hash": book.source_hash,
+                        "best_price": book.best_price,
+                        "available_size": book.available_size,
+                    }
+                snapshot[token_id] = {
+                    "token_id": token_id,
+                    "snapshot_ready": token_id in self._ready_tokens,
+                    "snapshot_generation": self._snapshot_generations.get(token_id, 0),
+                    "books": books,
+                    "recent_price_changes": filtered(self._recent_price_changes.get(token_id, [])),
+                    "recent_trade_prints": filtered(self._recent_trade_prints.get(token_id, [])),
+                    "recent_tick_size_changes": filtered(self._recent_tick_size_changes.get(token_id, [])),
+                    "recent_best_bid_asks": filtered(self._recent_best_bid_asks.get(token_id, [])),
+                }
+            return snapshot
 
     def apply_message(
         self,
@@ -187,11 +285,17 @@ class MarketDataCache:
                     updated.update(self.apply_payload(item, received_at=timestamp, logger=logger))
             return updated
 
-        event_type = str(payload.get("event_type") or payload.get("type") or "").strip()
+        event_type = str(payload.get("event_type") or payload.get("type") or "").strip().lower()
         if event_type == "book":
             return self._apply_book_snapshot(payload, received_at=timestamp, logger=logger)
         if event_type == "price_change":
             return self._apply_price_change(payload, received_at=timestamp, logger=logger)
+        if event_type == "last_trade_price":
+            return self._apply_last_trade_price(payload, received_at=timestamp, logger=logger)
+        if event_type == "tick_size_change":
+            return self._apply_tick_size_change(payload, received_at=timestamp, logger=logger)
+        if event_type == "best_bid_ask":
+            return self._apply_best_bid_ask(payload, received_at=timestamp, logger=logger)
         return set()
 
     @staticmethod
@@ -268,6 +372,25 @@ class MarketDataCache:
                     level.price: level.size
                     for level in current.levels
                 }
+                old_size = levels_by_price.get(price, 0.0)
+                revision = _source_revision(payload, change) or current.source_revision
+                source_hash = _source_hash(payload, change) or current.source_hash
+                self._append_recent_locked(
+                    self._recent_price_changes,
+                    token_id,
+                    {
+                        "event_type": "price_change",
+                        "token_id": token_id,
+                        "side": side,
+                        "price": price,
+                        "old_size": old_size,
+                        "new_size": max(0.0, size),
+                        "delta_size": max(0.0, size) - old_size,
+                        "source_revision": revision,
+                        "source_hash": source_hash,
+                        "observed_at": received_at,
+                    },
+                )
                 if size <= 0.0:
                     levels_by_price.pop(price, None)
                 else:
@@ -278,11 +401,131 @@ class MarketDataCache:
                     levels=_sorted_levels(side, levels_by_price),
                     source="ws_price_change",
                     updated_at=received_at,
-                    source_revision=_source_revision(payload, change) or current.source_revision,
+                    source_revision=revision,
+                    source_hash=source_hash,
                 )
                 updated.add(token_id)
         self._log_skipped_snapshot_warning(skipped_without_snapshot, logger)
         return updated
+
+    def _apply_last_trade_price(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        received_at: datetime,
+        logger: logging.Logger | None,
+    ) -> set[str]:
+        raw_trades = payload.get("trades") or payload.get("last_trades") or payload.get("lastTradePrices")
+        trades = raw_trades if isinstance(raw_trades, list) else [payload]
+        updated: set[str] = set()
+        with self._lock:
+            for trade in trades:
+                if not isinstance(trade, Mapping):
+                    continue
+                token_id = _token_id_from_payload(trade) or _token_id_from_payload(payload)
+                price = as_float(trade.get("price") or trade.get("last_trade_price") or trade.get("lastTradePrice"))
+                size = as_float(
+                    trade.get("size")
+                    or trade.get("quantity")
+                    or trade.get("amount")
+                    or trade.get("last_trade_size")
+                    or trade.get("lastTradeSize")
+                )
+                if token_id is None or price is None:
+                    continue
+                side = str(trade.get("side") or payload.get("side") or "").strip().upper() or None
+                fee_bps = as_float(
+                    trade.get("fee_rate_bps")
+                    or trade.get("feeRateBps")
+                    or trade.get("fee")
+                    or payload.get("fee_rate_bps")
+                    or payload.get("feeRateBps")
+                )
+                self._append_recent_locked(
+                    self._recent_trade_prints,
+                    token_id,
+                    {
+                        "event_type": "last_trade_price",
+                        "token_id": token_id,
+                        "side": side,
+                        "price": price,
+                        "size": size,
+                        "fee_bps": fee_bps,
+                        "source_revision": _source_revision(payload, trade),
+                        "source_hash": _source_hash(payload, trade),
+                        "observed_at": received_at,
+                    },
+                )
+                updated.add(token_id)
+        if not updated and logger is not None:
+            logger.warning("market_ws_last_trade_price_missing_token_or_price")
+        return updated
+
+    def _apply_tick_size_change(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        received_at: datetime,
+        logger: logging.Logger | None,
+    ) -> set[str]:
+        token_ids = _token_ids_from_payload(payload)
+        new_tick_size = as_float(
+            payload.get("tick_size")
+            or payload.get("tickSize")
+            or payload.get("new_tick_size")
+            or payload.get("newTickSize")
+        )
+        old_tick_size = as_float(payload.get("old_tick_size") or payload.get("oldTickSize"))
+        if not token_ids:
+            if logger is not None:
+                logger.warning("market_ws_tick_size_change_missing_token")
+            return set()
+        with self._lock:
+            for token_id in token_ids:
+                self._append_recent_locked(
+                    self._recent_tick_size_changes,
+                    token_id,
+                    {
+                        "event_type": "tick_size_change",
+                        "token_id": token_id,
+                        "old_tick_size": old_tick_size,
+                        "new_tick_size": new_tick_size,
+                        "source_revision": _source_revision(payload),
+                        "source_hash": _source_hash(payload),
+                        "observed_at": received_at,
+                    },
+                )
+        return set(token_ids)
+
+    def _apply_best_bid_ask(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        received_at: datetime,
+        logger: logging.Logger | None,
+    ) -> set[str]:
+        token_id = _token_id_from_payload(payload)
+        if token_id is None:
+            if logger is not None:
+                logger.warning("market_ws_best_bid_ask_missing_token")
+            return set()
+        best_bid = as_float(payload.get("bid") or payload.get("best_bid") or payload.get("bestBid"))
+        best_ask = as_float(payload.get("ask") or payload.get("best_ask") or payload.get("bestAsk"))
+        with self._lock:
+            self._append_recent_locked(
+                self._recent_best_bid_asks,
+                token_id,
+                {
+                    "event_type": "best_bid_ask",
+                    "token_id": token_id,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "source_revision": _source_revision(payload),
+                    "source_hash": _source_hash(payload),
+                    "observed_at": received_at,
+                },
+            )
+        return {token_id}
 
     def _log_skipped_snapshot_warning(
         self,
@@ -354,6 +597,15 @@ def _source_revision(*payloads: Mapping[str, Any]) -> str | None:
             value = payload.get(key)
             if value not in (None, ""):
                 return f"{key}:{value}"
+    return None
+
+
+def _source_hash(*payloads: Mapping[str, Any]) -> str | None:
+    for payload in payloads:
+        for key in ("hash", "book_hash", "bookHash"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return str(value)
     return None
 
 

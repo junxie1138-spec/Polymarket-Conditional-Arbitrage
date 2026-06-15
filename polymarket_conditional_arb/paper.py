@@ -17,7 +17,30 @@ EPSILON = 1e-9
 SCHEMA_VERSION = 1
 PORTFOLIO_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
-FillTimeBookReader = Callable[[BinaryMarket, datetime], tuple[OrderBookSide | None, OrderBookSide | None]]
+
+
+@dataclass(frozen=True)
+class FillTimeBookEvidence:
+    source: str
+    yes_book: OrderBookSide | None = None
+    no_book: OrderBookSide | None = None
+    observed_at: datetime | None = None
+    snapshot_ready: Mapping[str, bool] = field(default_factory=dict)
+    snapshot_generation: Mapping[str, int] = field(default_factory=dict)
+    public_price_changes: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
+    public_trade_prints: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
+    tick_size_changes: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
+    best_bid_asks: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
+    request_records: tuple[Mapping[str, Any], ...] = ()
+    errors: Mapping[str, str] = field(default_factory=dict)
+    public_error: str | None = None
+    fallback_reason: str | None = None
+
+
+FillTimeBookReader = Callable[
+    [BinaryMarket, datetime],
+    FillTimeBookEvidence | tuple[OrderBookSide | None, OrderBookSide | None],
+]
 
 
 class PaperPortfolioLoadError(RuntimeError):
@@ -381,6 +404,7 @@ def _copy_book_with_levels(
         source=f"{book.source}_{source_suffix}",
         updated_at=book.updated_at,
         source_revision=book.source_revision,
+        source_hash=book.source_hash,
     )
 
 
@@ -470,6 +494,157 @@ def _book_timestamps(yes_asks: OrderBookSide, no_asks: OrderBookSide) -> dict[st
     }
 
 
+def _book_audit(book: OrderBookSide | None) -> dict[str, Any] | None:
+    if book is None:
+        return None
+    return {
+        "token_id": book.token_id,
+        "side": book.side,
+        "source": book.source,
+        "updated_at_utc": utc_iso(book.updated_at) if book.updated_at else None,
+        "source_revision": book.source_revision,
+        "source_hash": book.source_hash,
+        "best_price": book.best_price,
+        "available_size": book.available_size,
+        "level_count": len(book.levels),
+    }
+
+
+def _book_fingerprint_input(book: OrderBookSide) -> list[dict[str, float]]:
+    return [{"price": level.price, "size": level.size} for level in book.levels]
+
+
+def _signal_fill_book_comparison(
+    signal_yes: OrderBookSide,
+    signal_no: OrderBookSide,
+    fill_yes: OrderBookSide | None,
+    fill_no: OrderBookSide | None,
+) -> dict[str, Any]:
+    return {
+        "yes": {
+            "signal": _book_audit(signal_yes),
+            "fill": _book_audit(fill_yes),
+            "levels_changed": _book_fingerprint_input(signal_yes)
+            != (_book_fingerprint_input(fill_yes) if fill_yes is not None else []),
+        },
+        "no": {
+            "signal": _book_audit(signal_no),
+            "fill": _book_audit(fill_no),
+            "levels_changed": _book_fingerprint_input(signal_no)
+            != (_book_fingerprint_input(fill_no) if fill_no is not None else []),
+        },
+    }
+
+
+def _evidence_rows_for_token(
+    rows_by_token: Mapping[str, tuple[Mapping[str, Any], ...]] | Mapping[str, Any],
+    token_id: str,
+) -> list[Mapping[str, Any]]:
+    rows = rows_by_token.get(token_id) if isinstance(rows_by_token, Mapping) else None
+    if not isinstance(rows, (list, tuple)):
+        return []
+    return [row for row in rows if isinstance(row, Mapping)]
+
+
+def _queue_ahead_at_prices(book: OrderBookSide, prices: set[float]) -> float:
+    return sum(level.size for level in book.levels if level.price in prices)
+
+
+def _intended_prices(tranches: Mapping[str, Any] | None, side: str) -> set[float]:
+    if not isinstance(tranches, Mapping):
+        return set()
+    prices: set[float] = set()
+    raw_tranches = tranches.get("tranches")
+    if isinstance(raw_tranches, list):
+        key = f"{side}_price"
+        for tranche in raw_tranches:
+            if isinstance(tranche, Mapping):
+                price = _as_float(tranche.get(key))
+                if price > EPSILON:
+                    prices.add(price)
+    return prices
+
+
+def _observed_queue_decrease(
+    evidence: FillTimeBookEvidence,
+    *,
+    token_id: str,
+    prices: set[float],
+    side_name: str,
+) -> tuple[float, list[dict[str, Any]], list[dict[str, Any]]]:
+    price_changes: list[dict[str, Any]] = []
+    trade_prints: list[dict[str, Any]] = []
+    size_decrease = 0.0
+    for row in _evidence_rows_for_token(evidence.public_price_changes, token_id):
+        side = str(row.get("side") or "").lower()
+        price = _as_float(row.get("price"))
+        delta_size = _as_float(row.get("delta_size"))
+        if side != "ask" or price not in prices:
+            continue
+        price_changes.append(dict(row))
+        if delta_size < 0.0:
+            size_decrease += abs(delta_size)
+    for row in _evidence_rows_for_token(evidence.public_trade_prints, token_id):
+        price = _as_float(row.get("price"))
+        size = _as_float(row.get("size"))
+        if price not in prices or size <= EPSILON:
+            continue
+        trade_prints.append(dict(row))
+        size_decrease += size
+    _ = side_name
+    return size_decrease, price_changes, trade_prints
+
+
+def _normalize_fill_time_evidence(
+    raw: FillTimeBookEvidence | tuple[OrderBookSide | None, OrderBookSide | None],
+) -> FillTimeBookEvidence:
+    if isinstance(raw, FillTimeBookEvidence):
+        return raw
+    yes_book, no_book = raw
+    return FillTimeBookEvidence(
+        source="legacy_fill_time_reader",
+        yes_book=yes_book,
+        no_book=no_book,
+    )
+
+
+def _fill_evidence_audit(
+    evidence: FillTimeBookEvidence,
+    *,
+    market: BinaryMarket,
+) -> dict[str, Any]:
+    return {
+        "source": evidence.source,
+        "observed_at_utc": utc_iso(evidence.observed_at) if evidence.observed_at else None,
+        "snapshot_ready": dict(evidence.snapshot_ready),
+        "snapshot_generation": dict(evidence.snapshot_generation),
+        "books": {
+            "yes": _book_audit(evidence.yes_book),
+            "no": _book_audit(evidence.no_book),
+        },
+        "public_price_changes": {
+            "yes": list(_evidence_rows_for_token(evidence.public_price_changes, market.yes_token_id)),
+            "no": list(_evidence_rows_for_token(evidence.public_price_changes, market.no_token_id)),
+        },
+        "public_trade_prints": {
+            "yes": list(_evidence_rows_for_token(evidence.public_trade_prints, market.yes_token_id)),
+            "no": list(_evidence_rows_for_token(evidence.public_trade_prints, market.no_token_id)),
+        },
+        "tick_size_changes": {
+            "yes": list(_evidence_rows_for_token(evidence.tick_size_changes, market.yes_token_id)),
+            "no": list(_evidence_rows_for_token(evidence.tick_size_changes, market.no_token_id)),
+        },
+        "best_bid_asks": {
+            "yes": list(_evidence_rows_for_token(evidence.best_bid_asks, market.yes_token_id)),
+            "no": list(_evidence_rows_for_token(evidence.best_bid_asks, market.no_token_id)),
+        },
+        "request_records": [dict(row) for row in evidence.request_records],
+        "errors": dict(evidence.errors),
+        "public_error": evidence.public_error,
+        "fallback_reason": evidence.fallback_reason,
+    }
+
+
 def _finalize_execution_from_books(
     market: BinaryMarket,
     yes_asks: OrderBookSide,
@@ -481,6 +656,7 @@ def _finalize_execution_from_books(
     max_quantity: float | None,
     simulation_metadata: dict[str, Any],
     signal_execution: Mapping[str, Any],
+    side_fill_quantities: Mapping[str, float] | None = None,
 ) -> PaperPortfolioDecision:
     cash = _as_float(state.get("cash"), params.starting_capital_usd)
     quantity, yes_cost, no_cost, tranches, stop_reason = _simulate_paired_tranches(
@@ -571,13 +747,20 @@ def _finalize_execution_from_books(
         )
 
     partial_applied = False
+    side_fill_source = "full_public_depth"
     yes_filled_quantity = quantity
     no_filled_quantity = quantity
-    if (
+    if isinstance(side_fill_quantities, Mapping):
+        yes_filled_quantity = min(quantity, max(0.0, _as_float(side_fill_quantities.get("yes"), quantity)))
+        no_filled_quantity = min(quantity, max(0.0, _as_float(side_fill_quantities.get("no"), quantity)))
+        partial_applied = yes_filled_quantity + EPSILON < quantity or no_filled_quantity + EPSILON < quantity
+        side_fill_source = "public_queue_evidence"
+    elif (
         params.simulation.partial_fill_probability > 0.0
         and _stage_random(params.simulation, market, fingerprint, "partial_fill") <= params.simulation.partial_fill_probability
     ):
         partial_applied = True
+        side_fill_source = "deterministic_partial_fallback"
         min_ratio = max(0.0, min(1.0, params.simulation.partial_fill_min_ratio))
         yes_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
             params.simulation,
@@ -609,6 +792,7 @@ def _finalize_execution_from_books(
 
     simulation_metadata["partial_fill"] = {
         "applied": partial_applied,
+        "source": side_fill_source,
         "target_quantity": quantity,
         "yes_filled_quantity": yes_filled_quantity,
         "no_filled_quantity": no_filled_quantity,
@@ -878,6 +1062,136 @@ def _apply_simulated_book_friction(
     return adjusted_yes, adjusted_no
 
 
+def _local_pressure_failure_probability(
+    simulation: config.PaperExecutionSimulationConfig,
+    evidence: FillTimeBookEvidence | None,
+) -> tuple[float, dict[str, Any]]:
+    request_records = list(evidence.request_records) if evidence is not None else []
+    retry_count = sum(max(0, int(_as_float(record.get("retries")))) for record in request_records)
+    error_records = [
+        record
+        for record in request_records
+        if record.get("error") or int(_as_float(record.get("status_code"))) in {429, 500, 502, 503, 504}
+    ]
+    timeout_records = [record for record in request_records if "Timeout" in str(record.get("error") or "")]
+    throttle_probability = 0.0
+    source = "no_public_pressure"
+    if error_records or retry_count > 0:
+        throttle_probability = min(1.0, 0.10 * retry_count + 0.25 * len(error_records) + 0.25 * len(timeout_records))
+        source = "public_request_errors"
+    elif simulation.throttle_max_submissions_per_second > 0:
+        throttle_probability = min(1.0, 1.0 / max(1, simulation.throttle_max_submissions_per_second))
+        source = "deterministic_local_pressure_fallback"
+    return throttle_probability, {
+        "source": source,
+        "request_count": len(request_records),
+        "retry_count": retry_count,
+        "error_count": len(error_records),
+        "timeout_count": len(timeout_records),
+        "probability": throttle_probability,
+        "request_records": [dict(record) for record in request_records],
+    }
+
+
+def _legacy_probability_failure(
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    signal_fingerprint: str,
+) -> str | None:
+    for stage, probability in (
+        ("submit_failure", simulation.submit_failure_probability),
+        ("accept_failure", simulation.accept_failure_probability),
+        ("fill_failure", simulation.fill_failure_probability),
+    ):
+        if _simulation_failure_triggered(
+            simulation,
+            market,
+            signal_fingerprint,
+            stage=stage,
+            probability=probability,
+        ):
+            if stage == "fill_failure" and _simulation_failure_triggered(
+                simulation,
+                market,
+                signal_fingerprint,
+                stage="cancel_failure",
+                probability=simulation.cancel_failure_probability,
+            ):
+                return "simulation_cancel_failure"
+            return f"simulation_{stage}"
+    return None
+
+
+def _public_queue_fill_metadata(
+    market: BinaryMarket,
+    signal_yes: OrderBookSide,
+    signal_no: OrderBookSide,
+    fill_yes: OrderBookSide,
+    fill_no: OrderBookSide,
+    signal_execution: Mapping[str, Any],
+    evidence: FillTimeBookEvidence,
+) -> tuple[dict[str, Any], dict[str, float] | None]:
+    prices = {
+        "yes": _intended_prices(signal_execution.get("details"), "yes"),
+        "no": _intended_prices(signal_execution.get("details"), "no"),
+    }
+    if not prices["yes"] and signal_yes.best_price is not None:
+        prices["yes"].add(signal_yes.best_price)
+    if not prices["no"] and signal_no.best_price is not None:
+        prices["no"].add(signal_no.best_price)
+
+    queue_ahead_yes = _queue_ahead_at_prices(signal_yes, prices["yes"])
+    queue_ahead_no = _queue_ahead_at_prices(signal_no, prices["no"])
+    yes_decrease, yes_deltas, yes_trades = _observed_queue_decrease(
+        evidence,
+        token_id=market.yes_token_id,
+        prices=prices["yes"],
+        side_name="yes",
+    )
+    no_decrease, no_deltas, no_trades = _observed_queue_decrease(
+        evidence,
+        token_id=market.no_token_id,
+        prices=prices["no"],
+        side_name="no",
+    )
+    has_public_evidence = bool(yes_deltas or no_deltas or yes_trades or no_trades)
+    target_quantity = _as_float(signal_execution.get("quantity"))
+    side_fill_quantities: dict[str, float] | None = None
+    if has_public_evidence:
+        side_fill_quantities = {
+            "yes": min(target_quantity, max(0.0, yes_decrease)),
+            "no": min(target_quantity, max(0.0, no_decrease)),
+        }
+    metadata = {
+        "source": "public_trade_delta_evidence" if has_public_evidence else "deterministic_depth_fallback",
+        "intended_prices": {
+            "yes": sorted(prices["yes"]),
+            "no": sorted(prices["no"]),
+        },
+        "queue_ahead_at_signal": {
+            "yes": queue_ahead_yes,
+            "no": queue_ahead_no,
+        },
+        "observed_public_size_decrease": {
+            "yes": yes_decrease,
+            "no": no_decrease,
+        },
+        "price_delta_evidence": {
+            "yes": yes_deltas,
+            "no": no_deltas,
+        },
+        "trade_print_evidence": {
+            "yes": yes_trades,
+            "no": no_trades,
+        },
+        "fill_books_available_depth": {
+            "yes": fill_yes.available_size,
+            "no": fill_no.available_size,
+        },
+    }
+    return metadata, side_fill_quantities
+
+
 def evaluate_binary_paper_execution(
     market: BinaryMarket,
     yes_asks: OrderBookSide,
@@ -911,116 +1225,73 @@ def evaluate_binary_paper_execution(
     )
     simulation_metadata["signal_book_fingerprint"] = signal_fingerprint
     simulation_metadata["signal_source_timestamps"] = _book_timestamps(yes_asks, no_asks)
+    simulation_metadata["live_public_data"] = {
+        "signal_books": {
+            "yes": _book_audit(yes_asks),
+            "no": _book_audit(no_asks),
+        }
+    }
+    simulation_metadata["inferred"] = {}
+    simulation_metadata["fallback"] = {}
 
-    throttle_saturated = False
     target_quantity = _as_float(signal_execution.get("quantity"))
-    if simulation.throttle_max_submissions_per_second > 0:
-        throttle_draw = _stage_random(simulation, market, signal_fingerprint, "throttle")
-        throttle_probability = min(1.0, 1.0 / max(1, simulation.throttle_max_submissions_per_second))
-        throttle_saturated = simulation.throttle_max_submissions_per_second <= 1 or throttle_draw <= throttle_probability
-        simulation_metadata["throttle"] = {
-            "saturated": throttle_saturated,
-            "draw": throttle_draw,
-            "saturation_probability": throttle_probability,
-            "max_submissions_per_second": simulation.throttle_max_submissions_per_second,
-            "quantity_ratio": simulation.throttle_quantity_ratio,
-        }
-        if throttle_saturated:
-            target_quantity *= max(0.0, min(1.0, simulation.throttle_quantity_ratio))
-            if target_quantity + EPSILON < market.effective_min_order_size:
-                return _simulation_failure_decision(
-                    "simulation_throttle_min_size",
-                    market=market,
-                    simulation=simulation_metadata,
-                    book_fingerprint=signal_fingerprint,
-                    degraded_quantity=target_quantity,
-                    min_quantity=market.effective_min_order_size,
-                )
-    else:
-        simulation_metadata["throttle"] = {
-            "saturated": False,
-            "max_submissions_per_second": simulation.throttle_max_submissions_per_second,
-            "quantity_ratio": simulation.throttle_quantity_ratio,
-        }
-
-    queued_signal_yes, queued_signal_no = _apply_simulated_book_friction(
-        market,
-        yes_asks,
-        no_asks,
-        simulation=simulation,
-        signal_fingerprint=signal_fingerprint,
-        metadata=simulation_metadata,
-    )
-    queued_signal_quantity, _, _, _, _ = _simulate_paired_tranches(
-        queued_signal_yes,
-        queued_signal_no,
-        cash=_as_float(state.get("cash"), params.starting_capital_usd),
-        params=params,
-        max_quantity=target_quantity,
-    )
-    if queued_signal_quantity + EPSILON < market.effective_min_order_size:
-        return _simulation_failure_decision(
-            "simulation_queue_min_size",
-            market=market,
-            simulation=simulation_metadata,
-            book_fingerprint=signal_fingerprint,
-            available_equal_depth=queued_signal_quantity,
-            min_quantity=market.effective_min_order_size,
-        )
-    if (
-        simulation.queue_fill_probability > 0.0
-        and simulation_metadata["queue"]["fill_draw"] > simulation.queue_fill_probability
-    ):
-        return _simulation_failure_decision(
-            "simulation_queue_unfilled",
-            market=market,
-            simulation=simulation_metadata,
-            book_fingerprint=signal_fingerprint,
-            fill_probability=simulation.queue_fill_probability,
-        )
-
-    for stage, probability in (
-        ("submit_failure", simulation.submit_failure_probability),
-        ("accept_failure", simulation.accept_failure_probability),
-    ):
-        if _simulation_failure_triggered(
-            simulation,
-            market,
-            signal_fingerprint,
-            stage=stage,
-            probability=probability,
-        ):
-            return _simulation_failure_decision(
-                f"simulation_{stage}",
-                market=market,
-                simulation=simulation_metadata,
-                book_fingerprint=signal_fingerprint,
-            )
 
     if fill_time_book_reader is not None:
-        fill_yes, fill_no = fill_time_book_reader(market, fill_time)
-        simulation_metadata["book_source"] = "fill_time_cache"
-        if fill_yes is None or fill_no is None:
-            return _simulation_failure_decision(
-                "simulation_missing_fill_time_book",
-                market=market,
-                simulation=simulation_metadata,
-                book_fingerprint=signal_fingerprint,
-                yes_book_present=fill_yes is not None,
-                no_book_present=fill_no is not None,
+        try:
+            evidence = _normalize_fill_time_evidence(fill_time_book_reader(market, fill_time))
+        except Exception as exc:
+            evidence = FillTimeBookEvidence(
+                source="error",
+                public_error=f"{type(exc).__name__}: {exc}",
             )
     else:
-        fill_yes, fill_no = yes_asks, no_asks
-        simulation_metadata["book_source"] = "signal_time_adjusted"
-
-    fill_yes, fill_no = _apply_simulated_book_friction(
-        market,
-        fill_yes,
-        fill_no,
-        simulation=simulation,
-        signal_fingerprint=signal_fingerprint,
-        metadata=simulation_metadata,
+        evidence = FillTimeBookEvidence(
+            source="signal_fallback",
+            yes_book=yes_asks,
+            no_book=no_asks,
+            observed_at=signal_time,
+            fallback_reason="no_fill_time_public_reader",
+        )
+    fill_yes = evidence.yes_book
+    fill_no = evidence.no_book
+    simulation_metadata["book_source"] = evidence.source
+    simulation_metadata["live_public_data"].update(
+        {
+            "fill_time": _fill_evidence_audit(evidence, market=market),
+            "book_comparison": _signal_fill_book_comparison(yes_asks, no_asks, fill_yes, fill_no),
+        }
     )
+
+    if evidence.public_error or evidence.errors:
+        return _simulation_failure_decision(
+            "simulation_public_data_error",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            public_error=evidence.public_error,
+            errors=dict(evidence.errors),
+        )
+
+    ready_flags = dict(evidence.snapshot_ready)
+    unready_tokens = [token_id for token_id, ready in ready_flags.items() if not ready]
+    if unready_tokens:
+        return _simulation_failure_decision(
+            "simulation_unready_fill_time_book",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            unready_tokens=unready_tokens,
+        )
+
+    if fill_yes is None or fill_no is None:
+        return _simulation_failure_decision(
+            "simulation_missing_fill_time_book",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            yes_book_present=fill_yes is not None,
+            no_book_present=fill_no is not None,
+        )
 
     for label, book in (("yes", fill_yes), ("no", fill_no)):
         age = _stale_seconds(book, fill_time)
@@ -1035,22 +1306,124 @@ def evaluate_binary_paper_execution(
                 max_age_seconds=params.max_book_age_seconds,
             )
 
-    if _simulation_failure_triggered(
-        simulation,
+    throttle_probability, pressure_metadata = _local_pressure_failure_probability(simulation, evidence)
+    throttle_draw = _stage_random(simulation, market, signal_fingerprint, "local_public_pressure")
+    throttle_saturated = throttle_probability > 0.0 and throttle_draw <= throttle_probability
+    simulation_metadata["throttle"] = {
+        "saturated": throttle_saturated,
+        "draw": throttle_draw,
+        "quantity_ratio": simulation.throttle_quantity_ratio,
+        "max_submissions_per_second": simulation.throttle_max_submissions_per_second,
+        **pressure_metadata,
+    }
+    simulation_metadata["inferred"]["rate_limit_or_local_pressure"] = pressure_metadata
+    if pressure_metadata["source"].endswith("_fallback"):
+        simulation_metadata["fallback"]["rate_limit_or_local_pressure"] = pressure_metadata
+    if throttle_saturated:
+        target_quantity *= max(0.0, min(1.0, simulation.throttle_quantity_ratio))
+        if target_quantity + EPSILON < market.effective_min_order_size:
+            return _simulation_failure_decision(
+                "simulation_local_pressure_min_size",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+                degraded_quantity=target_quantity,
+                min_quantity=market.effective_min_order_size,
+            )
+
+    queue_metadata, side_fill_quantities = _public_queue_fill_metadata(
         market,
-        signal_fingerprint,
-        stage="fill_failure",
-        probability=simulation.fill_failure_probability,
-    ):
-        cancel_failed = _simulation_failure_triggered(
-            simulation,
-            market,
-            signal_fingerprint,
-            stage="cancel_failure",
-            probability=simulation.cancel_failure_probability,
+        yes_asks,
+        no_asks,
+        fill_yes,
+        fill_no,
+        signal_execution,
+        evidence,
+    )
+    simulation_metadata["queue"] = {
+        "applied": True,
+        "depth_ratio": simulation.queue_depth_ratio if queue_metadata["source"].endswith("_fallback") else None,
+        "fill_probability": simulation.queue_fill_probability,
+        "fill_draw": _stage_random(simulation, market, signal_fingerprint, "queue_fill"),
+        **queue_metadata,
+    }
+    simulation_metadata["inferred"]["queue"] = queue_metadata
+
+    working_fill_yes = fill_yes
+    working_fill_no = fill_no
+    if queue_metadata["source"].endswith("_fallback") and simulation.queue_depth_ratio > 0.0:
+        simulation_metadata["fallback"]["queue"] = queue_metadata
+        working_fill_yes = _scale_book_depth(working_fill_yes, simulation.queue_depth_ratio)
+        working_fill_no = _scale_book_depth(working_fill_no, simulation.queue_depth_ratio)
+        queued_signal_quantity, _, _, _, _ = _simulate_paired_tranches(
+            working_fill_yes,
+            working_fill_no,
+            cash=_as_float(state.get("cash"), params.starting_capital_usd),
+            params=params,
+            max_quantity=target_quantity,
         )
+        if queued_signal_quantity + EPSILON < market.effective_min_order_size:
+            return _simulation_failure_decision(
+                "simulation_queue_min_size",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+                available_equal_depth=queued_signal_quantity,
+                min_quantity=market.effective_min_order_size,
+            )
+        if (
+            simulation.queue_fill_probability > 0.0
+            and simulation_metadata["queue"]["fill_draw"] > simulation.queue_fill_probability
+        ):
+            return _simulation_failure_decision(
+                "simulation_queue_unfilled",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+                fill_probability=simulation.queue_fill_probability,
+            )
+
+    if simulation.adverse_selection_probability > 0.0:
+        adverse_draw = _stage_random(simulation, market, signal_fingerprint, "adverse_selection")
+        adverse_applied = adverse_draw <= simulation.adverse_selection_probability
+        simulation_metadata["adverse_selection"] = {
+            "source": "deterministic_adverse_selection_fallback",
+            "applied": adverse_applied,
+            "draw": adverse_draw,
+            "probability": simulation.adverse_selection_probability,
+            "depth_removal_ratio": simulation.adverse_depth_removal_ratio if adverse_applied else 0.0,
+            "price_move_bps": simulation.adverse_price_move_bps if adverse_applied else 0.0,
+        }
+        simulation_metadata["fallback"]["adverse_selection"] = simulation_metadata["adverse_selection"]
+        if adverse_applied:
+            working_fill_yes = _adverse_adjust_book(
+                working_fill_yes,
+                removal_ratio=simulation.adverse_depth_removal_ratio,
+                price_move_bps=simulation.adverse_price_move_bps,
+            )
+            working_fill_no = _adverse_adjust_book(
+                working_fill_no,
+                removal_ratio=simulation.adverse_depth_removal_ratio,
+                price_move_bps=simulation.adverse_price_move_bps,
+            )
+    else:
+        simulation_metadata["adverse_selection"] = {
+            "source": "disabled",
+            "applied": False,
+            "probability": 0.0,
+            "depth_removal_ratio": 0.0,
+            "price_move_bps": 0.0,
+        }
+
+    legacy_failure = _legacy_probability_failure(simulation, market, signal_fingerprint)
+    if legacy_failure is not None:
+        simulation_metadata["fallback"]["legacy_failure_probability"] = {
+            "reason": legacy_failure,
+            "source": "deterministic_legacy_probability_fallback",
+            "note": "No private live order lifecycle is observed in paper mode.",
+        }
         return _simulation_failure_decision(
-            "simulation_cancel_failure" if cancel_failed else "simulation_fill_failure",
+            legacy_failure,
             market=market,
             simulation=simulation_metadata,
             book_fingerprint=signal_fingerprint,
@@ -1058,14 +1431,15 @@ def evaluate_binary_paper_execution(
 
     return _finalize_execution_from_books(
         market,
-        fill_yes,
-        fill_no,
+        working_fill_yes,
+        working_fill_no,
         state=state,
         params=params,
         as_of=fill_time,
         max_quantity=target_quantity,
         simulation_metadata=simulation_metadata,
         signal_execution=signal_execution,
+        side_fill_quantities=side_fill_quantities,
     )
 
 

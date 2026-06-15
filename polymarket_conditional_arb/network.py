@@ -8,6 +8,7 @@ import ssl
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -95,6 +96,36 @@ def sleep_for_attempt(attempt: int, *, base_seconds: float = 1.0, cap_seconds: f
     time.sleep(min(cap_seconds, base_seconds * (2 ** max(0, attempt - 1))))
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _record_request_meta(
+    meta: dict[str, Any] | None,
+    *,
+    started_at: datetime,
+    attempts: int,
+    backoff_seconds: float,
+    status_code: int | None,
+    error: Exception | None,
+) -> None:
+    if meta is None:
+        return
+    completed_at = _utc_now()
+    meta.update(
+        {
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "latency_seconds": max(0.0, (completed_at - started_at).total_seconds()),
+            "attempts": attempts,
+            "retries": max(0, attempts - 1),
+            "backoff_seconds": max(0.0, backoff_seconds),
+            "status_code": status_code,
+            "error": f"{type(error).__name__}: {error}" if error is not None else None,
+        }
+    )
+
+
 def get_json_with_retries(
     session: requests.Session,
     url: str,
@@ -103,21 +134,43 @@ def get_json_with_retries(
     timeout: float = 30,
     attempts: int = 3,
     backoff_seconds: float = 1.0,
+    meta: dict[str, Any] | None = None,
 ) -> Any:
     """GET JSON with bounded retry for transient network/server failures."""
     last_exc: Exception | None = None
+    started_at = _utc_now()
+    total_backoff = 0.0
     for attempt in range(1, attempts + 1):
         try:
             response = session.get(url, params=params, timeout=timeout)
             if is_retryable_status(response.status_code) and attempt < attempts:
+                total_backoff += min(30.0, backoff_seconds * (2 ** max(0, attempt - 1)))
                 sleep_for_attempt(attempt, base_seconds=backoff_seconds)
                 continue
             response.raise_for_status()
+            _record_request_meta(
+                meta,
+                started_at=started_at,
+                attempts=attempt,
+                backoff_seconds=total_backoff,
+                status_code=response.status_code,
+                error=None,
+            )
             return response.json()
         except Exception as exc:
             last_exc = exc
+            status = response_status(exc)
             if attempt == attempts or not is_retryable_exception(exc):
+                _record_request_meta(
+                    meta,
+                    started_at=started_at,
+                    attempts=attempt,
+                    backoff_seconds=total_backoff,
+                    status_code=status,
+                    error=exc,
+                )
                 raise
+            total_backoff += min(30.0, backoff_seconds * (2 ** max(0, attempt - 1)))
             sleep_for_attempt(attempt, base_seconds=backoff_seconds)
     raise RuntimeError(f"GET failed after retries: {url}") from last_exc
 
@@ -130,20 +183,42 @@ def post_json_with_retries(
     timeout: float = 30,
     attempts: int = 3,
     backoff_seconds: float = 1.0,
+    meta: dict[str, Any] | None = None,
 ) -> Any:
     """POST JSON and parse JSON response with bounded transient retries."""
     last_exc: Exception | None = None
+    started_at = _utc_now()
+    total_backoff = 0.0
     for attempt in range(1, attempts + 1):
         try:
             response = session.post(url, json=json_body, timeout=timeout)
             if is_retryable_status(response.status_code) and attempt < attempts:
+                total_backoff += min(30.0, backoff_seconds * (2 ** max(0, attempt - 1)))
                 sleep_for_attempt(attempt, base_seconds=backoff_seconds)
                 continue
             response.raise_for_status()
+            _record_request_meta(
+                meta,
+                started_at=started_at,
+                attempts=attempt,
+                backoff_seconds=total_backoff,
+                status_code=response.status_code,
+                error=None,
+            )
             return response.json()
         except Exception as exc:
             last_exc = exc
+            status = response_status(exc)
             if attempt == attempts or not is_retryable_exception(exc):
+                _record_request_meta(
+                    meta,
+                    started_at=started_at,
+                    attempts=attempt,
+                    backoff_seconds=total_backoff,
+                    status_code=status,
+                    error=exc,
+                )
                 raise
+            total_backoff += min(30.0, backoff_seconds * (2 ** max(0, attempt - 1)))
             sleep_for_attempt(attempt, base_seconds=backoff_seconds)
     raise RuntimeError(f"POST failed after retries: {url}") from last_exc

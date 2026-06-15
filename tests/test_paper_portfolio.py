@@ -9,6 +9,7 @@ from polymarket_conditional_arb import config
 from polymarket_conditional_arb.arb_models import BinaryMarket
 from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import (
+    FillTimeBookEvidence,
     PaperPortfolio,
     PaperPortfolioParams,
     evaluate_binary_paper_execution,
@@ -371,7 +372,12 @@ def test_moved_fill_time_books_skip_when_price_move_exceeds_limit():
     )
 
     def fill_reader(_market, _fill_time):
-        return asks("yes-token", [(0.50, 10)]), asks("no-token", [(0.49, 10)])
+        return FillTimeBookEvidence(
+            source="ws_cache",
+            yes_book=asks("yes-token", [(0.50, 10)]),
+            no_book=asks("no-token", [(0.49, 10)]),
+            snapshot_ready={"yes-token": True, "no-token": True},
+        )
 
     decision = evaluate_binary_paper_execution(
         market(),
@@ -387,6 +393,7 @@ def test_moved_fill_time_books_skip_when_price_move_exceeds_limit():
     assert decision.reason == "simulation_fill_price_moved"
     assert decision.details["simulation_failure"] is True
     assert decision.details["fill_unit_cost"] > decision.details["signal_unit_cost"]
+    assert decision.details["simulation"]["live_public_data"]["fill_time"]["source"] == "ws_cache"
 
 
 def test_queue_depth_ratio_reduces_available_fill_size():
@@ -404,6 +411,76 @@ def test_queue_depth_ratio_reduces_available_fill_size():
     assert decision.action == "EXECUTE"
     assert decision.execution["quantity"] == pytest.approx(10.0)
     assert decision.execution["simulation"]["queue"]["depth_ratio"] == 0.5
+    assert decision.execution["simulation"]["fallback"]["queue"]["source"] == "deterministic_depth_fallback"
+
+
+def test_public_queue_evidence_drives_partial_one_sided_fill(tmp_path):
+    p = params(
+        trade_ceiling_usd=100.0,
+        simulation=simulation(
+            latency_ms=1.0,
+            submit_failure_probability=0.0,
+            accept_failure_probability=0.0,
+            fill_failure_probability=0.0,
+            cancel_failure_probability=0.0,
+        ),
+    )
+    portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
+
+    def fill_reader(_market, _fill_time):
+        return FillTimeBookEvidence(
+            source="ws_cache",
+            yes_book=asks("yes-token", [(0.48, 100)]),
+            no_book=asks("no-token", [(0.49, 100)]),
+            snapshot_ready={"yes-token": True, "no-token": True},
+            public_price_changes={
+                "yes-token": (
+                    {
+                        "side": "ask",
+                        "price": 0.48,
+                        "old_size": 100.0,
+                        "new_size": 90.0,
+                        "delta_size": -10.0,
+                    },
+                ),
+                "no-token": (
+                    {
+                        "side": "ask",
+                        "price": 0.49,
+                        "old_size": 100.0,
+                        "new_size": 96.0,
+                        "delta_size": -4.0,
+                    },
+                ),
+            },
+            public_trade_prints={
+                "no-token": (
+                    {
+                        "price": 0.49,
+                        "size": 2.0,
+                        "side": "BUY",
+                    },
+                )
+            },
+        )
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 100)]),
+        asks("no-token", [(0.49, 100)]),
+        as_of=AS_OF,
+        fill_time_book_reader=fill_reader,
+    )
+
+    assert decision.action == "EXECUTE"
+    execution = decision.execution
+    assert execution["yes_filled_quantity"] == pytest.approx(10.0)
+    assert execution["no_filled_quantity"] == pytest.approx(6.0)
+    assert execution["quantity_redeemed"] == pytest.approx(6.0)
+    assert execution["unmatched_yes_quantity"] == pytest.approx(4.0)
+    assert execution["simulation"]["queue"]["source"] == "public_trade_delta_evidence"
+    assert execution["simulation"]["partial_fill"]["source"] == "public_queue_evidence"
+    assert portfolio.status()["unmatched_inventory"]
 
 
 def test_partial_fill_redeems_matched_quantity_and_leaves_unmatched_inventory(tmp_path):
@@ -450,7 +527,7 @@ def test_queue_degraded_pair_below_minimum_does_not_create_execution():
     assert decision.details["available_equal_depth"] == pytest.approx(4.0)
 
 
-def test_seeded_simulated_submit_failure_is_reproducible():
+def test_seeded_simulated_submit_failure_is_reproducible_and_marked_fallback():
     p = params(simulation=simulation(seed=123, submit_failure_probability=1.0))
 
     first = evaluate_binary_paper_execution(
@@ -474,6 +551,10 @@ def test_seeded_simulated_submit_failure_is_reproducible():
     assert second.action == "SKIP"
     assert first.reason == second.reason == "simulation_submit_failure"
     assert first.details["simulation"] == second.details["simulation"]
+    assert (
+        first.details["simulation"]["fallback"]["legacy_failure_probability"]["source"]
+        == "deterministic_legacy_probability_fallback"
+    )
 
 
 def test_throttle_saturation_reduces_quantity_and_skips_below_minimum():
@@ -494,7 +575,7 @@ def test_throttle_saturation_reduces_quantity_and_skips_below_minimum():
     )
 
     assert decision.action == "SKIP"
-    assert decision.reason == "simulation_throttle_min_size"
+    assert decision.reason == "simulation_local_pressure_min_size"
     assert decision.details["degraded_quantity"] == pytest.approx(4.0)
 
 
@@ -520,6 +601,47 @@ def test_simulated_execution_failure_writes_audit_event_without_mutating_state(t
     assert events[0]["reason"] == "simulation_submit_failure"
     assert events[0]["failure_stage"] == "simulation_submit_failure"
     assert events[0]["simulation"]["failure_reason"] == "simulation_submit_failure"
+    assert events[0]["simulation"]["live_public_data"]
+    assert events[0]["simulation"]["inferred"]
+    assert events[0]["simulation"]["fallback"]
+
+
+def test_public_data_error_writes_failure_event_without_mutating_state(tmp_path):
+    p = params(
+        simulation=simulation(
+            latency_ms=1.0,
+            submit_failure_probability=0.0,
+            accept_failure_probability=0.0,
+            fill_failure_probability=0.0,
+            cancel_failure_probability=0.0,
+        )
+    )
+    path = tmp_path / "portfolio.json"
+    events_path = tmp_path / "events.jsonl"
+    portfolio = PaperPortfolio(path, events_path=events_path, params=p).load()
+
+    def fill_reader(_market, _fill_time):
+        return FillTimeBookEvidence(
+            source="error",
+            public_error="Timeout: public CLOB request timed out",
+        )
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        as_of=AS_OF,
+        fill_time_book_reader=fill_reader,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_public_data_error"
+    assert not path.exists()
+    assert portfolio.state["executions"] == []
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert events[0]["event_type"] == "paper_portfolio_execution_failed"
+    assert events[0]["reason"] == "simulation_public_data_error"
+    assert events[0]["simulation"]["live_public_data"]["fill_time"]["public_error"].startswith("Timeout:")
 
 
 def test_capped_deep_book_fingerprint_prevents_duplicate_execution(tmp_path):

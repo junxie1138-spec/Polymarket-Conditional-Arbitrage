@@ -22,7 +22,13 @@ from .market_universe_cache import (
     load_market_universe_cache,
     write_market_universe_cache,
 )
-from .paper import PaperPortfolio, PaperPortfolioDecision, PaperPortfolioLoadError, PaperPortfolioParams
+from .paper import (
+    FillTimeBookEvidence,
+    PaperPortfolio,
+    PaperPortfolioDecision,
+    PaperPortfolioLoadError,
+    PaperPortfolioParams,
+)
 from .portfolio_lock import PortfolioDataLock, PortfolioLockError
 from .runtime_status import (
     RuntimeStatusWriter,
@@ -1761,9 +1767,41 @@ class ConditionalArbScanner:
         def fill_time_book_reader(
             market: BinaryMarket,
             fill_time: datetime,
-        ) -> tuple[OrderBookSide | None, OrderBookSide | None]:
-            _ = fill_time
-            return cache.book_side(market.yes_token_id, "ask"), cache.book_side(market.no_token_id, "ask")
+        ) -> FillTimeBookEvidence:
+            tokens = [market.yes_token_id, market.no_token_id]
+            public_snapshot = cache.public_evidence_snapshot(tokens, until=fill_time)
+            yes_public = public_snapshot.get(market.yes_token_id, {})
+            no_public = public_snapshot.get(market.no_token_id, {})
+            return FillTimeBookEvidence(
+                source="ws_cache",
+                yes_book=cache.book_side(market.yes_token_id, "ask"),
+                no_book=cache.book_side(market.no_token_id, "ask"),
+                observed_at=fill_time,
+                snapshot_ready={
+                    market.yes_token_id: cache.is_snapshot_ready(market.yes_token_id),
+                    market.no_token_id: cache.is_snapshot_ready(market.no_token_id),
+                },
+                snapshot_generation={
+                    market.yes_token_id: cache.snapshot_generation(market.yes_token_id),
+                    market.no_token_id: cache.snapshot_generation(market.no_token_id),
+                },
+                public_price_changes={
+                    market.yes_token_id: tuple(yes_public.get("recent_price_changes") or ()),
+                    market.no_token_id: tuple(no_public.get("recent_price_changes") or ()),
+                },
+                public_trade_prints={
+                    market.yes_token_id: tuple(yes_public.get("recent_trade_prints") or ()),
+                    market.no_token_id: tuple(no_public.get("recent_trade_prints") or ()),
+                },
+                tick_size_changes={
+                    market.yes_token_id: tuple(yes_public.get("recent_tick_size_changes") or ()),
+                    market.no_token_id: tuple(no_public.get("recent_tick_size_changes") or ()),
+                },
+                best_bid_asks={
+                    market.yes_token_id: tuple(yes_public.get("recent_best_bid_asks") or ()),
+                    market.no_token_id: tuple(no_public.get("recent_best_bid_asks") or ()),
+                },
+            )
 
         return self._evaluate_universe(
             universe,
@@ -1838,7 +1876,7 @@ class ConditionalArbScanner:
         dirty_token_ids: set[str] | None,
         evaluation_reason: str,
         params: PaperPortfolioParams,
-        fill_time_book_reader: Callable[[BinaryMarket, datetime], tuple[OrderBookSide | None, OrderBookSide | None]]
+        fill_time_book_reader: Callable[[BinaryMarket, datetime], FillTimeBookEvidence]
         | None = None,
     ) -> dict[str, Any]:
         cycle_started = datetime.now(timezone.utc)
@@ -1877,13 +1915,16 @@ class ConditionalArbScanner:
             if yes_book is None or no_book is None:
                 skip_counts["missing_ask_book"] = skip_counts.get("missing_ask_book", 0) + 1
                 continue
+            market_fill_time_reader = fill_time_book_reader
+            if market_fill_time_reader is None and not params.simulation.is_zero_friction:
+                market_fill_time_reader = self._rest_fill_time_book_reader(market)
             decision = self.portfolio.execute_binary_complete_set(
                 market,
                 yes_book,
                 no_book,
                 as_of=cycle_started,
                 params=params,
-                fill_time_book_reader=fill_time_book_reader,
+                fill_time_book_reader=market_fill_time_reader,
             )
             last_reason = self._handle_decision(
                 decision,
@@ -1940,6 +1981,59 @@ class ConditionalArbScanner:
             "summary": summary,
             "executions": executions,
         }
+
+    def _rest_fill_time_book_reader(
+        self,
+        market: BinaryMarket,
+    ) -> Callable[[BinaryMarket, datetime], FillTimeBookEvidence]:
+        def read(_market: BinaryMarket, fill_time: datetime) -> FillTimeBookEvidence:
+            try:
+                payload = self.client.fetch_ask_books_with_evidence([market.yes_token_id, market.no_token_id])
+            except AttributeError:
+                try:
+                    books = self.client.fetch_ask_books([market.yes_token_id, market.no_token_id])
+                except Exception as exc:
+                    return FillTimeBookEvidence(
+                        source="error",
+                        observed_at=fill_time,
+                        public_error=f"{type(exc).__name__}: {exc}",
+                    )
+                return FillTimeBookEvidence(
+                    source="rest_snapshot",
+                    yes_book=books.get(market.yes_token_id),
+                    no_book=books.get(market.no_token_id),
+                    observed_at=fill_time,
+                    snapshot_ready={
+                        market.yes_token_id: market.yes_token_id in books,
+                        market.no_token_id: market.no_token_id in books,
+                    },
+                )
+            except Exception as exc:
+                return FillTimeBookEvidence(
+                    source="error",
+                    observed_at=fill_time,
+                    public_error=f"{type(exc).__name__}: {exc}",
+                )
+
+            books = payload.get("books") if isinstance(payload, Mapping) else {}
+            errors = payload.get("errors") if isinstance(payload, Mapping) else {}
+            request_records = payload.get("request_records") if isinstance(payload, Mapping) else ()
+            return FillTimeBookEvidence(
+                source="rest_snapshot",
+                yes_book=books.get(market.yes_token_id) if isinstance(books, Mapping) else None,
+                no_book=books.get(market.no_token_id) if isinstance(books, Mapping) else None,
+                observed_at=fill_time,
+                snapshot_ready={
+                    market.yes_token_id: isinstance(books, Mapping) and market.yes_token_id in books,
+                    market.no_token_id: isinstance(books, Mapping) and market.no_token_id in books,
+                },
+                request_records=tuple(row for row in request_records if isinstance(row, Mapping))
+                if isinstance(request_records, (list, tuple))
+                else (),
+                errors={str(key): str(value) for key, value in errors.items()} if isinstance(errors, Mapping) else {},
+            )
+
+        return read
 
     def _evaluation_targets(
         self,

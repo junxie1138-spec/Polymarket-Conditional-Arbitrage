@@ -209,6 +209,7 @@ class OrderBookSide:
     source: str = "rest_book"
     updated_at: datetime | None = None
     source_revision: str | None = None
+    source_hash: str | None = None
 
     @property
     def available_size(self) -> float:
