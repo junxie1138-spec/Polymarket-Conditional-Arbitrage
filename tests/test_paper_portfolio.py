@@ -943,6 +943,75 @@ def test_status_uses_state_when_event_append_fails_after_save(tmp_path):
     assert status["cash"] == pytest.approx(1000.3)
 
 
+def test_status_reports_realized_and_open_inventory_metrics(tmp_path):
+    p = params()
+    path = tmp_path / "portfolio.json"
+    state = initial_portfolio_state(p, as_of=AS_OF)
+    state["cash"] = 999.0
+    state["realized_pnl"] = 0.3
+    state["executions"] = [
+        {
+            "execution_id": "paper:m1:1",
+            "market_id": "m1",
+            "net_profit": 0.3,
+            "quantity_redeemed": 10.0,
+            "executed_at_utc": "2026-06-08T12:00:00Z",
+        },
+        {
+            "execution_id": "paper:m2:1",
+            "market_id": "m2",
+            "net_profit": 0.0,
+            "quantity_redeemed": 0.0,
+            "executed_at_utc": "2026-06-08T12:01:00Z",
+        },
+        {
+            "execution_id": "paper:m3:1",
+            "market_id": "m3",
+            "net_profit": 0.0,
+            "quantity_redeemed": 0.0,
+            "executed_at_utc": "2026-06-08T12:02:00Z",
+        },
+    ]
+    state["inventory"] = {
+        "m2-yes": {
+            "token_id": "m2-yes",
+            "market_id": "m2",
+            "outcome": "YES",
+            "quantity": 4.0,
+            "cost_basis_usd": 1.2,
+            "last_valuation_price": 0.3,
+        },
+        "m2-no": {
+            "token_id": "m2-no",
+            "market_id": "m2",
+            "outcome": "NO",
+            "quantity": 1.0,
+            "cost_basis_usd": 0.45,
+            "last_valuation_price": 0.45,
+        },
+        "m3-yes": {
+            "token_id": "m3-yes",
+            "market_id": "m3",
+            "outcome": "YES",
+            "quantity": 2.0,
+            "cost_basis_usd": 0.8,
+            "last_valuation_price": 0.5,
+        },
+    }
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    status = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).status()
+
+    assert status["trade_count"] == 3
+    assert status["win_rate_pct"] == pytest.approx(100.0 / 3.0)
+    assert status["execution_win_rate_pct"] == pytest.approx(100.0 / 3.0)
+    assert status["realized_trade_count"] == 1
+    assert status["realized_win_rate_pct"] == pytest.approx(100.0)
+    assert status["capital_committed_usd"] == pytest.approx(2.45)
+    assert status["open_position_value_usd"] == pytest.approx(2.9)
+    assert status["active_trade_count"] == 2
+
+
 def test_execution_save_failure_rolls_back_in_memory_state(tmp_path, monkeypatch):
     p = params()
     path = tmp_path / "portfolio.json"

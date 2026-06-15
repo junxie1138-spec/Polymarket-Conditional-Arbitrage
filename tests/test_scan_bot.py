@@ -382,6 +382,61 @@ def test_market_universe_fetch_stops_between_event_pages(tmp_path):
         scanner._fetch_market_universe()
 
 
+def test_async_rest_book_seed_stops_after_signal_during_fetch(tmp_path):
+    class StopDuringFetchClient(TwoMarketClient):
+        def __init__(self):
+            super().__init__()
+            self.scanner = None
+
+        def fetch_ask_books(self, token_ids, *, on_progress=None):
+            assert self.scanner is not None
+            self.scanner.running = False
+            return super().fetch_ask_books(token_ids, on_progress=on_progress)
+
+    client = StopDuringFetchClient()
+    scanner = scanner_for(tmp_path, client)
+    client.scanner = scanner
+
+    with pytest.raises(ScannerStopped, match="scanner stopped"):
+        asyncio.run(
+            scanner._seed_rest_books_incrementally_async(
+                MarketDataCache(),
+                ["yes-1", "no-1"],
+                reason="ws_bootstrap",
+            )
+        )
+
+    assert client.fetch_ask_books_calls == 1
+
+
+def test_async_rest_book_seed_stops_before_next_batch(tmp_path, monkeypatch):
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client)
+    monkeypatch.setattr(
+        scanner,
+        "_book_seed_token_chunks",
+        lambda _token_ids: [["yes-1", "no-1"], ["yes-2", "no-2"]],
+    )
+    seeded_chunks = []
+
+    def stop_after_first_chunk(updated):
+        seeded_chunks.append(set(updated))
+        scanner.running = False
+
+    with pytest.raises(ScannerStopped, match="scanner stopped"):
+        asyncio.run(
+            scanner._seed_rest_books_incrementally_async(
+                MarketDataCache(),
+                ["yes-1", "no-1", "yes-2", "no-2"],
+                reason="ws_bootstrap",
+                on_chunk_seeded=stop_after_first_chunk,
+            )
+        )
+
+    assert client.fetch_ask_books_calls == 1
+    assert len(seeded_chunks) == 1
+
+
 def test_missing_startup_cache_rebuilds_full_universe_before_first_evaluation(tmp_path):
     cfg = replace(
         scan_config(tmp_path),
@@ -1120,6 +1175,83 @@ def test_status_dashboard_formats_online_warmup_and_dead():
     assert "Skips           1" in online
     assert "WARMUP" in assert_dashboard_frame(warmup)[1]
     assert "DEAD" in assert_dashboard_frame(dead)[1]
+
+
+def test_status_dashboard_formats_portfolio_metric_breakout():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "online",
+    }
+    portfolio_status = {
+        "cash": 992.5,
+        "realized_pnl": 1.5,
+        "total_equity": 1004.0,
+        "return_pct": 0.4,
+        "trade_count": 7,
+        "win_rate_pct": 14.285714,
+        "execution_win_rate_pct": 14.285714,
+        "realized_trade_count": 1,
+        "realized_win_rate_pct": 100.0,
+        "capital_committed_usd": 12.5,
+        "open_position_value_usd": 11.5,
+        "active_trade_count": 2,
+        "costs": {},
+        "last_execution_at_utc": utc_iso(now),
+        "unmatched_inventory": [
+            {"market_id": "m2", "token_id": "m2-yes"},
+            {"market_id": "m2", "token_id": "m2-no"},
+            {"market_id": "m3", "token_id": "m3-yes"},
+        ],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert assert_dashboard_frame(dashboard)
+    assert "Trades          7" in dashboard
+    assert "Realized trades 1" in dashboard
+    assert "Realized win    100.00%" in dashboard
+    assert "Execution win   14.29%" in dashboard
+    assert "Committed       $12.50" in dashboard
+    assert "Open value      $11.50" in dashboard
+    assert "Active trades   2" in dashboard
+
+
+def test_status_dashboard_formats_legacy_portfolio_metrics():
+    now = datetime(2026, 6, 10, 12, tzinfo=timezone.utc)
+    runtime = {
+        "schema_version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "heartbeat_at_utc": utc_iso(now),
+        "phase": "online",
+        "detail": "online",
+    }
+    portfolio_status = {
+        "cash": 1001.0,
+        "realized_pnl": 1.0,
+        "total_equity": 1001.0,
+        "return_pct": 0.1,
+        "trade_count": 1,
+        "win_rate_pct": 100.0,
+        "costs": {},
+        "last_execution_at_utc": utc_iso(now),
+        "unmatched_inventory": [{"market_id": "m1"}, {"market_id": "m1"}],
+    }
+
+    dashboard = format_status_dashboard(runtime=runtime, portfolio=portfolio_status, now=now)
+
+    assert assert_dashboard_frame(dashboard)
+    assert "Realized trades 1" in dashboard
+    assert "Realized win    100.00%" in dashboard
+    assert "Execution win   100.00%" in dashboard
+    assert "Committed       $0.00" in dashboard
+    assert "Open value      $0.00" in dashboard
+    assert "Active trades   1" in dashboard
 
 
 def test_status_dashboard_formats_warmup_progress_eta():

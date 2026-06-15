@@ -642,6 +642,7 @@ class ConditionalArbScanner:
         all_updated: set[str] = set()
 
         for batch_number, chunk in enumerate(chunks, start=1):
+            self._ensure_running()
             batch_start_token = completed_tokens + 1
             batch_end_token = completed_tokens + len(chunk)
             batch_started_at_utc = utc_iso()
@@ -731,8 +732,10 @@ class ConditionalArbScanner:
                 }
             )
             if updated and on_chunk_seeded is not None:
+                self._ensure_running()
                 on_chunk_seeded(set(updated))
 
+        self._ensure_running()
         self._runtime_update(
             detail=f"REST ask books seeded: {reason}",
             book_seed_completed_tokens=total_tokens,
@@ -771,6 +774,7 @@ class ConditionalArbScanner:
         all_updated: set[str] = set()
 
         for batch_number, chunk in enumerate(chunks, start=1):
+            self._ensure_running()
             batch_start_token = completed_tokens + 1
             batch_end_token = completed_tokens + len(chunk)
             batch_started_at_utc = utc_iso()
@@ -863,10 +867,12 @@ class ConditionalArbScanner:
             if on_progress_update is not None:
                 on_progress_update(dict(progress_payload))
             if updated and on_chunk_seeded is not None:
+                self._ensure_running()
                 callback_result = on_chunk_seeded(set(updated))
                 if hasattr(callback_result, "__await__"):
                     await callback_result
 
+        self._ensure_running()
         self._runtime_update(
             detail=f"REST ask books seeded: {reason}",
             book_seed_completed_tokens=total_tokens,
@@ -890,6 +896,7 @@ class ConditionalArbScanner:
     ) -> Any:
         attempt = 1
         while True:
+            self._ensure_running()
             try:
                 result = func()
             except Exception as exc:
@@ -916,6 +923,7 @@ class ConditionalArbScanner:
                     attempt,
                     summary(result) if summary is not None else {},
                 )
+            self._ensure_running()
             return result
 
     async def _run_async_with_retries(
@@ -927,6 +935,7 @@ class ConditionalArbScanner:
     ) -> Any:
         attempt = 1
         while True:
+            self._ensure_running()
             try:
                 result = await func()
             except Exception as exc:
@@ -953,6 +962,7 @@ class ConditionalArbScanner:
                     attempt,
                     summary(result) if summary is not None else {},
                 )
+            self._ensure_running()
             return result
 
     def bootstrap(self) -> None:
@@ -2084,6 +2094,7 @@ class ConditionalArbScanner:
         executions: list[dict[str, Any]] = []
 
         for market in standard_markets:
+            self._ensure_running()
             yes_book = books_by_token.get(market.yes_token_id)
             no_book = books_by_token.get(market.no_token_id)
             if yes_book is None or no_book is None:

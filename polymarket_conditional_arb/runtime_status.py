@@ -536,6 +536,25 @@ def format_status_dashboard(
     costs = portfolio.get("costs") if isinstance(portfolio.get("costs"), Mapping) else {}
     unmatched = portfolio.get("unmatched_inventory")
     unmatched_text = "none" if not unmatched else f"{len(unmatched)} positions"
+    legacy_win_rate = portfolio.get("win_rate_pct")
+    execution_win_rate = _float_value(portfolio.get("execution_win_rate_pct"))
+    if execution_win_rate is None:
+        execution_win_rate = _float_value(legacy_win_rate) or 0.0
+    realized_win_rate = _float_value(portfolio.get("realized_win_rate_pct"))
+    if realized_win_rate is None:
+        realized_win_rate = _float_value(legacy_win_rate) or 0.0
+    trade_count = _int_value(portfolio.get("trade_count"))
+    realized_trade_count = _int_value(portfolio.get("realized_trade_count"), trade_count)
+    active_trade_count_value = portfolio.get("active_trade_count")
+    active_trade_count = _int_value(active_trade_count_value)
+    if active_trade_count_value is None and isinstance(unmatched, Sequence) and not isinstance(unmatched, (str, bytes)):
+        active_trade_count = len(
+            {
+                market_id
+                for row in unmatched
+                if isinstance(row, Mapping) and (market_id := str(row.get("market_id") or ""))
+            }
+        )
     pending_settlement_count = _int_value(portfolio.get("pending_settlement_count"))
     settlements_applied_count = _int_value(portfolio.get("settlements_applied_count"))
     latest_settlement_at = portfolio.get("last_settlement_at_utc") or runtime_row.get("last_settlement_at_utc")
@@ -606,8 +625,13 @@ def format_status_dashboard(
         _kv("Equity", _format_money(portfolio.get("total_equity"))),
         _kv("Realized PnL", _format_money(portfolio.get("realized_pnl"))),
         _kv("Return", f"{float(portfolio.get('return_pct') or 0.0):.2f}%"),
-        _kv("Trades", _format_count(_int_value(portfolio.get("trade_count")))),
-        _kv("Win rate", f"{float(portfolio.get('win_rate_pct') or 0.0):.2f}%"),
+        _kv("Trades", _format_count(trade_count)),
+        _kv("Realized trades", _format_count(realized_trade_count)),
+        _kv("Realized win", f"{realized_win_rate:.2f}%"),
+        _kv("Execution win", f"{execution_win_rate:.2f}%"),
+        _kv("Committed", _format_money(portfolio.get("capital_committed_usd"))),
+        _kv("Open value", _format_money(portfolio.get("open_position_value_usd"))),
+        _kv("Active trades", _format_count(active_trade_count)),
     ]
     _append_split_section(rows, health_lines, portfolio_lines)
     if failures > 0:

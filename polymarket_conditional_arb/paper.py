@@ -2149,16 +2149,37 @@ class PaperPortfolio:
     def status(self) -> dict[str, Any]:
         state = self._read_state()
         executions = state.get("executions") if isinstance(state.get("executions"), list) else []
-        wins = sum(1 for execution in executions if _as_float(execution.get("net_profit")) > EPSILON)
+        execution_wins = sum(1 for execution in executions if _as_float(execution.get("net_profit")) > EPSILON)
         trade_count = len(executions)
+        realized_executions = [
+            execution
+            for execution in executions
+            if _as_float(execution.get("quantity_redeemed")) > EPSILON
+            or abs(_as_float(execution.get("net_profit"))) > EPSILON
+        ]
+        realized_trade_count = len(realized_executions)
+        realized_wins = sum(
+            1 for execution in realized_executions if _as_float(execution.get("net_profit")) > EPSILON
+        )
         starting_capital = _as_float(state.get("starting_capital_usd"), self.params.starting_capital_usd)
         cash = _as_float(state.get("cash"), starting_capital)
-        equity = cash + _inventory_equity_value(state)
+        open_position_value = _inventory_equity_value(state)
+        equity = cash + open_position_value
         costs = state.get("costs") if isinstance(state.get("costs"), Mapping) else {}
         inventory = list(_inventory_rows(state).values())
+        capital_committed = sum(max(0.0, _as_float(row.get("cost_basis_usd"))) for row in inventory)
+        active_trade_count = len(
+            {
+                market_id
+                for row in inventory
+                if (market_id := str(row.get("market_id") or ""))
+            }
+        )
         last_execution = executions[-1].get("executed_at_utc") if executions else None
         settlements = state.get("settlements") if isinstance(state.get("settlements"), list) else []
         last_settlement = settlements[-1].get("settled_at_utc") if settlements else None
+        execution_win_rate = (execution_wins / trade_count) * 100.0 if trade_count else 0.0
+        realized_win_rate = (realized_wins / realized_trade_count) * 100.0 if realized_trade_count else 0.0
         return {
             "starting_capital_usd": starting_capital,
             "cash": cash,
@@ -2168,7 +2189,13 @@ class PaperPortfolio:
             if starting_capital > 0
             else 0.0,
             "trade_count": trade_count,
-            "win_rate_pct": (wins / trade_count) * 100.0 if trade_count else 0.0,
+            "win_rate_pct": execution_win_rate,
+            "execution_win_rate_pct": execution_win_rate,
+            "realized_win_rate_pct": realized_win_rate,
+            "realized_trade_count": realized_trade_count,
+            "capital_committed_usd": capital_committed,
+            "open_position_value_usd": open_position_value,
+            "active_trade_count": active_trade_count,
             "costs": {
                 "fees_usd": _as_float(costs.get("fees_usd") if isinstance(costs, Mapping) else None),
                 "slippage_usd": _as_float(costs.get("slippage_usd") if isinstance(costs, Mapping) else None),
