@@ -536,6 +536,9 @@ def format_status_dashboard(
     costs = portfolio.get("costs") if isinstance(portfolio.get("costs"), Mapping) else {}
     unmatched = portfolio.get("unmatched_inventory")
     unmatched_text = "none" if not unmatched else f"{len(unmatched)} positions"
+    pending_settlement_count = _int_value(portfolio.get("pending_settlement_count"))
+    settlements_applied_count = _int_value(portfolio.get("settlements_applied_count"))
+    latest_settlement_at = portfolio.get("last_settlement_at_utc") or runtime_row.get("last_settlement_at_utc")
     host = runtime_row.get("host") or "unknown"
     pid = runtime_row.get("pid") or "unknown"
     health_status = _format_status_health(
@@ -698,6 +701,9 @@ def format_status_dashboard(
         _kv("Live sim fails", simulation_failure_text),
         _kv("Last live sim", last_simulation_failure_reason),
         _kv("Unmatched", unmatched_text),
+        _kv("Pending settle", _format_count(pending_settlement_count)),
+        _kv("Settlements", _format_count(settlements_applied_count)),
+        _kv("Last settle", _format_timestamp(latest_settlement_at)),
         _kv("Last error", runtime_row.get("last_error") or "none"),
     ]
     _append_split_section(rows, warmup_lines, execution_lines)

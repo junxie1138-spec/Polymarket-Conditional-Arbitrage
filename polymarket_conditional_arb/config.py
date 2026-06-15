@@ -58,6 +58,29 @@ DEFAULT_PAPER_THROTTLE_QUANTITY_RATIO = 0.50
 DEFAULT_PAPER_ADVERSE_SELECTION_PROBABILITY = 0.25
 DEFAULT_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO = 0.50
 DEFAULT_PAPER_ADVERSE_PRICE_MOVE_BPS = 10.0
+DEFAULT_PAPER_LATENCY_MODE = "fixed"
+DEFAULT_PAPER_LOCAL_TIMEOUT_MS = 0.0
+DEFAULT_PAPER_TELEMETRY_LATENCY_WINDOW = 50
+DEFAULT_PAPER_LATENCY_JITTER_SEED_SCOPE = "market_book_stage"
+DEFAULT_PAPER_FILL_ELIGIBILITY_MODE = "strict_public_depth"
+DEFAULT_PAPER_ALLOW_TRADE_PRINT_FILL_SUPPORT = True
+DEFAULT_PAPER_ALLOW_DETERMINISTIC_FILL_FALLBACK = False
+DEFAULT_PAPER_SETTLEMENT_ENABLED = True
+DEFAULT_PAPER_SETTLEMENT_SOURCE = "public_metadata_or_ws"
+DEFAULT_PAPER_UNMATCHED_OPEN_VALUATION = "best_bid_midpoint_or_zero"
+DEFAULT_PAPER_SETTLEMENT_REQUIRE_WINNER = True
+DEFAULT_PAPER_SLIPPAGE_MODE = "fixed_plus_calibrated"
+DEFAULT_PAPER_SLIPPAGE_MAX_BPS = 100.0
+DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS = 50
+DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE = "max"
+
+LATENCY_MODES = {"fixed", "telemetry"}
+LATENCY_JITTER_SEED_SCOPES = {"global", "market", "market_stage", "market_book_stage"}
+FILL_ELIGIBILITY_MODES = {"strict_public_depth"}
+SETTLEMENT_SOURCES = {"public_metadata_or_ws"}
+UNMATCHED_OPEN_VALUATION_MODES = {"best_bid_midpoint_or_zero"}
+SLIPPAGE_MODES = {"fixed_only", "fixed_plus_calibrated"}
+SLIPPAGE_COMBINE_MODES = {"max", "add"}
 
 
 @dataclass(frozen=True)
@@ -66,9 +89,24 @@ class PaperExecutionSimulationConfig:
     seed: int = DEFAULT_PAPER_SIM_SEED
     latency_ms: float = DEFAULT_PAPER_LATENCY_MS
     latency_jitter_ms: float = DEFAULT_PAPER_LATENCY_JITTER_MS
+    latency_mode: str = DEFAULT_PAPER_LATENCY_MODE
+    local_timeout_ms: float = DEFAULT_PAPER_LOCAL_TIMEOUT_MS
+    telemetry_latency_window: int = DEFAULT_PAPER_TELEMETRY_LATENCY_WINDOW
+    latency_jitter_seed_scope: str = DEFAULT_PAPER_LATENCY_JITTER_SEED_SCOPE
     signing_latency_ms: float = DEFAULT_PAPER_SIGNING_LATENCY_MS
     settlement_latency_ms: float = DEFAULT_PAPER_SETTLEMENT_LATENCY_MS
     max_fill_price_move_bps: float = DEFAULT_PAPER_MAX_FILL_PRICE_MOVE_BPS
+    fill_eligibility_mode: str = DEFAULT_PAPER_FILL_ELIGIBILITY_MODE
+    allow_trade_print_fill_support: bool = DEFAULT_PAPER_ALLOW_TRADE_PRINT_FILL_SUPPORT
+    allow_deterministic_fill_fallback: bool = DEFAULT_PAPER_ALLOW_DETERMINISTIC_FILL_FALLBACK
+    settlement_enabled: bool = DEFAULT_PAPER_SETTLEMENT_ENABLED
+    settlement_source: str = DEFAULT_PAPER_SETTLEMENT_SOURCE
+    unmatched_open_valuation: str = DEFAULT_PAPER_UNMATCHED_OPEN_VALUATION
+    settlement_require_winner: bool = DEFAULT_PAPER_SETTLEMENT_REQUIRE_WINNER
+    slippage_mode: str = DEFAULT_PAPER_SLIPPAGE_MODE
+    slippage_max_bps: float = DEFAULT_PAPER_SLIPPAGE_MAX_BPS
+    slippage_lookback_events: int = DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS
+    slippage_combine_mode: str = DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE
     queue_depth_ratio: float = DEFAULT_PAPER_QUEUE_DEPTH_RATIO
     queue_fill_probability: float = DEFAULT_PAPER_QUEUE_FILL_PROBABILITY
     partial_fill_probability: float = DEFAULT_PAPER_PARTIAL_FILL_PROBABILITY
@@ -83,15 +121,72 @@ class PaperExecutionSimulationConfig:
     adverse_depth_removal_ratio: float = DEFAULT_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO
     adverse_price_move_bps: float = DEFAULT_PAPER_ADVERSE_PRICE_MOVE_BPS
 
+    def __post_init__(self) -> None:
+        if self.latency_mode not in LATENCY_MODES:
+            raise ValueError(
+                f"latency_mode must be one of {sorted(LATENCY_MODES)}; got {self.latency_mode!r}"
+            )
+        if self.latency_jitter_seed_scope not in LATENCY_JITTER_SEED_SCOPES:
+            raise ValueError(
+                "latency_jitter_seed_scope must be one of "
+                f"{sorted(LATENCY_JITTER_SEED_SCOPES)}; got {self.latency_jitter_seed_scope!r}"
+            )
+        if self.fill_eligibility_mode not in FILL_ELIGIBILITY_MODES:
+            raise ValueError(
+                "fill_eligibility_mode must be one of "
+                f"{sorted(FILL_ELIGIBILITY_MODES)}; got {self.fill_eligibility_mode!r}"
+            )
+        if self.settlement_source not in SETTLEMENT_SOURCES:
+            raise ValueError(
+                f"settlement_source must be one of {sorted(SETTLEMENT_SOURCES)}; got {self.settlement_source!r}"
+            )
+        if self.unmatched_open_valuation not in UNMATCHED_OPEN_VALUATION_MODES:
+            raise ValueError(
+                "unmatched_open_valuation must be one of "
+                f"{sorted(UNMATCHED_OPEN_VALUATION_MODES)}; got {self.unmatched_open_valuation!r}"
+            )
+        if self.slippage_mode not in SLIPPAGE_MODES:
+            raise ValueError(
+                f"slippage_mode must be one of {sorted(SLIPPAGE_MODES)}; got {self.slippage_mode!r}"
+            )
+        if self.slippage_combine_mode not in SLIPPAGE_COMBINE_MODES:
+            raise ValueError(
+                "slippage_combine_mode must be one of "
+                f"{sorted(SLIPPAGE_COMBINE_MODES)}; got {self.slippage_combine_mode!r}"
+            )
+        if self.local_timeout_ms < 0.0:
+            raise ValueError("local_timeout_ms must be greater than or equal to 0")
+        if self.telemetry_latency_window < 1:
+            raise ValueError("telemetry_latency_window must be greater than or equal to 1")
+        if self.slippage_max_bps < 0.0:
+            raise ValueError("slippage_max_bps must be greater than or equal to 0")
+        if self.slippage_lookback_events < 1:
+            raise ValueError("slippage_lookback_events must be greater than or equal to 1")
+
     @classmethod
     def zero_friction(cls) -> "PaperExecutionSimulationConfig":
         return cls(
             enabled=False,
             latency_ms=0.0,
             latency_jitter_ms=0.0,
+            latency_mode=DEFAULT_PAPER_LATENCY_MODE,
+            local_timeout_ms=0.0,
+            telemetry_latency_window=DEFAULT_PAPER_TELEMETRY_LATENCY_WINDOW,
+            latency_jitter_seed_scope=DEFAULT_PAPER_LATENCY_JITTER_SEED_SCOPE,
             signing_latency_ms=0.0,
             settlement_latency_ms=0.0,
             max_fill_price_move_bps=0.0,
+            fill_eligibility_mode=DEFAULT_PAPER_FILL_ELIGIBILITY_MODE,
+            allow_trade_print_fill_support=DEFAULT_PAPER_ALLOW_TRADE_PRINT_FILL_SUPPORT,
+            allow_deterministic_fill_fallback=False,
+            settlement_enabled=False,
+            settlement_source=DEFAULT_PAPER_SETTLEMENT_SOURCE,
+            unmatched_open_valuation=DEFAULT_PAPER_UNMATCHED_OPEN_VALUATION,
+            settlement_require_winner=DEFAULT_PAPER_SETTLEMENT_REQUIRE_WINNER,
+            slippage_mode="fixed_only",
+            slippage_max_bps=0.0,
+            slippage_lookback_events=DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS,
+            slippage_combine_mode=DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE,
             queue_depth_ratio=0.0,
             queue_fill_probability=0.0,
             partial_fill_probability=0.0,
@@ -114,9 +209,11 @@ class PaperExecutionSimulationConfig:
         return (
             self.latency_ms <= 0.0
             and self.latency_jitter_ms <= 0.0
+            and self.local_timeout_ms <= 0.0
             and self.signing_latency_ms <= 0.0
             and self.settlement_latency_ms <= 0.0
             and self.max_fill_price_move_bps <= 0.0
+            and self.slippage_max_bps <= 0.0
             and self.queue_depth_ratio <= 0.0
             and self.queue_fill_probability <= 0.0
             and self.partial_fill_probability <= 0.0
@@ -222,6 +319,16 @@ def _ratio_env(name: str, default: float) -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError(f"{name} must be between 0 and 1")
     return value
+
+
+def _choice_env(name: str, default: str, allowed: set[str]) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized not in allowed:
+        raise ValueError(f"{name} must be one of {sorted(allowed)}")
+    return normalized
 
 
 def data_dir() -> Path:
@@ -375,6 +482,23 @@ def paper_execution_simulation_config() -> PaperExecutionSimulationConfig:
         seed=env_int("COND_ARB_PAPER_SIM_SEED", DEFAULT_PAPER_SIM_SEED),
         latency_ms=_non_negative_float_env("COND_ARB_PAPER_LATENCY_MS", DEFAULT_PAPER_LATENCY_MS),
         latency_jitter_ms=_non_negative_float_env("COND_ARB_PAPER_LATENCY_JITTER_MS", DEFAULT_PAPER_LATENCY_JITTER_MS),
+        latency_mode=_choice_env("COND_ARB_PAPER_LATENCY_MODE", DEFAULT_PAPER_LATENCY_MODE, LATENCY_MODES),
+        local_timeout_ms=_non_negative_float_env(
+            "COND_ARB_PAPER_LOCAL_TIMEOUT_MS",
+            DEFAULT_PAPER_LOCAL_TIMEOUT_MS,
+        ),
+        telemetry_latency_window=max(
+            1,
+            _non_negative_int_env(
+                "COND_ARB_PAPER_TELEMETRY_LATENCY_WINDOW",
+                DEFAULT_PAPER_TELEMETRY_LATENCY_WINDOW,
+            ),
+        ),
+        latency_jitter_seed_scope=_choice_env(
+            "COND_ARB_PAPER_LATENCY_JITTER_SEED_SCOPE",
+            DEFAULT_PAPER_LATENCY_JITTER_SEED_SCOPE,
+            LATENCY_JITTER_SEED_SCOPES,
+        ),
         signing_latency_ms=_non_negative_float_env(
             "COND_ARB_PAPER_SIGNING_LATENCY_MS",
             DEFAULT_PAPER_SIGNING_LATENCY_MS,
@@ -386,6 +510,58 @@ def paper_execution_simulation_config() -> PaperExecutionSimulationConfig:
         max_fill_price_move_bps=_non_negative_float_env(
             "COND_ARB_PAPER_MAX_FILL_PRICE_MOVE_BPS",
             DEFAULT_PAPER_MAX_FILL_PRICE_MOVE_BPS,
+        ),
+        fill_eligibility_mode=_choice_env(
+            "COND_ARB_PAPER_FILL_ELIGIBILITY_MODE",
+            DEFAULT_PAPER_FILL_ELIGIBILITY_MODE,
+            FILL_ELIGIBILITY_MODES,
+        ),
+        allow_trade_print_fill_support=env_bool(
+            "COND_ARB_PAPER_ALLOW_TRADE_PRINT_FILL_SUPPORT",
+            DEFAULT_PAPER_ALLOW_TRADE_PRINT_FILL_SUPPORT,
+        ),
+        allow_deterministic_fill_fallback=env_bool(
+            "COND_ARB_PAPER_ALLOW_DETERMINISTIC_FILL_FALLBACK",
+            DEFAULT_PAPER_ALLOW_DETERMINISTIC_FILL_FALLBACK,
+        ),
+        settlement_enabled=env_bool(
+            "COND_ARB_PAPER_SETTLEMENT_ENABLED",
+            DEFAULT_PAPER_SETTLEMENT_ENABLED,
+        ),
+        settlement_source=_choice_env(
+            "COND_ARB_PAPER_SETTLEMENT_SOURCE",
+            DEFAULT_PAPER_SETTLEMENT_SOURCE,
+            SETTLEMENT_SOURCES,
+        ),
+        unmatched_open_valuation=_choice_env(
+            "COND_ARB_PAPER_UNMATCHED_OPEN_VALUATION",
+            DEFAULT_PAPER_UNMATCHED_OPEN_VALUATION,
+            UNMATCHED_OPEN_VALUATION_MODES,
+        ),
+        settlement_require_winner=env_bool(
+            "COND_ARB_PAPER_SETTLEMENT_REQUIRE_WINNER",
+            DEFAULT_PAPER_SETTLEMENT_REQUIRE_WINNER,
+        ),
+        slippage_mode=_choice_env(
+            "COND_ARB_PAPER_SLIPPAGE_MODE",
+            DEFAULT_PAPER_SLIPPAGE_MODE,
+            SLIPPAGE_MODES,
+        ),
+        slippage_max_bps=_non_negative_float_env(
+            "COND_ARB_PAPER_SLIPPAGE_MAX_BPS",
+            DEFAULT_PAPER_SLIPPAGE_MAX_BPS,
+        ),
+        slippage_lookback_events=max(
+            1,
+            _non_negative_int_env(
+                "COND_ARB_PAPER_SLIPPAGE_LOOKBACK_EVENTS",
+                DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS,
+            ),
+        ),
+        slippage_combine_mode=_choice_env(
+            "COND_ARB_PAPER_SLIPPAGE_COMBINE_MODE",
+            DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE,
+            SLIPPAGE_COMBINE_MODES,
         ),
         queue_depth_ratio=_ratio_env("COND_ARB_PAPER_QUEUE_DEPTH_RATIO", DEFAULT_PAPER_QUEUE_DEPTH_RATIO),
         queue_fill_probability=_probability_env(

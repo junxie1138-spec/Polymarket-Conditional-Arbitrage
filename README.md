@@ -58,7 +58,9 @@ Paper sizing mirrors Polymarket's API order-size floor: each simulated YES and N
 
 `COND_ARB_TRADE_CEILING_USD` is a per-execution maximum capital spend. Profitable depth above the ceiling is clamped down to that spend limit instead of being rejected, and the 5-share floor is checked against the final simulated YES and NO order sizes after the clamp.
 
-Paper fills use live-market-data-driven simulated execution by default while staying strictly paper-only. A signal-time opportunity is rechecked at the simulated fill timestamp using public YES/NO ask books from the WebSocket cache or fresh REST `/books`/`/book` snapshots. The simulator records public source type, timestamps, source revisions/hashes, snapshot readiness/generation, recent `price_change` deltas, `last_trade_price` prints, `tick_size_change` metadata, request latency/retry/status evidence, and public/network errors. It compares signal-time and fill-time books, skips safely on missing, unready, stale, or errored public data, estimates queue progress from observed public size decreases and trade prints, and falls back to deterministic queue/adverse-selection/partial-fill knobs only when no usable public evidence exists. Completed paper fills store a top-level `simulation` object with `live_public_data`, `inferred`, and `fallback` sections plus fill timestamp, book source, queue inputs, rate-limit/local-pressure evidence, and partial-fill metadata. Simulated failures append `paper_portfolio_execution_failed` audit events and do not mutate the portfolio.
+Paper fills use live-market-data-driven simulated execution by default while staying strictly paper-only. A signal-time opportunity is rechecked at the simulated fill timestamp using public YES/NO ask books from the WebSocket cache or fresh REST `/books`/`/book` snapshots. The simulator records public source type, timestamps, source revisions/hashes, snapshot readiness/generation, recent `price_change` deltas, `last_trade_price` prints, `tick_size_change` metadata, request latency/retry/status evidence, and public/network errors. It compares signal-time and fill-time books, skips safely on missing, unready, stale, timeout, or errored public data, and treats deterministic queue/adverse/partial fallback as opt-in when no usable public evidence exists. Completed paper fills store a top-level `simulation` object with `live_public_data`, `inferred`, and `fallback` sections plus fill timestamp, book source, queue inputs, rate-limit/local-pressure evidence, public-depth eligibility, and calibrated slippage metadata. Simulated failures append `paper_portfolio_execution_failed` audit events and do not mutate the portfolio.
+
+Open unmatched inventory stays in the local paper portfolio with cost basis and mark-to-market fields. `run` reconciles public resolution events and Gamma market metadata, settles resolved leftovers to 1/0 when the winner is known, and records `paper_portfolio_settlement` events. `status` remains read-only and now shows pending settlement and latest settlement counters from the saved portfolio/runtime state.
 
 The simulator does not claim private live-order truth. Public CLOB REST `/book` and `/books` snapshots can expose bids, asks, timestamp/hash-style revisions, min order size, tick size, neg-risk, and last-trade fields, and a token may return `404 No orderbook` even when market metadata exists. Public market WebSocket events such as `book`, `price_change`, `last_trade_price`, `tick_size_change`, and optional `best_bid_ask` provide observable book state, level-size changes, trade prints, timestamps, and hashes where present. Public Gamma discovery supplies CLOB token IDs, `orderMinSize`, `orderPriceMinTickSize`, active/closed/accepting-order flags, best bid/ask, and last trade fields. Rate-limit docs describe Cloudflare throttling and endpoint ceilings, but responses may not include granular rate-limit headers; the runner records local request cadence, retries, backoff, status/error outcomes, and documented bucket estimates as evidence. Exact private queue position, private order acceptance/rejection details, cancel lifecycle, and whether a hypothetical paper order would have been maker/taker filled are not observable without private live orders, so those fields are labeled inferred or fallback.
 
@@ -84,8 +86,8 @@ The files below are generated local operational state and are ignored by Git. Tr
 
 - `logs/conditional_arb_scan.log`: human-readable portfolio runner log.
 - `data/paper_portfolio_instance.json`: current cash, equity, realized PnL, costs, executions, inventory, book fingerprints, live-public-data simulation metadata, and run metadata.
-- `data/paper_portfolio_events.jsonl`: append-only portfolio lifecycle, cycle, execution, and simulated execution-failure events.
-- `data/paper_portfolio_runtime.json`: current runner heartbeat, phase, executor and coverage status, warmup/cache counts, REST book-seed progress including active batch telemetry and compact failure samples/categories, WebSocket health counters, dirty WebSocket backlog counters, best-effort runtime write failure counters, last cycle summary, and simulation failure counts.
+- `data/paper_portfolio_events.jsonl`: append-only portfolio lifecycle, cycle, execution, settlement, and simulated execution-failure events.
+- `data/paper_portfolio_runtime.json`: current runner heartbeat, phase, executor and coverage status, warmup/cache counts, REST book-seed progress including active batch telemetry and compact failure samples/categories, WebSocket health counters, dirty WebSocket backlog counters, best-effort runtime write failure counters, last cycle summary, settlement counters, and simulation failure counts.
 - `data/paper_portfolio_instance.json.lock`: local process lock for `run` and `reset --yes`.
 - `data/market_universe_cache.json`: warm-start cache of public tradable market metadata, kept in priority order.
 
@@ -118,9 +120,24 @@ The files below are generated local operational state and are ignored by Git. Tr
 - `COND_ARB_PAPER_SIM_SEED`
 - `COND_ARB_PAPER_LATENCY_MS`
 - `COND_ARB_PAPER_LATENCY_JITTER_MS`
+- `COND_ARB_PAPER_LATENCY_MODE`
+- `COND_ARB_PAPER_LOCAL_TIMEOUT_MS`
+- `COND_ARB_PAPER_TELEMETRY_LATENCY_WINDOW`
+- `COND_ARB_PAPER_LATENCY_JITTER_SEED_SCOPE`
 - `COND_ARB_PAPER_SIGNING_LATENCY_MS`
 - `COND_ARB_PAPER_SETTLEMENT_LATENCY_MS`
 - `COND_ARB_PAPER_MAX_FILL_PRICE_MOVE_BPS`
+- `COND_ARB_PAPER_FILL_ELIGIBILITY_MODE`
+- `COND_ARB_PAPER_ALLOW_TRADE_PRINT_FILL_SUPPORT`
+- `COND_ARB_PAPER_ALLOW_DETERMINISTIC_FILL_FALLBACK`
+- `COND_ARB_PAPER_SETTLEMENT_ENABLED`
+- `COND_ARB_PAPER_SETTLEMENT_SOURCE`
+- `COND_ARB_PAPER_UNMATCHED_OPEN_VALUATION`
+- `COND_ARB_PAPER_SETTLEMENT_REQUIRE_WINNER`
+- `COND_ARB_PAPER_SLIPPAGE_MODE`
+- `COND_ARB_PAPER_SLIPPAGE_MAX_BPS`
+- `COND_ARB_PAPER_SLIPPAGE_LOOKBACK_EVENTS`
+- `COND_ARB_PAPER_SLIPPAGE_COMBINE_MODE`
 - `COND_ARB_PAPER_QUEUE_DEPTH_RATIO`
 - `COND_ARB_PAPER_QUEUE_FILL_PROBABILITY`
 - `COND_ARB_PAPER_PARTIAL_FILL_PROBABILITY`
@@ -136,4 +153,4 @@ The files below are generated local operational state and are ignored by Git. Tr
 - `COND_ARB_PAPER_ADVERSE_PRICE_MOVE_BPS`
 - `POLYMARKET_CLOB_HOST`
 
-`COND_ARB_MARKET_LIMIT=0` means no local validation cap. The WebSocket path is enabled by default; REST `/books` remains in use for startup seeding, added-token backfill, and periodic reconciliation. Paper execution simulation is enabled by default; set `COND_ARB_PAPER_SIMULATION_ENABLED=false`, or leave it enabled and set all friction knobs to zero, to preserve the old optimistic fill behavior.
+`COND_ARB_MARKET_LIMIT=0` means no local validation cap. The WebSocket path is enabled by default; REST `/books` remains in use for startup seeding, added-token backfill, periodic reconciliation, and settlement valuation. Paper execution simulation is enabled by default; set `COND_ARB_PAPER_SIMULATION_ENABLED=false`, or leave it enabled and set all friction knobs to zero, to preserve the old optimistic fill behavior. Deterministic fill fallback is now opt-in.

@@ -211,6 +211,32 @@ def test_public_evidence_snapshot_retains_price_changes_trades_ticks_and_hashes(
     assert token["recent_best_bid_asks"][0]["best_ask"] == 0.49
 
 
+def test_market_resolved_event_is_retained_by_token_and_market():
+    cache = MarketDataCache()
+
+    updated = cache.apply_message(
+        {
+            "event_type": "market_resolved",
+            "market": "m1",
+            "asset_ids": ["yes-token", "no-token"],
+            "winning_asset_id": "yes-token",
+            "winning_outcome": "Yes",
+            "hash": "resolved-hash",
+        },
+        received_at=AS_OF,
+    )
+
+    assert updated == {"yes-token", "no-token"}
+    public = cache.public_evidence_snapshot(["yes-token"])
+    resolved = public["yes-token"]["recent_market_resolved"][0]
+    assert resolved["market_id"] == "m1"
+    assert resolved["winning_asset_id"] == "yes-token"
+    assert resolved["winning_outcome"] == "Yes"
+    assert resolved["source_hash"] == "resolved-hash"
+    by_market = cache.market_resolution_snapshot(["m1"])
+    assert by_market["m1"][0]["winning_asset_id"] == "yes-token"
+
+
 def test_price_change_without_ready_snapshot_is_ignored(caplog):
     cache = MarketDataCache()
     logger = logging.getLogger("test_market_data")

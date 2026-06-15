@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from . import config
 from .arb_models import BinaryMarket, BookLevel, OrderBookSide
@@ -15,7 +15,7 @@ from .event_log import AppendOnlyJsonl, jsonable, utc_iso
 
 EPSILON = 1e-9
 SCHEMA_VERSION = 1
-PORTFOLIO_SCHEMA_VERSION = 1
+PORTFOLIO_SCHEMA_VERSION = 2
 LOGGER = logging.getLogger(__name__)
 
 
@@ -182,10 +182,12 @@ def _cost_breakdown(
     params: PaperPortfolioParams,
     *,
     merge_cost_usd: float | None = None,
+    slippage_bps: float | None = None,
 ) -> dict[str, float]:
+    effective_slippage_bps = params.slippage_buffer_bps if slippage_bps is None else max(0.0, slippage_bps)
     return {
         "fees_usd": gross_cost * params.taker_fee_rate,
-        "slippage_usd": gross_cost * params.slippage_buffer_rate,
+        "slippage_usd": gross_cost * (effective_slippage_bps / 10_000.0),
         "tax_usd": gross_cost * params.tax_rate,
         "merge_usd": params.merge_cost_usd if merge_cost_usd is None else merge_cost_usd,
     }
@@ -195,23 +197,62 @@ def _inventory_rows(state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     rows = state.get("inventory")
     if not isinstance(rows, dict):
         return {}
-    return {
-        str(token_id): dict(row)
-        for token_id, row in rows.items()
-        if isinstance(row, Mapping) and _as_float(row.get("quantity")) > EPSILON
-    }
+    normalized: dict[str, dict[str, Any]] = {}
+    for token_id, row in rows.items():
+        if not isinstance(row, Mapping):
+            continue
+        quantity = _as_float(row.get("quantity"))
+        if quantity <= EPSILON:
+            continue
+        normalized[str(token_id)] = {
+            **dict(row),
+            "token_id": str(row.get("token_id") or token_id),
+            "market_id": str(row.get("market_id") or ""),
+            "condition_id": row.get("condition_id"),
+            "outcome": str(row.get("outcome") or "").upper(),
+            "quantity": quantity,
+            "cost_basis_usd": _as_float(row.get("cost_basis_usd")),
+            "last_valuation_price": _as_float(row.get("last_valuation_price")),
+            "last_valuation_usd": _as_float(row.get("last_valuation_usd")),
+            "last_valuation_source": row.get("last_valuation_source"),
+            "last_valued_at_utc": row.get("last_valued_at_utc"),
+            "pending_settlement": bool(row.get("pending_settlement")),
+        }
+    return normalized
 
 
-def _redeemable_inventory_value(state: Mapping[str, Any]) -> float:
+def _inventory_equity_value(state: Mapping[str, Any]) -> float:
     inventory = _inventory_rows(state)
-    by_market: dict[str, dict[str, float]] = {}
+    by_market: dict[str, dict[str, dict[str, Any]]] = {}
     for row in inventory.values():
         market_id = str(row.get("market_id") or "")
         outcome = str(row.get("outcome") or "").upper()
         if outcome not in {"YES", "NO"}:
             continue
-        by_market.setdefault(market_id, {"YES": 0.0, "NO": 0.0})[outcome] += _as_float(row.get("quantity"))
-    return sum(min(row["YES"], row["NO"]) for row in by_market.values())
+        by_market.setdefault(market_id, {})[outcome] = row
+
+    total = 0.0
+    for grouped in by_market.values():
+        yes_row = grouped.get("YES")
+        no_row = grouped.get("NO")
+        yes_quantity = _as_float(yes_row.get("quantity")) if yes_row is not None else 0.0
+        no_quantity = _as_float(no_row.get("quantity")) if no_row is not None else 0.0
+        paired = min(yes_quantity, no_quantity)
+        if paired > EPSILON:
+            total += paired
+        if yes_row is not None and yes_quantity - paired > EPSILON:
+            total += (yes_quantity - paired) * _as_float(yes_row.get("last_valuation_price"))
+        if no_row is not None and no_quantity - paired > EPSILON:
+            total += (no_quantity - paired) * _as_float(no_row.get("last_valuation_price"))
+    return total
+
+
+def _open_inventory_market_ids(state: Mapping[str, Any]) -> set[str]:
+    return {
+        str(row.get("market_id") or "")
+        for row in _inventory_rows(state).values()
+        if str(row.get("market_id") or "")
+    }
 
 
 def initial_portfolio_state(
@@ -235,6 +276,7 @@ def initial_portfolio_state(
         },
         "executions": [],
         "inventory": {},
+        "settlements": [],
         "book_fingerprints": {},
         "metadata": {
             "created_at_utc": now,
@@ -254,6 +296,7 @@ def _normalized_state(data: Mapping[str, Any], params: PaperPortfolioParams) -> 
     state.setdefault("realized_pnl", _as_float(state.get("cash")) - _as_float(state.get("starting_capital_usd")))
     state.setdefault("executions", [])
     state.setdefault("inventory", {})
+    state.setdefault("settlements", [])
     state.setdefault("book_fingerprints", {})
     state.setdefault("metadata", {})
     costs = state.get("costs") if isinstance(state.get("costs"), Mapping) else {}
@@ -266,7 +309,13 @@ def _normalized_state(data: Mapping[str, Any], params: PaperPortfolioParams) -> 
     state["cash"] = _as_float(state.get("cash"), _as_float(state.get("starting_capital_usd")))
     state["starting_capital_usd"] = _as_float(state.get("starting_capital_usd"), params.starting_capital_usd)
     state["realized_pnl"] = _as_float(state.get("realized_pnl"))
-    state["total_equity"] = state["cash"] + _redeemable_inventory_value(state)
+    state["inventory"] = _inventory_rows(state)
+    state["settlements"] = [
+        dict(row)
+        for row in state.get("settlements", [])
+        if isinstance(row, Mapping)
+    ]
+    state["total_equity"] = state["cash"] + _inventory_equity_value(state)
     return state
 
 
@@ -463,27 +512,100 @@ def _simulation_latency_fields(
     book_fingerprint: str,
     signal_time: datetime,
 ) -> tuple[datetime, dict[str, Any]]:
+    return _simulation_latency_fields_with_requests(
+        simulation,
+        market,
+        book_fingerprint,
+        signal_time,
+        request_records=(),
+    )
+
+
+def _request_latency_samples(request_records: Sequence[Mapping[str, Any]], *, limit: int) -> list[float]:
+    samples = [
+        max(0.0, _as_float(record.get("latency_seconds")) * 1000.0)
+        for record in request_records[-max(1, int(limit)) :]
+        if isinstance(record, Mapping)
+    ]
+    return [sample for sample in samples if sample >= 0.0]
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round((percentile / 100.0) * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def _simulation_latency_seed_parts(
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    book_fingerprint: str,
+    stage: str,
+) -> tuple[Any, ...]:
+    scope = simulation.latency_jitter_seed_scope
+    if scope == "global":
+        return (simulation.seed, stage)
+    if scope == "market":
+        return (simulation.seed, market.market_id, stage)
+    if scope == "market_stage":
+        return (simulation.seed, market.market_id, book_fingerprint, stage)
+    return (simulation.seed, market.market_id, book_fingerprint, stage, market.condition_id)
+
+
+def _simulation_latency_fields_with_requests(
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    book_fingerprint: str,
+    signal_time: datetime,
+    *,
+    request_records: Sequence[Mapping[str, Any]],
+) -> tuple[datetime, dict[str, Any]]:
+    latency_mode = simulation.latency_mode
+    telemetry_samples = _request_latency_samples(request_records, limit=simulation.telemetry_latency_window)
+    telemetry_summary = {
+        "sample_count": len(telemetry_samples),
+        "p50_latency_ms": _percentile(telemetry_samples, 50.0),
+        "p95_latency_ms": _percentile(telemetry_samples, 95.0),
+        "samples_ms": telemetry_samples,
+    }
+    base_latency_ms = max(0.0, simulation.latency_ms)
+    if latency_mode == "telemetry" and telemetry_samples:
+        base_latency_ms = max(base_latency_ms, telemetry_summary["p95_latency_ms"])
     jitter = 0.0
     if simulation.latency_jitter_ms > 0.0:
-        jitter_draw = _stage_random(simulation, market, book_fingerprint, "latency_jitter")
+        jitter_draw = _stable_unit_interval(
+            *_simulation_latency_seed_parts(simulation, market, book_fingerprint, "latency_jitter")
+        )
         jitter = (jitter_draw - 0.5) * 2.0 * simulation.latency_jitter_ms
-    submit_latency_ms = max(0.0, simulation.latency_ms + jitter)
+    submit_latency_ms = max(0.0, base_latency_ms + jitter)
     signing_latency_ms = max(0.0, simulation.signing_latency_ms)
     settlement_latency_ms = max(0.0, simulation.settlement_latency_ms)
     fill_latency_ms = submit_latency_ms + signing_latency_ms
     fill_time = signal_time + timedelta(milliseconds=fill_latency_ms)
     settlement_time = fill_time + timedelta(milliseconds=settlement_latency_ms)
+    timeout_ms = max(0.0, simulation.local_timeout_ms)
     return fill_time, {
         "seed": simulation.seed,
         "enabled": simulation.enabled,
+        "latency_mode": latency_mode,
         "signal_timestamp_utc": utc_iso(signal_time),
+        "base_latency_ms": base_latency_ms,
         "submit_latency_ms": submit_latency_ms,
         "latency_jitter_ms": jitter,
+        "latency_jitter_seed_scope": simulation.latency_jitter_seed_scope,
         "signing_latency_ms": signing_latency_ms,
         "fill_latency_ms": fill_latency_ms,
         "settlement_latency_ms": settlement_latency_ms,
         "fill_timestamp_utc": utc_iso(fill_time),
         "settlement_timestamp_utc": utc_iso(settlement_time),
+        "local_timeout_ms": timeout_ms,
+        "simulated_submit_timestamp_utc": utc_iso(signal_time + timedelta(milliseconds=submit_latency_ms)),
+        "simulated_timeout_timestamp_utc": (
+            utc_iso(signal_time + timedelta(milliseconds=timeout_ms)) if timeout_ms > 0.0 else None
+        ),
+        "telemetry": telemetry_summary,
     }
 
 
@@ -571,10 +693,11 @@ def _observed_queue_decrease(
     token_id: str,
     prices: set[float],
     side_name: str,
-) -> tuple[float, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[float, float, list[dict[str, Any]], list[dict[str, Any]]]:
     price_changes: list[dict[str, Any]] = []
     trade_prints: list[dict[str, Any]] = []
-    size_decrease = 0.0
+    price_change_size = 0.0
+    trade_print_size = 0.0
     for row in _evidence_rows_for_token(evidence.public_price_changes, token_id):
         side = str(row.get("side") or "").lower()
         price = _as_float(row.get("price"))
@@ -583,16 +706,16 @@ def _observed_queue_decrease(
             continue
         price_changes.append(dict(row))
         if delta_size < 0.0:
-            size_decrease += abs(delta_size)
+            price_change_size += abs(delta_size)
     for row in _evidence_rows_for_token(evidence.public_trade_prints, token_id):
         price = _as_float(row.get("price"))
         size = _as_float(row.get("size"))
         if price not in prices or size <= EPSILON:
             continue
         trade_prints.append(dict(row))
-        size_decrease += size
+        trade_print_size += size
     _ = side_name
-    return size_decrease, price_changes, trade_prints
+    return price_change_size, trade_print_size, price_changes, trade_prints
 
 
 def _normalize_fill_time_evidence(
@@ -645,6 +768,316 @@ def _fill_evidence_audit(
     }
 
 
+def _capped_signal_tranches(
+    signal_execution: Mapping[str, Any],
+    *,
+    signal_yes: OrderBookSide,
+    signal_no: OrderBookSide,
+    target_quantity: float,
+) -> tuple[dict[str, float], ...]:
+    details = signal_execution.get("details") if isinstance(signal_execution, Mapping) else None
+    raw_tranches = details.get("tranches") if isinstance(details, Mapping) else None
+    remaining = max(0.0, target_quantity)
+    tranches: list[dict[str, float]] = []
+    if isinstance(raw_tranches, list):
+        for tranche in raw_tranches:
+            if not isinstance(tranche, Mapping):
+                continue
+            tranche_quantity = min(remaining, max(0.0, _as_float(tranche.get("quantity"))))
+            yes_price = _as_float(tranche.get("yes_price"))
+            no_price = _as_float(tranche.get("no_price"))
+            if tranche_quantity <= EPSILON or yes_price <= EPSILON or no_price <= EPSILON:
+                continue
+            tranches.append(
+                {
+                    "quantity": tranche_quantity,
+                    "yes_price": yes_price,
+                    "no_price": no_price,
+                    "unit_gross_cost": _as_float(tranche.get("unit_gross_cost"), yes_price + no_price),
+                }
+            )
+            remaining -= tranche_quantity
+            if remaining <= EPSILON:
+                break
+    if tranches:
+        return tuple(tranches)
+    if target_quantity <= EPSILON or signal_yes.best_price is None or signal_no.best_price is None:
+        return ()
+    return (
+        {
+            "quantity": target_quantity,
+            "yes_price": signal_yes.best_price,
+            "no_price": signal_no.best_price,
+            "unit_gross_cost": signal_yes.best_price + signal_no.best_price,
+        },
+    )
+
+
+def _supported_quantity_for_tranches(
+    book: OrderBookSide,
+    tranches: Sequence[Mapping[str, Any]],
+    *,
+    side: str,
+) -> float:
+    if not tranches:
+        return 0.0
+    levels: list[dict[str, float]] = [
+        {"price": level.price, "size": level.size}
+        for level in book.levels
+    ]
+    level_index = 0
+    supported = 0.0
+    price_key = f"{side}_price"
+    for tranche in tranches:
+        remaining = _as_float(tranche.get("quantity"))
+        price_limit = _as_float(tranche.get(price_key))
+        if remaining <= EPSILON or price_limit <= EPSILON:
+            continue
+        while remaining > EPSILON and level_index < len(levels):
+            level = levels[level_index]
+            if level["price"] > price_limit + EPSILON:
+                return supported
+            take = min(remaining, max(0.0, level["size"]))
+            if take > EPSILON:
+                supported += take
+                remaining -= take
+                level["size"] -= take
+            if level["size"] <= EPSILON:
+                level_index += 1
+            elif take <= EPSILON:
+                break
+        if remaining > EPSILON:
+            return supported
+    return supported
+
+
+def _book_with_support(
+    book: OrderBookSide,
+    additions_by_price: Mapping[float, float],
+    *,
+    source_suffix: str,
+) -> OrderBookSide:
+    if not additions_by_price:
+        return book
+    merged = {level.price: level.size for level in book.levels}
+    for price, size in additions_by_price.items():
+        if price <= EPSILON or size <= EPSILON:
+            continue
+        merged[price] = merged.get(price, 0.0) + size
+    levels = [BookLevel(price=price, size=size) for price, size in merged.items() if size > EPSILON]
+    levels.sort(key=lambda level: level.price, reverse=(book.side == "bid"))
+    return _copy_book_with_levels(book, levels, source_suffix=source_suffix)
+
+
+def _fill_eligibility_for_leg(
+    *,
+    simulation: config.PaperExecutionSimulationConfig,
+    token_id: str,
+    side_name: str,
+    signal_book: OrderBookSide,
+    fill_book: OrderBookSide,
+    signal_execution: Mapping[str, Any],
+    evidence: FillTimeBookEvidence,
+    tranches: Sequence[Mapping[str, Any]],
+    target_quantity: float,
+) -> tuple[OrderBookSide, float, dict[str, Any]]:
+    intended_prices = _intended_prices(signal_execution.get("details"), side_name)
+    if not intended_prices and signal_book.best_price is not None:
+        intended_prices.add(signal_book.best_price)
+    queue_ahead = _queue_ahead_at_prices(signal_book, intended_prices)
+    price_change_size, trade_print_size, price_deltas, trade_prints = _observed_queue_decrease(
+        evidence,
+        token_id=token_id,
+        prices=intended_prices,
+        side_name=side_name,
+    )
+    depth_supported_quantity = min(target_quantity, _supported_quantity_for_tranches(fill_book, tranches, side=side_name))
+    additions_by_price: dict[float, float] = {}
+    for row in price_deltas:
+        price = _as_float(row.get("price"))
+        delta_size = abs(min(0.0, _as_float(row.get("delta_size"))))
+        if price > EPSILON and delta_size > EPSILON:
+            additions_by_price[price] = additions_by_price.get(price, 0.0) + delta_size
+    trade_print_support_applied = False
+    if (
+        simulation.allow_trade_print_fill_support
+        and trade_print_size > EPSILON
+        and (depth_supported_quantity > EPSILON or price_change_size > EPSILON)
+    ):
+        trade_print_support_applied = True
+        for row in trade_prints:
+            price = _as_float(row.get("price"))
+            size = _as_float(row.get("size"))
+            if price > EPSILON and size > EPSILON:
+                additions_by_price[price] = additions_by_price.get(price, 0.0) + size
+    augmented_book = _book_with_support(fill_book, additions_by_price, source_suffix="public_support")
+    supported_quantity = min(target_quantity, _supported_quantity_for_tranches(augmented_book, tranches, side=side_name))
+    trade_only = depth_supported_quantity <= EPSILON and price_change_size <= EPSILON and trade_print_size > EPSILON
+    source = "none"
+    if supported_quantity >= target_quantity - EPSILON and depth_supported_quantity >= target_quantity - EPSILON:
+        source = "strict_public_depth"
+    elif supported_quantity > depth_supported_quantity + EPSILON and price_change_size > EPSILON:
+        source = "public_depth_plus_price_change"
+    elif supported_quantity > depth_supported_quantity + EPSILON and trade_print_support_applied:
+        source = "public_depth_plus_trade_print"
+    elif supported_quantity > EPSILON and depth_supported_quantity > EPSILON:
+        source = "partial_public_depth"
+    elif supported_quantity > EPSILON and price_change_size > EPSILON:
+        source = "price_change_support_only"
+    elif trade_only:
+        source = "trade_print_only"
+    return augmented_book, supported_quantity, {
+        "source": source,
+        "target_quantity": target_quantity,
+        "supported_quantity": supported_quantity,
+        "depth_supported_quantity": depth_supported_quantity,
+        "price_change_supported_quantity": price_change_size,
+        "trade_print_supported_quantity": trade_print_size if trade_print_support_applied else 0.0,
+        "trade_print_observed_quantity": trade_print_size,
+        "trade_print_support_applied": trade_print_support_applied,
+        "trade_print_only": trade_only,
+        "intended_prices": sorted(intended_prices),
+        "queue_ahead_at_signal": queue_ahead,
+        "price_delta_evidence": price_deltas,
+        "trade_print_evidence": trade_prints,
+        "fill_book_available_depth": fill_book.available_size,
+        "augmented_fill_book_available_depth": augmented_book.available_size,
+    }
+
+
+def _latest_best_bid_ask(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    filtered = [row for row in rows if isinstance(row, Mapping)]
+    return filtered[-1] if filtered else None
+
+
+def _calibrated_slippage(
+    *,
+    params: PaperPortfolioParams,
+    simulation: config.PaperExecutionSimulationConfig,
+    market: BinaryMarket,
+    quantity: float,
+    yes_book: OrderBookSide,
+    no_book: OrderBookSide,
+    signal_execution: Mapping[str, Any],
+    evidence: FillTimeBookEvidence | None,
+    as_of: datetime,
+) -> tuple[float, dict[str, Any]]:
+    base_bps = max(0.0, params.slippage_buffer_bps)
+    metadata = {
+        "mode": simulation.slippage_mode,
+        "base_bps": base_bps,
+        "combine_mode": simulation.slippage_combine_mode,
+        "calibrated_bps": 0.0,
+        "final_bps": base_bps,
+        "cap_bps": simulation.slippage_max_bps,
+        "capped": False,
+        "legs": {},
+    }
+    if simulation.slippage_mode != "fixed_plus_calibrated" or quantity <= EPSILON or evidence is None:
+        return base_bps, metadata
+
+    tranches = _capped_signal_tranches(
+        signal_execution,
+        signal_yes=yes_book,
+        signal_no=no_book,
+        target_quantity=quantity,
+    )
+    legs: dict[str, Any] = {}
+    calibrated_values: list[float] = []
+    for side_name, token_id, book in (
+        ("yes", market.yes_token_id, yes_book),
+        ("no", market.no_token_id, no_book),
+    ):
+        bba = _latest_best_bid_ask(
+            _evidence_rows_for_token(
+                evidence.best_bid_asks,
+                token_id,
+            )[-simulation.slippage_lookback_events :]
+        )
+        best_bid = _as_float(bba.get("best_bid")) if isinstance(bba, Mapping) else 0.0
+        best_ask = _as_float(bba.get("best_ask")) if isinstance(bba, Mapping) else _as_float(book.best_price)
+        midpoint = (best_bid + best_ask) / 2.0 if best_bid > EPSILON and best_ask > EPSILON else max(best_bid, best_ask)
+        spread_bps = (
+            ((best_ask - best_bid) / midpoint) * 10_000.0
+            if midpoint > EPSILON and best_ask > EPSILON and best_bid > EPSILON and best_ask >= best_bid
+            else 0.0
+        )
+        supported_depth = max(EPSILON, _supported_quantity_for_tranches(book, tranches, side=side_name))
+        depth_ratio = quantity / supported_depth
+        lookback_prices = [
+            _as_float(row.get("price"))
+            for row in _evidence_rows_for_token(evidence.public_price_changes, token_id)[
+                -simulation.slippage_lookback_events :
+            ]
+            if _as_float(row.get("price")) > EPSILON
+        ]
+        lookback_prices.extend(
+            _as_float(row.get("price"))
+            for row in _evidence_rows_for_token(evidence.public_trade_prints, token_id)[
+                -simulation.slippage_lookback_events :
+            ]
+            if _as_float(row.get("price")) > EPSILON
+        )
+        intended_prices = _intended_prices(signal_execution.get("details"), side_name)
+        intended_price = max(intended_prices) if intended_prices else _as_float(book.best_price)
+        observed_move_bps = 0.0
+        if intended_price > EPSILON and lookback_prices:
+            observed_move_bps = max(0.0, ((max(lookback_prices) - intended_price) / intended_price) * 10_000.0)
+        recent_trade_sizes = [
+            _as_float(row.get("size"))
+            for row in _evidence_rows_for_token(evidence.public_trade_prints, token_id)[
+                -simulation.slippage_lookback_events :
+            ]
+            if _as_float(row.get("size")) > EPSILON
+        ]
+        avg_trade_size = sum(recent_trade_sizes) / len(recent_trade_sizes) if recent_trade_sizes else 0.0
+        trade_pressure = quantity / avg_trade_size if avg_trade_size > EPSILON else 1.0
+        stale_age = _stale_seconds(book, as_of) or 0.0
+        age_ratio = stale_age / max(params.max_book_age_seconds, 1.0)
+        request_records = list(evidence.request_records)[-simulation.slippage_lookback_events :]
+        retry_count = sum(max(0, int(_as_float(record.get("retries")))) for record in request_records)
+        error_count = sum(1 for record in request_records if record.get("error"))
+        latency_seconds = max((_as_float(record.get("latency_seconds")) for record in request_records), default=0.0)
+        multiplier = 1.0 + max(0.0, age_ratio * 0.25) + (retry_count * 0.10) + (error_count * 0.15) + (
+            latency_seconds * 0.10
+        )
+        leg_bps = (
+            (spread_bps * 0.50)
+            + (max(0.0, depth_ratio - 1.0) * 25.0)
+            + (observed_move_bps * 0.35)
+            + (max(0.0, trade_pressure - 1.0) * 5.0)
+        ) * multiplier
+        leg_bps = min(max(0.0, leg_bps), max(0.0, simulation.slippage_max_bps))
+        legs[side_name] = {
+            "spread_bps": spread_bps,
+            "depth_ratio": depth_ratio,
+            "observed_price_move_bps": observed_move_bps,
+            "average_trade_size": avg_trade_size,
+            "trade_pressure": trade_pressure,
+            "stale_age_seconds": stale_age,
+            "retry_count": retry_count,
+            "error_count": error_count,
+            "latency_seconds": latency_seconds,
+            "calibrated_bps": leg_bps,
+        }
+        calibrated_values.append(leg_bps)
+    calibrated_bps = min(max(calibrated_values or [0.0]), max(0.0, simulation.slippage_max_bps))
+    final_bps = (
+        max(base_bps, calibrated_bps)
+        if simulation.slippage_combine_mode == "max"
+        else min(max(0.0, simulation.slippage_max_bps), base_bps + calibrated_bps)
+    )
+    metadata.update(
+        {
+            "calibrated_bps": calibrated_bps,
+            "final_bps": final_bps,
+            "capped": calibrated_bps >= simulation.slippage_max_bps - EPSILON,
+            "legs": legs,
+        }
+    )
+    return final_bps, metadata
+
+
 def _finalize_execution_from_books(
     market: BinaryMarket,
     yes_asks: OrderBookSide,
@@ -656,6 +1089,7 @@ def _finalize_execution_from_books(
     max_quantity: float | None,
     simulation_metadata: dict[str, Any],
     signal_execution: Mapping[str, Any],
+    evidence: FillTimeBookEvidence | None = None,
     side_fill_quantities: Mapping[str, float] | None = None,
 ) -> PaperPortfolioDecision:
     cash = _as_float(state.get("cash"), params.starting_capital_usd)
@@ -723,7 +1157,19 @@ def _finalize_execution_from_books(
                 max_fill_price_move_bps=params.simulation.max_fill_price_move_bps,
             )
 
-    full_fill_costs = _cost_breakdown(gross_cost, params)
+    effective_slippage_bps, slippage_metadata = _calibrated_slippage(
+        params=params,
+        simulation=params.simulation,
+        market=market,
+        quantity=quantity,
+        yes_book=yes_asks,
+        no_book=no_asks,
+        signal_execution=signal_execution,
+        evidence=evidence,
+        as_of=as_of,
+    )
+    simulation_metadata["slippage"] = slippage_metadata
+    full_fill_costs = _cost_breakdown(gross_cost, params, slippage_bps=effective_slippage_bps)
     full_fill_capital_used = gross_cost + sum(full_fill_costs.values())
     full_fill_net_profit = quantity - full_fill_capital_used
     full_fill_net_return_bps = (
@@ -784,7 +1230,12 @@ def _finalize_execution_from_books(
     gross_cost = yes_actual_cost + no_actual_cost
     matched_quantity = min(yes_filled_quantity, no_filled_quantity)
     merge_cost = params.merge_cost_usd if matched_quantity > EPSILON else 0.0
-    costs = _cost_breakdown(gross_cost, params, merge_cost_usd=merge_cost)
+    costs = _cost_breakdown(
+        gross_cost,
+        params,
+        merge_cost_usd=merge_cost,
+        slippage_bps=effective_slippage_bps,
+    )
     capital_used = gross_cost + sum(costs.values())
     redeemed_value = matched_quantity
     net_profit = redeemed_value - capital_used
@@ -835,6 +1286,7 @@ def _finalize_execution_from_books(
         "redeemed_value": redeemed_value,
         "net_profit": net_profit,
         "net_return_bps": net_return_bps,
+        "effective_slippage_bps": effective_slippage_bps,
         "trade_ceiling_usd": params.trade_ceiling_usd,
         "ceiling_used_usd": capital_used,
         "stop_reason": stop_reason,
@@ -1142,13 +1594,13 @@ def _public_queue_fill_metadata(
 
     queue_ahead_yes = _queue_ahead_at_prices(signal_yes, prices["yes"])
     queue_ahead_no = _queue_ahead_at_prices(signal_no, prices["no"])
-    yes_decrease, yes_deltas, yes_trades = _observed_queue_decrease(
+    yes_price_change_size, yes_trade_size, yes_deltas, yes_trades = _observed_queue_decrease(
         evidence,
         token_id=market.yes_token_id,
         prices=prices["yes"],
         side_name="yes",
     )
-    no_decrease, no_deltas, no_trades = _observed_queue_decrease(
+    no_price_change_size, no_trade_size, no_deltas, no_trades = _observed_queue_decrease(
         evidence,
         token_id=market.no_token_id,
         prices=prices["no"],
@@ -1159,11 +1611,11 @@ def _public_queue_fill_metadata(
     side_fill_quantities: dict[str, float] | None = None
     if has_public_evidence:
         side_fill_quantities = {
-            "yes": min(target_quantity, max(0.0, yes_decrease)),
-            "no": min(target_quantity, max(0.0, no_decrease)),
+            "yes": min(target_quantity, max(0.0, yes_price_change_size + yes_trade_size)),
+            "no": min(target_quantity, max(0.0, no_price_change_size + no_trade_size)),
         }
     metadata = {
-        "source": "public_trade_delta_evidence" if has_public_evidence else "deterministic_depth_fallback",
+        "source": "public_trade_delta_evidence" if has_public_evidence else "no_public_queue_evidence",
         "intended_prices": {
             "yes": sorted(prices["yes"]),
             "no": sorted(prices["no"]),
@@ -1172,9 +1624,17 @@ def _public_queue_fill_metadata(
             "yes": queue_ahead_yes,
             "no": queue_ahead_no,
         },
-        "observed_public_size_decrease": {
-            "yes": yes_decrease,
-            "no": no_decrease,
+        "observed_public_support": {
+            "yes": yes_price_change_size + yes_trade_size,
+            "no": no_price_change_size + no_trade_size,
+        },
+        "observed_price_change_size_decrease": {
+            "yes": yes_price_change_size,
+            "no": no_price_change_size,
+        },
+        "observed_trade_print_size": {
+            "yes": yes_trade_size,
+            "no": no_trade_size,
         },
         "price_delta_evidence": {
             "yes": yes_deltas,
@@ -1252,6 +1712,14 @@ def evaluate_binary_paper_execution(
             observed_at=signal_time,
             fallback_reason="no_fill_time_public_reader",
         )
+    fill_time, telemetry_latency_metadata = _simulation_latency_fields_with_requests(
+        simulation,
+        market,
+        signal_fingerprint,
+        signal_time,
+        request_records=evidence.request_records,
+    )
+    simulation_metadata.update(telemetry_latency_metadata)
     fill_yes = evidence.yes_book
     fill_no = evidence.no_book
     simulation_metadata["book_source"] = evidence.source
@@ -1261,6 +1729,15 @@ def evaluate_binary_paper_execution(
             "book_comparison": _signal_fill_book_comparison(yes_asks, no_asks, fill_yes, fill_no),
         }
     )
+
+    if evidence.fallback_reason and not simulation.allow_deterministic_fill_fallback:
+        return _simulation_failure_decision(
+            "simulation_no_fill_time_public_source",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            fallback_reason=evidence.fallback_reason,
+        )
 
     if evidence.public_error or evidence.errors:
         return _simulation_failure_decision(
@@ -1276,7 +1753,7 @@ def evaluate_binary_paper_execution(
     unready_tokens = [token_id for token_id, ready in ready_flags.items() if not ready]
     if unready_tokens:
         return _simulation_failure_decision(
-            "simulation_unready_fill_time_book",
+            "simulation_ws_stale_fill_window" if evidence.source == "ws_cache" else "simulation_unready_fill_time_book",
             market=market,
             simulation=simulation_metadata,
             book_fingerprint=signal_fingerprint,
@@ -1293,6 +1770,23 @@ def evaluate_binary_paper_execution(
             no_book_present=fill_no is not None,
         )
 
+    timeout_ms = max(0.0, simulation.local_timeout_ms)
+    if timeout_ms > 0.0:
+        timed_out_records = [
+            dict(record)
+            for record in evidence.request_records
+            if _as_float(record.get("latency_seconds")) * 1000.0 > timeout_ms + EPSILON
+        ]
+        if timed_out_records:
+            return _simulation_failure_decision(
+                "simulation_local_timeout",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=signal_fingerprint,
+                timed_out_requests=timed_out_records,
+                local_timeout_ms=timeout_ms,
+            )
+
     for label, book in (("yes", fill_yes), ("no", fill_no)):
         age = _stale_seconds(book, fill_time)
         if age is not None and (age < -EPSILON or age > params.max_book_age_seconds):
@@ -1305,6 +1799,33 @@ def evaluate_binary_paper_execution(
                 age_seconds=age,
                 max_age_seconds=params.max_book_age_seconds,
             )
+
+    if simulation.max_fill_price_move_bps > 0.0:
+        fill_quantity, fill_yes_cost, fill_no_cost, _, _ = _simulate_paired_tranches(
+            fill_yes,
+            fill_no,
+            cash=_as_float(state.get("cash"), params.starting_capital_usd),
+            params=params,
+            max_quantity=target_quantity,
+        )
+        signal_quantity = _as_float(signal_execution.get("quantity"))
+        signal_gross_cost = _as_float(signal_execution.get("gross_cost"))
+        fill_gross_cost = fill_yes_cost + fill_no_cost
+        if fill_quantity > EPSILON and signal_quantity > EPSILON and signal_gross_cost > EPSILON:
+            signal_unit_cost = signal_gross_cost / signal_quantity
+            fill_unit_cost = fill_gross_cost / fill_quantity
+            move_bps = ((fill_unit_cost - signal_unit_cost) / signal_unit_cost) * 10_000.0
+            simulation_metadata["price_move_bps"] = move_bps
+            if move_bps > simulation.max_fill_price_move_bps + EPSILON:
+                return _simulation_failure_decision(
+                    "simulation_fill_price_moved",
+                    market=market,
+                    simulation=simulation_metadata,
+                    book_fingerprint=signal_fingerprint,
+                    signal_unit_cost=signal_unit_cost,
+                    fill_unit_cost=fill_unit_cost,
+                    max_fill_price_move_bps=simulation.max_fill_price_move_bps,
+                )
 
     throttle_probability, pressure_metadata = _local_pressure_failure_probability(simulation, evidence)
     throttle_draw = _stage_random(simulation, market, signal_fingerprint, "local_public_pressure")
@@ -1331,7 +1852,52 @@ def evaluate_binary_paper_execution(
                 min_quantity=market.effective_min_order_size,
             )
 
-    queue_metadata, side_fill_quantities = _public_queue_fill_metadata(
+    tranches = _capped_signal_tranches(
+        signal_execution,
+        signal_yes=yes_asks,
+        signal_no=no_asks,
+        target_quantity=target_quantity,
+    )
+    public_fill_yes, yes_supported_quantity, yes_eligibility = _fill_eligibility_for_leg(
+        simulation=simulation,
+        token_id=market.yes_token_id,
+        side_name="yes",
+        signal_book=yes_asks,
+        fill_book=fill_yes,
+        signal_execution=signal_execution,
+        evidence=evidence,
+        tranches=tranches,
+        target_quantity=target_quantity,
+    )
+    public_fill_no, no_supported_quantity, no_eligibility = _fill_eligibility_for_leg(
+        simulation=simulation,
+        token_id=market.no_token_id,
+        side_name="no",
+        signal_book=no_asks,
+        fill_book=fill_no,
+        signal_execution=signal_execution,
+        evidence=evidence,
+        tranches=tranches,
+        target_quantity=target_quantity,
+    )
+    side_fill_quantities = {"yes": yes_supported_quantity, "no": no_supported_quantity}
+    simulation_metadata["fill_eligibility"] = {
+        "mode": simulation.fill_eligibility_mode,
+        "yes": yes_eligibility,
+        "no": no_eligibility,
+    }
+    simulation_metadata["queue"] = {
+        "applied": True,
+        "source": "public_fill_eligibility",
+        "yes": yes_eligibility,
+        "no": no_eligibility,
+    }
+    simulation_metadata["inferred"]["queue"] = {
+        "yes_source": yes_eligibility["source"],
+        "no_source": no_eligibility["source"],
+    }
+
+    queue_metadata, queue_side_fill_quantities = _public_queue_fill_metadata(
         market,
         yes_asks,
         no_asks,
@@ -1340,73 +1906,17 @@ def evaluate_binary_paper_execution(
         signal_execution,
         evidence,
     )
-    simulation_metadata["queue"] = {
-        "applied": True,
-        "depth_ratio": simulation.queue_depth_ratio if queue_metadata["source"].endswith("_fallback") else None,
-        "fill_probability": simulation.queue_fill_probability,
-        "fill_draw": _stage_random(simulation, market, signal_fingerprint, "queue_fill"),
-        **queue_metadata,
-    }
-    simulation_metadata["inferred"]["queue"] = queue_metadata
+    simulation_metadata["queue"]["public_queue_evidence"] = queue_metadata
+    simulation_metadata["inferred"]["queue"]["public_queue_source"] = queue_metadata["source"]
 
-    working_fill_yes = fill_yes
-    working_fill_no = fill_no
-    if queue_metadata["source"].endswith("_fallback") and simulation.queue_depth_ratio > 0.0:
-        simulation_metadata["fallback"]["queue"] = queue_metadata
-        working_fill_yes = _scale_book_depth(working_fill_yes, simulation.queue_depth_ratio)
-        working_fill_no = _scale_book_depth(working_fill_no, simulation.queue_depth_ratio)
-        queued_signal_quantity, _, _, _, _ = _simulate_paired_tranches(
-            working_fill_yes,
-            working_fill_no,
-            cash=_as_float(state.get("cash"), params.starting_capital_usd),
-            params=params,
-            max_quantity=target_quantity,
-        )
-        if queued_signal_quantity + EPSILON < market.effective_min_order_size:
-            return _simulation_failure_decision(
-                "simulation_queue_min_size",
-                market=market,
-                simulation=simulation_metadata,
-                book_fingerprint=signal_fingerprint,
-                available_equal_depth=queued_signal_quantity,
-                min_quantity=market.effective_min_order_size,
-            )
-        if (
-            simulation.queue_fill_probability > 0.0
-            and simulation_metadata["queue"]["fill_draw"] > simulation.queue_fill_probability
-        ):
-            return _simulation_failure_decision(
-                "simulation_queue_unfilled",
-                market=market,
-                simulation=simulation_metadata,
-                book_fingerprint=signal_fingerprint,
-                fill_probability=simulation.queue_fill_probability,
-            )
-
-    if simulation.adverse_selection_probability > 0.0:
-        adverse_draw = _stage_random(simulation, market, signal_fingerprint, "adverse_selection")
-        adverse_applied = adverse_draw <= simulation.adverse_selection_probability
-        simulation_metadata["adverse_selection"] = {
-            "source": "deterministic_adverse_selection_fallback",
-            "applied": adverse_applied,
-            "draw": adverse_draw,
-            "probability": simulation.adverse_selection_probability,
-            "depth_removal_ratio": simulation.adverse_depth_removal_ratio if adverse_applied else 0.0,
-            "price_move_bps": simulation.adverse_price_move_bps if adverse_applied else 0.0,
-        }
-        simulation_metadata["fallback"]["adverse_selection"] = simulation_metadata["adverse_selection"]
-        if adverse_applied:
-            working_fill_yes = _adverse_adjust_book(
-                working_fill_yes,
-                removal_ratio=simulation.adverse_depth_removal_ratio,
-                price_move_bps=simulation.adverse_price_move_bps,
-            )
-            working_fill_no = _adverse_adjust_book(
-                working_fill_no,
-                removal_ratio=simulation.adverse_depth_removal_ratio,
-                price_move_bps=simulation.adverse_price_move_bps,
-            )
-    else:
+    working_fill_yes = public_fill_yes
+    working_fill_no = public_fill_no
+    public_support_available = (
+        not evidence.fallback_reason
+        and yes_supported_quantity > EPSILON
+        and no_supported_quantity > EPSILON
+    )
+    if public_support_available:
         simulation_metadata["adverse_selection"] = {
             "source": "disabled",
             "applied": False,
@@ -1414,6 +1924,104 @@ def evaluate_binary_paper_execution(
             "depth_removal_ratio": 0.0,
             "price_move_bps": 0.0,
         }
+        if queue_side_fill_quantities is not None:
+            side_fill_quantities = queue_side_fill_quantities
+        else:
+            side_fill_quantities = None
+        for side_name, supported_quantity in (side_fill_quantities or {}).items():
+            if supported_quantity > EPSILON and supported_quantity + EPSILON < market.effective_min_order_size:
+                return _simulation_failure_decision(
+                    "simulation_public_fill_below_min_size",
+                    market=market,
+                    simulation=simulation_metadata,
+                    book_fingerprint=signal_fingerprint,
+                    side=side_name,
+                    supported_quantity=supported_quantity,
+                    min_quantity=market.effective_min_order_size,
+                )
+    elif not simulation.allow_deterministic_fill_fallback:
+        return _simulation_failure_decision(
+            "simulation_insufficient_public_fill_evidence",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=signal_fingerprint,
+            yes_supported_quantity=yes_supported_quantity,
+            no_supported_quantity=no_supported_quantity,
+        )
+    else:
+        side_fill_quantities = None
+        fallback_queue_metadata = dict(queue_metadata)
+        fallback_queue_metadata["source"] = "deterministic_depth_fallback"
+        simulation_metadata["queue"] = {
+            "applied": True,
+            "depth_ratio": simulation.queue_depth_ratio,
+            "fill_probability": simulation.queue_fill_probability,
+            "fill_draw": _stage_random(simulation, market, signal_fingerprint, "queue_fill"),
+            **fallback_queue_metadata,
+        }
+        simulation_metadata["fallback"]["queue"] = fallback_queue_metadata
+        if simulation.queue_depth_ratio > 0.0:
+            working_fill_yes = _scale_book_depth(working_fill_yes, simulation.queue_depth_ratio)
+            working_fill_no = _scale_book_depth(working_fill_no, simulation.queue_depth_ratio)
+            queued_signal_quantity, _, _, _, _ = _simulate_paired_tranches(
+                working_fill_yes,
+                working_fill_no,
+                cash=_as_float(state.get("cash"), params.starting_capital_usd),
+                params=params,
+                max_quantity=target_quantity,
+            )
+            if queued_signal_quantity + EPSILON < market.effective_min_order_size:
+                return _simulation_failure_decision(
+                    "simulation_queue_min_size",
+                    market=market,
+                    simulation=simulation_metadata,
+                    book_fingerprint=signal_fingerprint,
+                    available_equal_depth=queued_signal_quantity,
+                    min_quantity=market.effective_min_order_size,
+                )
+            if (
+                simulation.queue_fill_probability > 0.0
+                and simulation_metadata["queue"]["fill_draw"] > simulation.queue_fill_probability
+            ):
+                return _simulation_failure_decision(
+                    "simulation_queue_unfilled",
+                    market=market,
+                    simulation=simulation_metadata,
+                    book_fingerprint=signal_fingerprint,
+                    fill_probability=simulation.queue_fill_probability,
+                )
+
+        if simulation.adverse_selection_probability > 0.0:
+            adverse_draw = _stage_random(simulation, market, signal_fingerprint, "adverse_selection")
+            adverse_applied = adverse_draw <= simulation.adverse_selection_probability
+            simulation_metadata["adverse_selection"] = {
+                "source": "deterministic_adverse_selection_fallback",
+                "applied": adverse_applied,
+                "draw": adverse_draw,
+                "probability": simulation.adverse_selection_probability,
+                "depth_removal_ratio": simulation.adverse_depth_removal_ratio if adverse_applied else 0.0,
+                "price_move_bps": simulation.adverse_price_move_bps if adverse_applied else 0.0,
+            }
+            simulation_metadata["fallback"]["adverse_selection"] = simulation_metadata["adverse_selection"]
+            if adverse_applied:
+                working_fill_yes = _adverse_adjust_book(
+                    working_fill_yes,
+                    removal_ratio=simulation.adverse_depth_removal_ratio,
+                    price_move_bps=simulation.adverse_price_move_bps,
+                )
+                working_fill_no = _adverse_adjust_book(
+                    working_fill_no,
+                    removal_ratio=simulation.adverse_depth_removal_ratio,
+                    price_move_bps=simulation.adverse_price_move_bps,
+                )
+        else:
+            simulation_metadata["adverse_selection"] = {
+                "source": "disabled",
+                "applied": False,
+                "probability": 0.0,
+                "depth_removal_ratio": 0.0,
+                "price_move_bps": 0.0,
+            }
 
     legacy_failure = _legacy_probability_failure(simulation, market, signal_fingerprint)
     if legacy_failure is not None:
@@ -1439,6 +2047,7 @@ def evaluate_binary_paper_execution(
         max_quantity=target_quantity,
         simulation_metadata=simulation_metadata,
         signal_execution=signal_execution,
+        evidence=evidence,
         side_fill_quantities=side_fill_quantities,
     )
 
@@ -1481,9 +2090,15 @@ class PaperPortfolio:
 
     def _prepare_state_for_save(self, state: dict[str, Any]) -> None:
         state["cash"] = _as_float(state.get("cash"), self.params.starting_capital_usd)
-        state["total_equity"] = state["cash"] + _redeemable_inventory_value(state)
+        state["inventory"] = _inventory_rows(state)
+        state["total_equity"] = state["cash"] + _inventory_equity_value(state)
         metadata = state.setdefault("metadata", {})
         if isinstance(metadata, dict):
+            metadata["pending_settlement_count"] = sum(
+                1 for row in _inventory_rows(state).values() if bool(row.get("pending_settlement"))
+            )
+            settlements = state.get("settlements") if isinstance(state.get("settlements"), list) else []
+            metadata["settlements_applied_count"] = len(settlements)
             metadata["updated_at_utc"] = utc_iso()
 
     def _save_state(self, state: dict[str, Any]) -> None:
@@ -1538,10 +2153,12 @@ class PaperPortfolio:
         trade_count = len(executions)
         starting_capital = _as_float(state.get("starting_capital_usd"), self.params.starting_capital_usd)
         cash = _as_float(state.get("cash"), starting_capital)
-        equity = cash + _redeemable_inventory_value(state)
+        equity = cash + _inventory_equity_value(state)
         costs = state.get("costs") if isinstance(state.get("costs"), Mapping) else {}
         inventory = list(_inventory_rows(state).values())
         last_execution = executions[-1].get("executed_at_utc") if executions else None
+        settlements = state.get("settlements") if isinstance(state.get("settlements"), list) else []
+        last_settlement = settlements[-1].get("settled_at_utc") if settlements else None
         return {
             "starting_capital_usd": starting_capital,
             "cash": cash,
@@ -1559,8 +2176,224 @@ class PaperPortfolio:
                 "merge_usd": _as_float(costs.get("merge_usd") if isinstance(costs, Mapping) else None),
             },
             "last_execution_at_utc": last_execution,
+            "pending_settlement_count": sum(1 for row in inventory if bool(row.get("pending_settlement"))),
+            "settlements_applied_count": len(settlements),
+            "last_settlement_at_utc": last_settlement,
             "unmatched_inventory": inventory,
         }
+
+    def open_inventory_market_ids(self) -> set[str]:
+        if not self.state:
+            self.load()
+        return _open_inventory_market_ids(self.state)
+
+    def reconcile_public_markets(
+        self,
+        *,
+        markets_by_id: Mapping[str, BinaryMarket],
+        resolution_events_by_market: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+        valuation_snapshots_by_token: Mapping[str, Mapping[str, Any]] | None = None,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not self.state:
+            self.load()
+        base_state = deepcopy(self.state)
+        working_state = deepcopy(self.state)
+        now = _ensure_aware(as_of or _utc_now())
+        inventory = working_state.get("inventory")
+        if not isinstance(inventory, dict):
+            inventory = {}
+            working_state["inventory"] = inventory
+        settlements = working_state.setdefault("settlements", [])
+        if not isinstance(settlements, list):
+            settlements = []
+            working_state["settlements"] = settlements
+        existing_keys = {
+            str(row.get("settlement_key"))
+            for row in settlements
+            if isinstance(row, Mapping) and row.get("settlement_key") not in (None, "")
+        }
+
+        resolution_events = resolution_events_by_market or {}
+        valuation_snapshots = valuation_snapshots_by_token or {}
+        settlement_records: list[dict[str, Any]] = []
+        pending_settlement_count = 0
+        changed = False
+
+        def latest_resolution_row(market_id: str) -> Mapping[str, Any] | None:
+            rows = resolution_events.get(market_id)
+            if isinstance(rows, Sequence) and rows:
+                for row in reversed(rows):
+                    if isinstance(row, Mapping):
+                        return row
+            return None
+
+        def valuation_for_token(token_id: str) -> tuple[float, str]:
+            snapshot = valuation_snapshots.get(token_id)
+            if not isinstance(snapshot, Mapping):
+                return 0.0, "zero"
+            books = snapshot.get("books") if isinstance(snapshot.get("books"), Mapping) else {}
+            best_bid = 0.0
+            best_ask = 0.0
+            recent_bba = snapshot.get("recent_best_bid_asks")
+            if isinstance(recent_bba, list) and recent_bba:
+                last_bba = recent_bba[-1]
+                if isinstance(last_bba, Mapping):
+                    best_bid = _as_float(last_bba.get("best_bid"))
+                    best_ask = _as_float(last_bba.get("best_ask"))
+            if best_bid <= EPSILON and isinstance(books.get("bid"), Mapping):
+                best_bid = _as_float(books["bid"].get("best_price"))
+            if best_ask <= EPSILON and isinstance(books.get("ask"), Mapping):
+                best_ask = _as_float(books["ask"].get("best_price"))
+            if self.params.simulation.unmatched_open_valuation == "best_bid_midpoint_or_zero":
+                if best_bid > EPSILON and best_ask > EPSILON:
+                    return (best_bid + best_ask) / 2.0, "best_bid_midpoint"
+                if best_bid > EPSILON:
+                    return best_bid, "best_bid"
+            return 0.0, "zero"
+
+        def winner_details(market: BinaryMarket, resolution_row: Mapping[str, Any] | None) -> tuple[str | None, str | None, str]:
+            if isinstance(resolution_row, Mapping):
+                winner_token = resolution_row.get("winning_asset_id")
+                winner_outcome = resolution_row.get("winning_outcome")
+                if winner_token not in (None, "") or winner_outcome not in (None, ""):
+                    return (
+                        str(winner_token) if winner_token not in (None, "") else None,
+                        str(winner_outcome).upper() if winner_outcome not in (None, "") else None,
+                        "ws_market_resolved",
+                    )
+            metadata = market.metadata if isinstance(market.metadata, Mapping) else {}
+            winner_token = metadata.get("winner_token_id")
+            winner_outcome = metadata.get("winner_outcome")
+            return (
+                str(winner_token) if winner_token not in (None, "") else None,
+                str(winner_outcome).upper() if winner_outcome not in (None, "") else None,
+                "public_metadata",
+            )
+
+        def market_looks_resolved(market: BinaryMarket, resolution_row: Mapping[str, Any] | None) -> bool:
+            if resolution_row is not None:
+                return True
+            metadata = market.metadata if isinstance(market.metadata, Mapping) else {}
+            status_values = {
+                str(metadata.get("uma_resolution_status") or "").strip().lower(),
+                str(metadata.get("resolution_status") or "").strip().lower(),
+            }
+            return market.closed or bool(status_values & {"resolved", "finalized", "complete", "settled"})
+
+        for token_id, row in list(_inventory_rows(working_state).items()):
+            market_id = str(row.get("market_id") or "")
+            market = markets_by_id.get(market_id)
+            if market is None:
+                pending_settlement_count += 1
+                row["pending_settlement"] = True
+                inventory[token_id] = row
+                continue
+            valuation_price, valuation_source = valuation_for_token(token_id)
+            row["last_valuation_price"] = valuation_price
+            row["last_valuation_usd"] = row["quantity"] * valuation_price
+            row["last_valuation_source"] = valuation_source
+            row["last_valued_at_utc"] = utc_iso(now)
+            resolution_row = latest_resolution_row(market_id)
+            resolved = market_looks_resolved(market, resolution_row)
+            winner_token_id, winner_outcome, settlement_source = winner_details(market, resolution_row)
+            winner_matches_market = winner_token_id in {
+                None,
+                market.yes_token_id,
+                market.no_token_id,
+            } and winner_outcome in {None, "YES", "NO"}
+            row["pending_settlement"] = False
+            if not self.params.simulation.settlement_enabled:
+                inventory[token_id] = row
+                continue
+            if market.neg_risk:
+                pending_settlement_count += 1
+                row["pending_settlement"] = True
+                inventory[token_id] = row
+                continue
+            if not resolved:
+                inventory[token_id] = row
+                continue
+            if self.params.simulation.settlement_require_winner and (
+                (winner_token_id in (None, "") and winner_outcome in (None, ""))
+                or not winner_matches_market
+            ):
+                pending_settlement_count += 1
+                row["pending_settlement"] = True
+                inventory[token_id] = row
+                continue
+            winning = bool(
+                (winner_token_id not in (None, "") and winner_token_id == token_id)
+                or (winner_outcome not in (None, "") and winner_outcome == str(row.get("outcome") or "").upper())
+            )
+            settlement_key = f"{market_id}:{token_id}:{winner_token_id or winner_outcome or 'unknown'}"
+            if settlement_key in existing_keys:
+                inventory.pop(token_id, None)
+                changed = True
+                continue
+            realized_value = row["quantity"] if winning else 0.0
+            cost_basis = _as_float(row.get("cost_basis_usd"))
+            working_state["cash"] = _as_float(working_state.get("cash"), self.params.starting_capital_usd) + realized_value
+            working_state["realized_pnl"] = _as_float(working_state.get("realized_pnl")) + (realized_value - cost_basis)
+            settlement_record = {
+                "settlement_key": settlement_key,
+                "market_id": market_id,
+                "token_id": token_id,
+                "outcome": row.get("outcome"),
+                "quantity": row["quantity"],
+                "winning_token_id": winner_token_id,
+                "winning_outcome": winner_outcome,
+                "resolved_winning": winning,
+                "settlement_source": settlement_source,
+                "settled_value_usd": realized_value,
+                "write_down_value_usd": max(0.0, cost_basis - realized_value),
+                "cost_basis_usd": cost_basis,
+                "paper_only": True,
+                "settled_at_utc": utc_iso(now),
+            }
+            settlements.append(settlement_record)
+            settlement_records.append(settlement_record)
+            existing_keys.add(settlement_key)
+            inventory.pop(token_id, None)
+            changed = True
+
+        working_state["inventory"] = inventory
+        working_state["total_equity"] = _as_float(working_state.get("cash"), self.params.starting_capital_usd) + _inventory_equity_value(
+            working_state
+        )
+        metadata = working_state.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            metadata["pending_settlement_count"] = pending_settlement_count
+            metadata["settlements_applied_count"] = len(settlements)
+            metadata["last_settlement_at_utc"] = settlement_records[-1]["settled_at_utc"] if settlement_records else metadata.get(
+                "last_settlement_at_utc"
+            )
+        changed = changed or working_state != base_state
+        summary = {
+            "pending_settlement_count": pending_settlement_count,
+            "settlements_applied": len(settlement_records),
+            "last_settlement_at_utc": settlement_records[-1]["settled_at_utc"] if settlement_records else None,
+            "settlements": settlement_records,
+        }
+        if not changed:
+            self.state = working_state
+            return summary
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+        self.state = working_state
+        for record in settlement_records:
+            try:
+                self.append_event("paper_portfolio_settlement", record)
+            except Exception as exc:
+                LOGGER.warning(
+                    "paper_portfolio_settlement_event_append_failed settlement_key=%s error=%r",
+                    record.get("settlement_key"),
+                    exc,
+                )
+        return summary
 
     def execute_binary_complete_set(
         self,
@@ -1649,7 +2482,7 @@ class PaperPortfolio:
         *,
         params: PaperPortfolioParams,
     ) -> None:
-        preexisting_redeemed = self._redeem_completed_pairs_from_state(
+        preexisting_redeemed, preexisting_redeemed_cost = self._redeem_completed_pairs_with_cost_from_state(
             state,
             market_id=str(execution["market_id"]),
             yes_token_id=str(execution["yes_token_id"]),
@@ -1657,6 +2490,9 @@ class PaperPortfolio:
         )
         if preexisting_redeemed > EPSILON:
             state["cash"] = _as_float(state.get("cash"), params.starting_capital_usd) + preexisting_redeemed
+            state["realized_pnl"] = _as_float(state.get("realized_pnl")) + (
+                preexisting_redeemed - preexisting_redeemed_cost
+            )
             normalizations = state.setdefault("inventory_normalizations", [])
             if isinstance(normalizations, list):
                 normalizations.append(
@@ -1665,6 +2501,7 @@ class PaperPortfolio:
                         "yes_token_id": execution["yes_token_id"],
                         "no_token_id": execution["no_token_id"],
                         "redeemed_value": preexisting_redeemed,
+                        "redeemed_cost_basis_usd": preexisting_redeemed_cost,
                         "normalized_before_execution_id": execution["execution_id"],
                         "normalized_at_utc": execution["executed_at_utc"],
                     }
@@ -1676,6 +2513,16 @@ class PaperPortfolio:
 
         yes_quantity = _as_float(execution.get("yes_filled_quantity"), _as_float(execution.get("quantity")))
         no_quantity = _as_float(execution.get("no_filled_quantity"), _as_float(execution.get("quantity")))
+        gross_cost = _as_float(execution.get("gross_cost"))
+        variable_costs = (
+            _as_float(execution.get("estimated_fees"))
+            + _as_float(execution.get("slippage_buffer"))
+            + _as_float(execution.get("tax_cost"))
+        )
+        yes_cost = _as_float(execution.get("yes_cost"))
+        no_cost = _as_float(execution.get("no_cost"))
+        yes_cost_basis = yes_cost + (variable_costs * (yes_cost / gross_cost) if gross_cost > EPSILON else 0.0)
+        no_cost_basis = no_cost + (variable_costs * (no_cost / gross_cost) if gross_cost > EPSILON else 0.0)
         self._add_inventory_to_state(
             state,
             token_id=str(execution["yes_token_id"]),
@@ -1683,6 +2530,8 @@ class PaperPortfolio:
             condition_id=execution.get("condition_id"),
             outcome="YES",
             quantity=yes_quantity,
+            cost_basis_usd=yes_cost_basis,
+            valued_at_utc=execution.get("executed_at_utc"),
         )
         self._add_inventory_to_state(
             state,
@@ -1691,8 +2540,10 @@ class PaperPortfolio:
             condition_id=execution.get("condition_id"),
             outcome="NO",
             quantity=no_quantity,
+            cost_basis_usd=no_cost_basis,
+            valued_at_utc=execution.get("executed_at_utc"),
         )
-        redeemed = self._redeem_completed_pairs_from_state(
+        redeemed, redeemed_cost_basis = self._redeem_completed_pairs_with_cost_from_state(
             state,
             market_id=str(execution["market_id"]),
             yes_token_id=str(execution["yes_token_id"]),
@@ -1705,8 +2556,10 @@ class PaperPortfolio:
         execution["cash_after"] = cash_after
         if preexisting_redeemed > EPSILON:
             execution["preexisting_redeemed_value"] = preexisting_redeemed
+            execution["preexisting_redeemed_cost_basis_usd"] = preexisting_redeemed_cost
         execution["quantity_redeemed"] = redeemed
-        execution["net_profit"] = cash_after - cash_before
+        execution["redeemed_cost_basis_usd"] = redeemed_cost_basis
+        execution["net_profit"] = redeemed - redeemed_cost_basis - _as_float(execution.get("merge_cost"))
         costs = state.setdefault("costs", {})
         if isinstance(costs, dict):
             costs["fees_usd"] = _as_float(costs.get("fees_usd")) + _as_float(execution.get("estimated_fees"))
@@ -1727,7 +2580,7 @@ class PaperPortfolio:
                 "executed_at_utc": execution["executed_at_utc"],
             }
         state["last_execution_at_utc"] = execution["executed_at_utc"]
-        state["total_equity"] = state["cash"] + _redeemable_inventory_value(state)
+        state["total_equity"] = state["cash"] + _inventory_equity_value(state)
 
     def _add_inventory(
         self,
@@ -1737,6 +2590,8 @@ class PaperPortfolio:
         condition_id: str | None,
         outcome: str,
         quantity: float,
+        cost_basis_usd: float = 0.0,
+        valued_at_utc: Any = None,
     ) -> None:
         self._add_inventory_to_state(
             self.state,
@@ -1745,6 +2600,8 @@ class PaperPortfolio:
             condition_id=condition_id,
             outcome=outcome,
             quantity=quantity,
+            cost_basis_usd=cost_basis_usd,
+            valued_at_utc=valued_at_utc,
         )
 
     @staticmethod
@@ -1756,12 +2613,18 @@ class PaperPortfolio:
         condition_id: str | None,
         outcome: str,
         quantity: float,
+        cost_basis_usd: float = 0.0,
+        valued_at_utc: Any = None,
     ) -> None:
+        if quantity <= EPSILON:
+            return
         inventory = state.setdefault("inventory", {})
         if not isinstance(inventory, dict):
             inventory = {}
             state["inventory"] = inventory
         row = dict(inventory.get(token_id) or {})
+        previous_quantity = _as_float(row.get("quantity"))
+        previous_cost_basis = _as_float(row.get("cost_basis_usd"))
         row.update(
             {
                 "token_id": token_id,
@@ -1770,7 +2633,13 @@ class PaperPortfolio:
                 "outcome": outcome,
             }
         )
-        row["quantity"] = _as_float(row.get("quantity")) + quantity
+        row["quantity"] = previous_quantity + quantity
+        row["cost_basis_usd"] = previous_cost_basis + max(0.0, cost_basis_usd)
+        row["last_valuation_price"] = _as_float(row.get("last_valuation_price"))
+        row["last_valuation_usd"] = _as_float(row.get("last_valuation_usd"))
+        row["last_valuation_source"] = row.get("last_valuation_source") or "zero"
+        row["last_valued_at_utc"] = row.get("last_valued_at_utc") or valued_at_utc
+        row["pending_settlement"] = bool(row.get("pending_settlement"))
         inventory[token_id] = row
 
     def _redeem_completed_pairs(self, *, market_id: str, yes_token_id: str, no_token_id: str) -> float:
@@ -1789,22 +2658,46 @@ class PaperPortfolio:
         yes_token_id: str,
         no_token_id: str,
     ) -> float:
+        redeemed, _cost_basis = PaperPortfolio._redeem_completed_pairs_with_cost_from_state(
+            state,
+            market_id=market_id,
+            yes_token_id=yes_token_id,
+            no_token_id=no_token_id,
+        )
+        return redeemed
+
+    @staticmethod
+    def _redeem_completed_pairs_with_cost_from_state(
+        state: dict[str, Any],
+        *,
+        market_id: str,
+        yes_token_id: str,
+        no_token_id: str,
+    ) -> tuple[float, float]:
         inventory = state.get("inventory")
         if not isinstance(inventory, dict):
-            return 0.0
+            return 0.0, 0.0
         yes_row = inventory.get(yes_token_id)
         no_row = inventory.get(no_token_id)
         if not isinstance(yes_row, dict) or not isinstance(no_row, dict):
-            return 0.0
+            return 0.0, 0.0
         if str(yes_row.get("market_id")) != market_id or str(no_row.get("market_id")) != market_id:
-            return 0.0
-        redeem_quantity = min(_as_float(yes_row.get("quantity")), _as_float(no_row.get("quantity")))
+            return 0.0, 0.0
+        yes_quantity = _as_float(yes_row.get("quantity"))
+        no_quantity = _as_float(no_row.get("quantity"))
+        redeem_quantity = min(yes_quantity, no_quantity)
         if redeem_quantity <= EPSILON:
-            return 0.0
-        yes_row["quantity"] = _as_float(yes_row.get("quantity")) - redeem_quantity
-        no_row["quantity"] = _as_float(no_row.get("quantity")) - redeem_quantity
+            return 0.0, 0.0
+        yes_cost_basis = _as_float(yes_row.get("cost_basis_usd"))
+        no_cost_basis = _as_float(no_row.get("cost_basis_usd"))
+        redeemed_yes_cost = yes_cost_basis * (redeem_quantity / yes_quantity) if yes_quantity > EPSILON else 0.0
+        redeemed_no_cost = no_cost_basis * (redeem_quantity / no_quantity) if no_quantity > EPSILON else 0.0
+        yes_row["quantity"] = yes_quantity - redeem_quantity
+        no_row["quantity"] = no_quantity - redeem_quantity
+        yes_row["cost_basis_usd"] = max(0.0, yes_cost_basis - redeemed_yes_cost)
+        no_row["cost_basis_usd"] = max(0.0, no_cost_basis - redeemed_no_cost)
         if yes_row["quantity"] <= EPSILON:
             inventory.pop(yes_token_id, None)
         if no_row["quantity"] <= EPSILON:
             inventory.pop(no_token_id, None)
-        return redeem_quantity
+        return redeem_quantity, redeemed_yes_cost + redeemed_no_cost

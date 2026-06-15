@@ -67,9 +67,24 @@ def test_load_scan_config_reads_conservative_paper_simulation_defaults(monkeypat
     assert loaded.paper_simulation.seed == 0
     assert loaded.paper_simulation.latency_ms == 250.0
     assert loaded.paper_simulation.latency_jitter_ms == 50.0
+    assert loaded.paper_simulation.latency_mode == "fixed"
+    assert loaded.paper_simulation.local_timeout_ms == 0.0
+    assert loaded.paper_simulation.telemetry_latency_window == 50
+    assert loaded.paper_simulation.latency_jitter_seed_scope == "market_book_stage"
     assert loaded.paper_simulation.signing_latency_ms == 50.0
     assert loaded.paper_simulation.settlement_latency_ms == 1500.0
     assert loaded.paper_simulation.max_fill_price_move_bps == 25.0
+    assert loaded.paper_simulation.fill_eligibility_mode == "strict_public_depth"
+    assert loaded.paper_simulation.allow_trade_print_fill_support is True
+    assert loaded.paper_simulation.allow_deterministic_fill_fallback is False
+    assert loaded.paper_simulation.settlement_enabled is True
+    assert loaded.paper_simulation.settlement_source == "public_metadata_or_ws"
+    assert loaded.paper_simulation.unmatched_open_valuation == "best_bid_midpoint_or_zero"
+    assert loaded.paper_simulation.settlement_require_winner is True
+    assert loaded.paper_simulation.slippage_mode == "fixed_plus_calibrated"
+    assert loaded.paper_simulation.slippage_max_bps == 100.0
+    assert loaded.paper_simulation.slippage_lookback_events == 50
+    assert loaded.paper_simulation.slippage_combine_mode == "max"
     assert loaded.paper_simulation.queue_depth_ratio == 0.75
     assert loaded.paper_simulation.queue_fill_probability == 0.95
     assert loaded.paper_simulation.partial_fill_probability == 0.15
@@ -109,9 +124,12 @@ def test_load_scan_config_reads_zero_friction_paper_simulation(monkeypatch):
         "COND_ARB_PAPER_ADVERSE_SELECTION_PROBABILITY",
         "COND_ARB_PAPER_ADVERSE_DEPTH_REMOVAL_RATIO",
         "COND_ARB_PAPER_ADVERSE_PRICE_MOVE_BPS",
+        "COND_ARB_PAPER_LOCAL_TIMEOUT_MS",
+        "COND_ARB_PAPER_SLIPPAGE_MAX_BPS",
     ):
         monkeypatch.setenv(name, "0")
     monkeypatch.setenv("COND_ARB_PAPER_THROTTLE_MAX_SUBMISSIONS_PER_SECOND", "0")
+    monkeypatch.setenv("COND_ARB_PAPER_SLIPPAGE_MODE", "fixed_only")
 
     loaded = config.load_scan_config()
 
@@ -126,4 +144,13 @@ def test_load_scan_config_rejects_invalid_paper_simulation_probability(monkeypat
     monkeypatch.setenv("COND_ARB_PAPER_FILL_FAILURE_PROBABILITY", "1.5")
 
     with pytest.raises(ValueError, match="COND_ARB_PAPER_FILL_FAILURE_PROBABILITY must be between 0 and 1"):
+        config.load_scan_config()
+
+
+def test_load_scan_config_rejects_invalid_paper_simulation_choice(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_CLOB_HOST", "https://clob.example")
+    monkeypatch.setenv("COND_ARB_MARKET_WS_ENDPOINT", "wss://ws.example/ws/market")
+    monkeypatch.setenv("COND_ARB_PAPER_LATENCY_MODE", "private_gateway")
+
+    with pytest.raises(ValueError, match="COND_ARB_PAPER_LATENCY_MODE must be one of"):
         config.load_scan_config()

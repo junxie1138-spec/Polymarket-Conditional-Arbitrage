@@ -64,6 +64,39 @@ def _token_id_from_token_row(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _winner_metadata(market: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for row in json_list(market.get("tokens")):
+        if not isinstance(row, dict):
+            continue
+        token_id = _token_id_from_token_row(row)
+        outcome = _normalized_outcome_label(
+            row.get("outcome")
+            or row.get("name")
+            or row.get("label")
+            or row.get("title")
+        )
+        if as_bool(first_present(row, "winner", "isWinner", "resolvedWinner"), default=False):
+            if token_id:
+                metadata["winner_token_id"] = token_id
+            if outcome:
+                metadata["winner_outcome"] = outcome
+            break
+
+    for key, aliases in (
+        ("winner", ("winner",)),
+        ("winner_token_id", ("winningTokenId", "winning_token_id", "winningAssetId", "winning_asset_id")),
+        ("winner_outcome", ("winningOutcome", "winning_outcome")),
+        ("uma_resolution_status", ("umaResolutionStatus", "uma_resolution_status")),
+        ("resolution_status", ("resolutionStatus", "resolution_status")),
+        ("resolved_at", ("resolvedAt", "resolved_at", "resolutionDate", "resolution_date")),
+    ):
+        value = first_present(market, *aliases)
+        if value not in (None, "") and key not in metadata:
+            metadata[key] = value
+    return metadata
+
+
 def outcome_token_map_from_market(market: dict[str, Any]) -> dict[str, str]:
     token_rows = json_list(market.get("tokens"))
     mapped: dict[str, str] = {}
@@ -168,6 +201,7 @@ class BinaryMarket:
             )
             if key in market
         }
+        metadata.update(_winner_metadata(market))
         return cls(
             market_id=market_id,
             condition_id=str(market.get("conditionId") or "").strip() or None,

@@ -7,7 +7,7 @@ import logging
 import signal
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -1454,7 +1454,14 @@ class ConditionalArbScanner:
                 )
             )
         combined = self._combine_evaluation_results(results)
+        settlement_summary = self._reconcile_paper_settlements(
+            universe=universe,
+            cache=cache,
+            resolution_events_by_market={},
+        )
         summary = combined.get("summary", {})
+        if isinstance(summary, dict):
+            summary.update(settlement_summary)
         skip_counts = summary.get("skip_counts") if isinstance(summary.get("skip_counts"), Mapping) else {}
         simulation_failure_counts = (
             summary.get("simulation_failure_counts")
@@ -1470,6 +1477,9 @@ class ConditionalArbScanner:
             last_cycle_skip_counts=dict(skip_counts),
             last_cycle_simulation_failure_counts=dict(simulation_failure_counts),
             last_simulated_execution_failure_reason=summary.get("last_simulated_execution_failure_reason"),
+            pending_settlement_count=_progress_int(settlement_summary.get("pending_settlement_count")),
+            settlements_applied_count=_progress_int(settlement_summary.get("settlements_applied_count")),
+            last_settlement_at_utc=settlement_summary.get("last_settlement_at_utc"),
             detail=f"completed {reason}",
         )
         return combined
@@ -1803,6 +1813,7 @@ class ConditionalArbScanner:
                 },
             )
 
+        resolution_events_by_market = cache.market_resolution_snapshot()
         return self._evaluate_universe(
             universe,
             cache.ask_books_snapshot(universe.token_ids),
@@ -1810,7 +1821,55 @@ class ConditionalArbScanner:
             evaluation_reason=evaluation_reason,
             params=params,
             fill_time_book_reader=fill_time_book_reader,
+            settlement_cache=cache,
+            resolution_events_by_market=resolution_events_by_market,
         )
+
+    def _fetch_open_inventory_markets(self, market_ids: set[str]) -> dict[str, BinaryMarket]:
+        if not market_ids:
+            return {}
+        request_records: list[dict[str, Any]] = []
+        try:
+            fetcher = getattr(self.client, "fetch_binary_markets_by_ids")
+        except AttributeError:
+            return {}
+        try:
+            markets = fetcher(sorted(market_ids), request_records=request_records)
+        except Exception as exc:
+            self.logger.warning("paper_settlement_market_refresh_failed markets=%s error=%r", len(market_ids), exc)
+            return {}
+        return dict(markets) if isinstance(markets, Mapping) else {}
+
+    def _reconcile_paper_settlements(
+        self,
+        *,
+        universe: MarketUniverse,
+        cache: MarketDataCache | None,
+        resolution_events_by_market: Mapping[str, Sequence[Mapping[str, Any]]] | None,
+    ) -> dict[str, Any]:
+        open_market_ids = self.portfolio.open_inventory_market_ids()
+        universe_markets = {market.market_id: market for market in universe.markets if market.market_id in open_market_ids}
+        missing_market_ids = open_market_ids - set(universe_markets)
+        refreshed_markets = self._fetch_open_inventory_markets(missing_market_ids)
+        markets_by_id = {**universe_markets, **refreshed_markets}
+        token_ids = sorted(
+            {
+                token_id
+                for market in markets_by_id.values()
+                for token_id in (market.yes_token_id, market.no_token_id)
+            }
+        )
+        valuation_snapshot = cache.public_evidence_snapshot(token_ids) if cache is not None and token_ids else {}
+        summary = self.portfolio.reconcile_public_markets(
+            markets_by_id=markets_by_id,
+            resolution_events_by_market=resolution_events_by_market or {},
+            valuation_snapshots_by_token=valuation_snapshot,
+        )
+        return {
+            "pending_settlement_count": _progress_int(summary.get("pending_settlement_count")),
+            "settlements_applied_count": _progress_int(summary.get("settlements_applied")),
+            "last_settlement_at_utc": summary.get("last_settlement_at_utc"),
+        }
 
     @staticmethod
     def _ensure_aware_datetime(value: datetime) -> datetime:
@@ -1878,6 +1937,8 @@ class ConditionalArbScanner:
         params: PaperPortfolioParams,
         fill_time_book_reader: Callable[[BinaryMarket, datetime], FillTimeBookEvidence]
         | None = None,
+        settlement_cache: MarketDataCache | None = None,
+        resolution_events_by_market: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         cycle_started = datetime.now(timezone.utc)
         self._runtime_update(
@@ -1936,6 +1997,11 @@ class ConditionalArbScanner:
                 last_simulation_failure_reason = last_reason
 
         neg_risk_markets = sum(1 for market in universe.markets if market.neg_risk)
+        settlement_summary = self._reconcile_paper_settlements(
+            universe=universe,
+            cache=settlement_cache,
+            resolution_events_by_market=resolution_events_by_market or {},
+        )
         summary = {
             "cycle_started_at_utc": utc_iso(cycle_started),
             "evaluation_reason": evaluation_reason,
@@ -1950,6 +2016,7 @@ class ConditionalArbScanner:
             "skip_counts": skip_counts,
             "simulation_failure_counts": simulation_failure_counts,
             "last_simulated_execution_failure_reason": last_simulation_failure_reason,
+            **settlement_summary,
         }
         self.portfolio.append_event("paper_portfolio_cycle_completed", summary)
         self._runtime_update(
@@ -1961,6 +2028,9 @@ class ConditionalArbScanner:
             last_cycle_skip_counts=skip_counts,
             last_cycle_simulation_failure_counts=simulation_failure_counts,
             last_simulated_execution_failure_reason=last_simulation_failure_reason,
+            pending_settlement_count=_progress_int(settlement_summary.get("pending_settlement_count")),
+            settlements_applied_count=_progress_int(settlement_summary.get("settlements_applied_count")),
+            last_settlement_at_utc=settlement_summary.get("last_settlement_at_utc"),
             events_fetched=universe.events_fetched,
             raw_markets=universe.raw_markets,
             tradable_markets=len(universe.markets),

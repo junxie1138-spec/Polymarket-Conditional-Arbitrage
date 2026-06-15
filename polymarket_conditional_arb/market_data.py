@@ -64,6 +64,14 @@ def _token_ids_from_payload(payload: Mapping[str, Any]) -> list[str]:
     return []
 
 
+def _market_key_from_payload(payload: Mapping[str, Any]) -> str | None:
+    for key in ("market_id", "marketId", "market", "condition_id", "conditionId"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
 def _sorted_levels(side: BookSideName, levels_by_price: Mapping[float, float]) -> tuple[BookLevel, ...]:
     levels = [
         BookLevel(price=price, size=size)
@@ -90,6 +98,8 @@ class MarketDataCache:
         self._recent_trade_prints: dict[str, list[dict[str, Any]]] = {}
         self._recent_tick_size_changes: dict[str, list[dict[str, Any]]] = {}
         self._recent_best_bid_asks: dict[str, list[dict[str, Any]]] = {}
+        self._recent_market_resolved_by_token: dict[str, list[dict[str, Any]]] = {}
+        self._recent_market_resolved_by_market: dict[str, list[dict[str, Any]]] = {}
         self._recent_public_evidence_limit = max(1, int(recent_public_evidence_limit))
         self._skipped_snapshot_warning_interval_seconds = max(
             0.0,
@@ -159,6 +169,22 @@ class MarketDataCache:
                 self._recent_trade_prints.pop(token_id, None)
                 self._recent_tick_size_changes.pop(token_id, None)
                 self._recent_best_bid_asks.pop(token_id, None)
+                self._recent_market_resolved_by_token.pop(token_id, None)
+
+    def market_resolution_snapshot(
+        self,
+        market_ids: Iterable[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        allowed = {str(market_id) for market_id in market_ids} if market_ids is not None else None
+        with self._lock:
+            source = self._recent_market_resolved_by_market
+            if allowed is None:
+                return {market_id: [dict(row) for row in rows] for market_id, rows in source.items()}
+            return {
+                market_id: [dict(row) for row in source.get(market_id, [])]
+                for market_id in sorted(allowed)
+                if market_id in source
+            }
 
     def mark_tokens_stale(self, token_ids: Iterable[str], *, stale_at: datetime) -> None:
         token_set = {str(token_id) for token_id in token_ids}
@@ -251,6 +277,7 @@ class MarketDataCache:
                     "recent_trade_prints": filtered(self._recent_trade_prints.get(token_id, [])),
                     "recent_tick_size_changes": filtered(self._recent_tick_size_changes.get(token_id, [])),
                     "recent_best_bid_asks": filtered(self._recent_best_bid_asks.get(token_id, [])),
+                    "recent_market_resolved": filtered(self._recent_market_resolved_by_token.get(token_id, [])),
                 }
             return snapshot
 
@@ -296,6 +323,8 @@ class MarketDataCache:
             return self._apply_tick_size_change(payload, received_at=timestamp, logger=logger)
         if event_type == "best_bid_ask":
             return self._apply_best_bid_ask(payload, received_at=timestamp, logger=logger)
+        if event_type == "market_resolved":
+            return self._apply_market_resolved(payload, received_at=timestamp, logger=logger)
         return set()
 
     @staticmethod
@@ -526,6 +555,50 @@ class MarketDataCache:
                 },
             )
         return {token_id}
+
+    def _apply_market_resolved(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        received_at: datetime,
+        logger: logging.Logger | None,
+    ) -> set[str]:
+        market_key = _market_key_from_payload(payload)
+        winning_asset_id = (
+            payload.get("winning_asset_id")
+            or payload.get("winningAssetId")
+            or payload.get("winner_token_id")
+            or payload.get("winnerTokenId")
+        )
+        winning_outcome = payload.get("winning_outcome") or payload.get("winningOutcome")
+        token_ids = _token_ids_from_payload(payload)
+        if winning_asset_id not in (None, ""):
+            token_ids.append(str(winning_asset_id))
+        normalized_token_ids = sorted(dict.fromkeys(str(token_id) for token_id in token_ids if token_id))
+        if market_key is None and not normalized_token_ids:
+            if logger is not None:
+                logger.warning("market_ws_market_resolved_missing_market_and_token")
+            return set()
+        row = {
+            "event_type": "market_resolved",
+            "market_id": market_key,
+            "token_ids": normalized_token_ids,
+            "winning_asset_id": str(winning_asset_id) if winning_asset_id not in (None, "") else None,
+            "winning_outcome": str(winning_outcome) if winning_outcome not in (None, "") else None,
+            "source_revision": _source_revision(payload),
+            "source_hash": _source_hash(payload),
+            "observed_at": received_at,
+        }
+        with self._lock:
+            if market_key is not None:
+                rows = self._recent_market_resolved_by_market.setdefault(str(market_key), [])
+                rows.append(dict(row))
+                excess = len(rows) - self._recent_public_evidence_limit
+                if excess > 0:
+                    del rows[:excess]
+            for token_id in normalized_token_ids:
+                self._append_recent_locked(self._recent_market_resolved_by_token, token_id, row)
+        return set(normalized_token_ids)
 
     def _log_skipped_snapshot_warning(
         self,

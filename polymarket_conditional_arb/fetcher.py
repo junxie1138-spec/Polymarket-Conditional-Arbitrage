@@ -88,11 +88,13 @@ class GammaClobClient:
         session=None,
         clob_host: str | None = None,
         gamma_events_url: str = config.GAMMA_EVENTS_URL,
+        gamma_markets_url: str | None = None,
         batch_book_limit: int = config.CLOB_BATCH_BOOK_LIMIT,
     ):
         self.session = session or network.get_session()
         self.clob_host = (clob_host or config.clob_host()).rstrip("/")
         self.gamma_events_url = gamma_events_url
+        self.gamma_markets_url = gamma_markets_url or gamma_events_url.replace("/events", "/markets")
         self.batch_book_limit = max(1, min(config.CLOB_BATCH_BOOK_LIMIT, batch_book_limit))
 
     def fetch_active_events(
@@ -200,6 +202,61 @@ class GammaClobClient:
         markets = self.tradable_binary_markets(raw_markets)
         if limit is not None:
             return markets[:limit]
+        return markets
+
+    def fetch_market_rows_by_ids(
+        self,
+        market_ids: Iterable[str],
+        *,
+        request_records: list[dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        rows_by_id: dict[str, dict[str, Any]] = {}
+        for market_id in dict.fromkeys(str(market_id) for market_id in market_ids if market_id):
+            request_meta = {
+                "endpoint_family": "gamma_markets",
+                "endpoint": "/markets",
+                "market_id": market_id,
+            }
+            data = network.get_json_with_retries(
+                self.session,
+                self.gamma_markets_url,
+                params={"id": market_id},
+                timeout=30,
+                meta=request_meta,
+            )
+            if request_records is not None:
+                request_records.append(_jsonable_request_meta(request_meta))
+            rows: list[dict[str, Any]]
+            if isinstance(data, list):
+                rows = [row for row in data if isinstance(row, dict)]
+            elif isinstance(data, dict):
+                rows = [data]
+            else:
+                raise ValueError(f"unexpected Gamma markets response: {type(data).__name__}")
+            matched = next(
+                (
+                    row
+                    for row in rows
+                    if str(row.get("id") or row.get("conditionId") or "").strip() == market_id
+                ),
+                rows[0] if rows else None,
+            )
+            if matched is not None:
+                rows_by_id[market_id] = dict(matched)
+        return rows_by_id
+
+    def fetch_binary_markets_by_ids(
+        self,
+        market_ids: Iterable[str],
+        *,
+        request_records: list[dict[str, Any]] | None = None,
+    ) -> dict[str, BinaryMarket]:
+        rows_by_id = self.fetch_market_rows_by_ids(market_ids, request_records=request_records)
+        markets: dict[str, BinaryMarket] = {}
+        for market_id, row in rows_by_id.items():
+            market = BinaryMarket.from_gamma_market(row)
+            if market is not None:
+                markets[market_id] = market
         return markets
 
     def fetch_order_book(self, token_id: str, *, request_meta: dict[str, Any] | None = None) -> dict[str, Any]:

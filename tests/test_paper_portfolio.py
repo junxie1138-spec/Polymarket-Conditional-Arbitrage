@@ -80,9 +80,24 @@ def simulation(**overrides):
         "seed": 0,
         "latency_ms": 0.0,
         "latency_jitter_ms": 0.0,
+        "latency_mode": "fixed",
+        "local_timeout_ms": 0.0,
+        "telemetry_latency_window": 50,
+        "latency_jitter_seed_scope": "market_book_stage",
         "signing_latency_ms": 0.0,
         "settlement_latency_ms": 0.0,
         "max_fill_price_move_bps": 0.0,
+        "fill_eligibility_mode": "strict_public_depth",
+        "allow_trade_print_fill_support": True,
+        "allow_deterministic_fill_fallback": False,
+        "settlement_enabled": True,
+        "settlement_source": "public_metadata_or_ws",
+        "unmatched_open_valuation": "best_bid_midpoint_or_zero",
+        "settlement_require_winner": True,
+        "slippage_mode": "fixed_plus_calibrated",
+        "slippage_max_bps": 100.0,
+        "slippage_lookback_events": 50,
+        "slippage_combine_mode": "max",
         "queue_depth_ratio": 0.0,
         "queue_fill_probability": 0.0,
         "partial_fill_probability": 0.0,
@@ -348,7 +363,7 @@ def test_zero_friction_simulation_preserves_legacy_fill_and_fingerprint(tmp_path
 def test_simulated_latency_makes_stale_fill_time_books_skip():
     p = params(
         max_book_age_seconds=1.0,
-        simulation=simulation(latency_ms=1500.0),
+        simulation=simulation(latency_ms=1500.0, allow_deterministic_fill_fallback=True),
     )
 
     decision = evaluate_binary_paper_execution(
@@ -366,9 +381,59 @@ def test_simulated_latency_makes_stale_fill_time_books_skip():
     assert decision.details["simulation"]["fill_latency_ms"] == pytest.approx(1500.0)
 
 
+def test_latency_telemetry_uses_recent_request_samples():
+    p = params(simulation=simulation(latency_mode="telemetry", allow_deterministic_fill_fallback=True))
+    evidence = FillTimeBookEvidence(
+        source="rest_snapshot",
+        yes_book=asks("yes-token", [(0.48, 10)]),
+        no_book=asks("no-token", [(0.49, 10)]),
+        request_records=(
+            {"latency_seconds": 0.04},
+            {"latency_seconds": 0.08},
+            {"latency_seconds": 0.12},
+        ),
+    )
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+        fill_time_book_reader=lambda _market, _fill_time: evidence,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution["simulation"]["telemetry"]["sample_count"] == 3
+    assert decision.execution["simulation"]["telemetry"]["p95_latency_ms"] == pytest.approx(120.0)
+
+
+def test_local_timeout_skips_slow_fill_time_request():
+    p = params(simulation=simulation(local_timeout_ms=50.0))
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+        fill_time_book_reader=lambda _market, _fill_time: FillTimeBookEvidence(
+            source="rest_snapshot",
+            yes_book=asks("yes-token", [(0.48, 10)]),
+            no_book=asks("no-token", [(0.49, 10)]),
+            request_records=({"latency_seconds": 0.08},),
+        ),
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_local_timeout"
+
+
 def test_moved_fill_time_books_skip_when_price_move_exceeds_limit():
     p = params(
-        simulation=simulation(max_fill_price_move_bps=10.0),
+        simulation=simulation(max_fill_price_move_bps=10.0, allow_deterministic_fill_fallback=True),
     )
 
     def fill_reader(_market, _fill_time):
@@ -397,7 +462,13 @@ def test_moved_fill_time_books_skip_when_price_move_exceeds_limit():
 
 
 def test_queue_depth_ratio_reduces_available_fill_size():
-    p = params(simulation=simulation(queue_depth_ratio=0.5, queue_fill_probability=1.0))
+    p = params(
+        simulation=simulation(
+            queue_depth_ratio=0.5,
+            queue_fill_probability=1.0,
+            allow_deterministic_fill_fallback=True,
+        )
+    )
 
     decision = evaluate_binary_paper_execution(
         market(),
@@ -478,15 +549,43 @@ def test_public_queue_evidence_drives_partial_one_sided_fill(tmp_path):
     assert execution["no_filled_quantity"] == pytest.approx(6.0)
     assert execution["quantity_redeemed"] == pytest.approx(6.0)
     assert execution["unmatched_yes_quantity"] == pytest.approx(4.0)
-    assert execution["simulation"]["queue"]["source"] == "public_trade_delta_evidence"
+    assert execution["simulation"]["queue"]["public_queue_evidence"]["source"] == "public_trade_delta_evidence"
     assert execution["simulation"]["partial_fill"]["source"] == "public_queue_evidence"
     assert portfolio.status()["unmatched_inventory"]
+
+
+def test_deterministic_fallback_can_fill_without_public_evidence_when_enabled():
+    p = params(
+        simulation=simulation(
+            allow_deterministic_fill_fallback=True,
+            queue_depth_ratio=0.5,
+            queue_fill_probability=1.0,
+            partial_fill_probability=1.0,
+            partial_fill_min_ratio=0.5,
+        )
+    )
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 20)]),
+        asks("no-token", [(0.49, 20)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution["simulation"]["fallback"]["queue"]["source"] == "deterministic_depth_fallback"
 
 
 def test_partial_fill_redeems_matched_quantity_and_leaves_unmatched_inventory(tmp_path):
     p = params(
         trade_ceiling_usd=100.0,
-        simulation=simulation(partial_fill_probability=1.0, partial_fill_min_ratio=0.5),
+        simulation=simulation(
+            partial_fill_probability=1.0,
+            partial_fill_min_ratio=0.5,
+            allow_deterministic_fill_fallback=True,
+        ),
     )
     portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
 
@@ -510,8 +609,30 @@ def test_partial_fill_redeems_matched_quantity_and_leaves_unmatched_inventory(tm
     assert status["unmatched_inventory"]
 
 
+def test_strict_mode_skips_when_only_signal_book_is_available():
+    p = params(simulation=simulation())
+
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        state=state_for(p),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "simulation_no_fill_time_public_source"
+
+
 def test_queue_degraded_pair_below_minimum_does_not_create_execution():
-    p = params(simulation=simulation(queue_depth_ratio=0.4, queue_fill_probability=1.0))
+    p = params(
+        simulation=simulation(
+            queue_depth_ratio=0.4,
+            queue_fill_probability=1.0,
+            allow_deterministic_fill_fallback=True,
+        )
+    )
 
     decision = evaluate_binary_paper_execution(
         market(),
@@ -528,7 +649,13 @@ def test_queue_degraded_pair_below_minimum_does_not_create_execution():
 
 
 def test_seeded_simulated_submit_failure_is_reproducible_and_marked_fallback():
-    p = params(simulation=simulation(seed=123, submit_failure_probability=1.0))
+    p = params(
+        simulation=simulation(
+            seed=123,
+            submit_failure_probability=1.0,
+            allow_deterministic_fill_fallback=True,
+        )
+    )
 
     first = evaluate_binary_paper_execution(
         market(),
@@ -562,6 +689,7 @@ def test_throttle_saturation_reduces_quantity_and_skips_below_minimum():
         simulation=simulation(
             throttle_max_submissions_per_second=1,
             throttle_quantity_ratio=0.4,
+            allow_deterministic_fill_fallback=True,
         )
     )
 
@@ -579,8 +707,109 @@ def test_throttle_saturation_reduces_quantity_and_skips_below_minimum():
     assert decision.details["degraded_quantity"] == pytest.approx(4.0)
 
 
+def test_reconcile_public_markets_settles_closed_market_inventory(tmp_path):
+    p = params(simulation=simulation(settlement_enabled=True))
+    portfolio = PaperPortfolio(tmp_path / "state.json", events_path=tmp_path / "events.jsonl", params=p).load()
+    portfolio.state["inventory"] = {
+        "yes-token": {
+            "token_id": "yes-token",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "outcome": "YES",
+            "quantity": 2.0,
+            "cost_basis_usd": 0.8,
+            "pending_settlement": True,
+        },
+        "no-token": {
+            "token_id": "no-token",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "outcome": "NO",
+            "quantity": 2.0,
+            "cost_basis_usd": 0.9,
+            "pending_settlement": True,
+        },
+    }
+    base_market = market()
+    resolved_market = BinaryMarket(
+        market_id=base_market.market_id,
+        condition_id=base_market.condition_id,
+        question=base_market.question,
+        yes_token_id=base_market.yes_token_id,
+        no_token_id=base_market.no_token_id,
+        active=False,
+        closed=True,
+        accepting_orders=False,
+        enable_order_book=base_market.enable_order_book,
+        neg_risk=base_market.neg_risk,
+        tick_size=base_market.tick_size,
+        min_order_size=base_market.min_order_size,
+        metadata={**base_market.metadata, "winner_token_id": "yes-token", "winner_outcome": "YES"},
+    )
+
+    summary = portfolio.reconcile_public_markets(
+        markets_by_id={"m1": resolved_market},
+        resolution_events_by_market={"m1": ({"winning_asset_id": "yes-token", "winning_outcome": "YES"},)},
+        valuation_snapshots_by_token={
+            "yes-token": {"recent_best_bid_asks": [{"best_bid": 0.45, "best_ask": 0.47}]},
+            "no-token": {"recent_best_bid_asks": [{"best_bid": 0.03, "best_ask": 0.05}]},
+        },
+        as_of=AS_OF,
+    )
+
+    assert summary["settlements_applied"] == 2
+    assert portfolio.state["cash"] == pytest.approx(1002.0)
+    assert portfolio.state["inventory"] == {}
+    assert portfolio.state["metadata"]["pending_settlement_count"] == 0
+    assert portfolio.status()["settlements_applied_count"] == 2
+
+
+def test_reconcile_public_markets_is_idempotent_for_duplicate_settlement(tmp_path):
+    p = params(simulation=simulation(settlement_enabled=True))
+    portfolio = PaperPortfolio(tmp_path / "state.json", events_path=tmp_path / "events.jsonl", params=p).load()
+    portfolio.state["inventory"] = {
+        "yes-token": {
+            "token_id": "yes-token",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "outcome": "YES",
+            "quantity": 1.0,
+            "cost_basis_usd": 0.4,
+        }
+    }
+    base_market = market()
+    resolved_market = BinaryMarket(
+        market_id=base_market.market_id,
+        condition_id=base_market.condition_id,
+        question=base_market.question,
+        yes_token_id=base_market.yes_token_id,
+        no_token_id=base_market.no_token_id,
+        active=False,
+        closed=True,
+        accepting_orders=False,
+        enable_order_book=base_market.enable_order_book,
+        neg_risk=base_market.neg_risk,
+        tick_size=base_market.tick_size,
+        min_order_size=base_market.min_order_size,
+        metadata={**base_market.metadata, "winner_token_id": "yes-token", "winner_outcome": "YES"},
+    )
+
+    first = portfolio.reconcile_public_markets(markets_by_id={"m1": resolved_market}, as_of=AS_OF)
+    cash_after_first = portfolio.state["cash"]
+    second = portfolio.reconcile_public_markets(markets_by_id={"m1": resolved_market}, as_of=AS_OF)
+
+    assert first["settlements_applied"] == 1
+    assert second["settlements_applied"] == 0
+    assert portfolio.state["cash"] == pytest.approx(cash_after_first)
+
+
 def test_simulated_execution_failure_writes_audit_event_without_mutating_state(tmp_path):
-    p = params(simulation=simulation(submit_failure_probability=1.0))
+    p = params(
+        simulation=simulation(
+            submit_failure_probability=1.0,
+            allow_deterministic_fill_fallback=True,
+        )
+    )
     path = tmp_path / "portfolio.json"
     events_path = tmp_path / "events.jsonl"
     portfolio = PaperPortfolio(path, events_path=events_path, params=p).load()
