@@ -39,6 +39,30 @@ def test_load_scan_config_normalizes_valid_clob_host(monkeypatch):
     assert loaded.market_ws_endpoint == "wss://ws.example/ws/market"
 
 
+def test_load_scan_config_defaults_market_ws_message_limit_above_websockets_default(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_CLOB_HOST", "https://clob.example")
+    monkeypatch.setenv("COND_ARB_MARKET_WS_ENDPOINT", "wss://ws.example/ws/market")
+
+    loaded = config.load_scan_config()
+
+    assert loaded.market_ws_max_message_size_bytes == config.DEFAULT_MARKET_WS_MAX_MESSAGE_SIZE_BYTES
+    assert loaded.market_ws_max_message_size_bytes > config.MIN_MARKET_WS_MAX_MESSAGE_SIZE_BYTES
+    assert loaded.rest_book_seed_batch_stall_seconds == config.DEFAULT_REST_BOOK_SEED_BATCH_STALL_SECONDS
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-1", "4096"])
+def test_load_scan_config_clamps_small_market_ws_message_limit_and_reads_stall_seconds(monkeypatch, raw_value):
+    monkeypatch.setenv("POLYMARKET_CLOB_HOST", "https://clob.example")
+    monkeypatch.setenv("COND_ARB_MARKET_WS_ENDPOINT", "wss://ws.example/ws/market")
+    monkeypatch.setenv("COND_ARB_MARKET_WS_MAX_MESSAGE_SIZE_BYTES", raw_value)
+    monkeypatch.setenv("COND_ARB_REST_BOOK_SEED_BATCH_STALL_SECONDS", "123")
+
+    loaded = config.load_scan_config()
+
+    assert loaded.market_ws_max_message_size_bytes == config.MIN_MARKET_WS_MAX_MESSAGE_SIZE_BYTES
+    assert loaded.rest_book_seed_batch_stall_seconds == 123.0
+
+
 def test_load_scan_config_reads_fast_start_settings(monkeypatch, tmp_path):
     monkeypatch.setenv("POLYMARKET_CLOB_HOST", "https://clob.example")
     monkeypatch.setenv("COND_ARB_MARKET_WS_ENDPOINT", "wss://ws.example/ws/market")

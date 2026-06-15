@@ -33,6 +33,7 @@ from polymarket_conditional_arb.scan_bot import (
     ScannerRetryPolicy,
     ScannerStopped,
     _DirtyTokenAccumulator,
+    _RestBookSeedBatchStallMonitor,
     _config_from_args,
     build_parser,
     main,
@@ -1386,7 +1387,7 @@ def test_status_dashboard_surfaces_websocket_health():
         "market_ws_connection_count": 7,
         "market_ws_reconnect_count": 3,
         "market_ws_error_count": 2,
-        "market_ws_last_error": "ConnectionClosedError: dropped",
+        "market_ws_last_error": "ConnectionClosedError: sent 1009 (message too big)",
         "market_ws_stale_token_batches": 2,
         "market_ws_stale_tokens": 1000,
     }
@@ -1409,7 +1410,63 @@ def test_status_dashboard_surfaces_websocket_health():
     assert "WS reconnects   3" in dashboard
     assert "WS errors       2" in dashboard
     assert "WS stale        2 batches / 1,000 tokens" in dashboard
-    assert "WS error        ConnectionClosedError:" in dashboard
+    assert runtime["market_ws_last_error"].startswith("ConnectionClosedError: sent 1009")
+    assert "WS error        ConnectionClosedError: se..." in dashboard
+
+
+def test_dirty_pair_backfill_stall_warning_updates_runtime_last_error(tmp_path, caplog):
+    cfg = replace(scan_config(tmp_path), rest_book_seed_batch_stall_seconds=300.0)
+    params = PaperPortfolioParams.from_config(cfg)
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=TwoMarketClient(),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=logging.getLogger("test_targeted_backfill_stall"),
+        params=params,
+    )
+    scanner._runtime_started = True
+    monitor = _RestBookSeedBatchStallMonitor(
+        reason="dirty_pair_backfill",
+        stall_seconds=cfg.rest_book_seed_batch_stall_seconds,
+        logger=scanner.logger,
+        runtime_update=scanner._runtime_update,
+        runtime_snapshot=scanner.runtime.snapshot,
+    )
+    in_flight = {
+        "total_tokens": 4,
+        "current_batch_number": 1,
+        "total_batches": 2,
+        "current_batch_start_token": 1,
+        "current_batch_end_token": 2,
+        "current_batch_status": "in_flight",
+        "current_batch_started_at_utc": "2026-06-15T00:00:00Z",
+    }
+
+    monitor.note_progress(in_flight, loop_time=100.0)
+    with caplog.at_level(logging.WARNING, logger="test_targeted_backfill_stall"):
+        monitor.maybe_warn(loop_time=401.0)
+
+    assert "rest_book_seed_batch_stalled reason=dirty_pair_backfill age_seconds=301.0 batch=1/2" in caplog.text
+    assert (
+        scanner.runtime.snapshot()["last_error"]
+        == "dirty_pair_backfill stalled batch=1/2 tokens=1-2 threshold=300s"
+    )
+
+    monitor.note_progress(
+        {
+            **in_flight,
+            "completed_tokens": 2,
+            "remaining_tokens": 2,
+            "current_batch_status": "complete",
+        },
+        loop_time=402.0,
+    )
+
+    assert scanner.runtime.snapshot()["last_error"] is None
 
 
 def test_status_dashboard_treats_win32_alive_pid_as_online(monkeypatch):

@@ -92,6 +92,94 @@ class _BookChunkResult:
     failure_categories: Mapping[str, int]
 
 
+@dataclass
+class _RestBookSeedBatchStallMonitor:
+    reason: str
+    stall_seconds: float
+    logger: logging.Logger
+    runtime_update: Callable[..., None]
+    runtime_snapshot: Callable[[], Mapping[str, Any]]
+    current_batch_number: int = 0
+    total_batches: int = 0
+    total_tokens: int = 0
+    batch_start_token: int = 0
+    batch_end_token: int = 0
+    batch_started_at_utc: str | None = None
+    batch_started_at_loop_time: float | None = None
+    warning_message: str | None = None
+    warned_batch_key: tuple[int, str] | None = None
+
+    def note_progress(self, progress: Mapping[str, Any], *, loop_time: float) -> None:
+        status = progress.get("current_batch_status")
+        if status == "in_flight":
+            self._clear_warning_if_current()
+            self.current_batch_number = _progress_int(progress.get("current_batch_number"))
+            self.total_batches = _progress_int(progress.get("total_batches"))
+            self.total_tokens = _progress_int(progress.get("total_tokens"))
+            self.batch_start_token = _progress_int(progress.get("current_batch_start_token"))
+            self.batch_end_token = _progress_int(progress.get("current_batch_end_token"))
+            started_at = progress.get("current_batch_started_at_utc")
+            self.batch_started_at_utc = str(started_at) if started_at else None
+            self.batch_started_at_loop_time = loop_time
+            self.warning_message = None
+            self.warned_batch_key = None
+            return
+        if status in {"complete", "failed"}:
+            self.reset()
+
+    def maybe_warn(self, *, loop_time: float) -> None:
+        if self.batch_started_at_loop_time is None:
+            return
+        age_seconds = loop_time - self.batch_started_at_loop_time
+        if age_seconds < self.stall_seconds:
+            return
+        warning_message = self._warning_text()
+        if self.runtime_snapshot().get("last_error") != warning_message:
+            self.runtime_update(last_error=warning_message)
+        batch_key = self._current_batch_key()
+        if batch_key == self.warned_batch_key:
+            self.warning_message = warning_message
+            return
+        self.logger.warning(
+            "rest_book_seed_batch_stalled reason=%s age_seconds=%.1f batch=%s/%s tokens=%s-%s total_tokens=%s",
+            self.reason,
+            age_seconds,
+            self.current_batch_number,
+            self.total_batches,
+            self.batch_start_token,
+            self.batch_end_token,
+            self.total_tokens,
+        )
+        self.warning_message = warning_message
+        self.warned_batch_key = batch_key
+
+    def reset(self) -> None:
+        self._clear_warning_if_current()
+        self.current_batch_number = 0
+        self.total_batches = 0
+        self.total_tokens = 0
+        self.batch_start_token = 0
+        self.batch_end_token = 0
+        self.batch_started_at_utc = None
+        self.batch_started_at_loop_time = None
+        self.warning_message = None
+        self.warned_batch_key = None
+
+    def _clear_warning_if_current(self) -> None:
+        if self.warning_message and self.runtime_snapshot().get("last_error") == self.warning_message:
+            self.runtime_update(last_error=None)
+
+    def _current_batch_key(self) -> tuple[int, str]:
+        return (self.current_batch_number, self.batch_started_at_utc or "")
+
+    def _warning_text(self) -> str:
+        return (
+            f"{self.reason} stalled batch={self.current_batch_number}/{self.total_batches} "
+            f"tokens={self.batch_start_token}-{self.batch_end_token} "
+            f"threshold={self.stall_seconds:g}s"
+        )
+
+
 class _DirtyTokenAccumulator:
     def __init__(self) -> None:
         self._event = asyncio.Event()
@@ -666,6 +754,7 @@ class ConditionalArbScanner:
         *,
         reason: str,
         on_chunk_seeded: Callable[[set[str]], Any] | None = None,
+        on_progress_update: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> set[str]:
         chunks = self._book_seed_token_chunks(token_ids)
         if not chunks:
@@ -685,23 +774,24 @@ class ConditionalArbScanner:
             batch_start_token = completed_tokens + 1
             batch_end_token = completed_tokens + len(chunk)
             batch_started_at_utc = utc_iso()
-            progress(
-                {
-                    "total_tokens": total_tokens,
-                    "completed_tokens": completed_tokens,
-                    "remaining_tokens": total_tokens - completed_tokens,
-                    "received_books": received_books,
-                    "failed_tokens": failed_tokens,
-                    "current_batch_number": batch_number,
-                    "total_batches": total_batches,
-                    "current_batch_start_token": batch_start_token,
-                    "current_batch_end_token": batch_end_token,
-                    "current_batch_status": "in_flight",
-                    "current_batch_started_at_utc": batch_started_at_utc,
-                    "failed_token_sample": failed_token_sample,
-                    "failure_categories": failure_categories,
-                }
-            )
+            progress_payload = {
+                "total_tokens": total_tokens,
+                "completed_tokens": completed_tokens,
+                "remaining_tokens": total_tokens - completed_tokens,
+                "received_books": received_books,
+                "failed_tokens": failed_tokens,
+                "current_batch_number": batch_number,
+                "total_batches": total_batches,
+                "current_batch_start_token": batch_start_token,
+                "current_batch_end_token": batch_end_token,
+                "current_batch_status": "in_flight",
+                "current_batch_started_at_utc": batch_started_at_utc,
+                "failed_token_sample": failed_token_sample,
+                "failure_categories": failure_categories,
+            }
+            progress(progress_payload)
+            if on_progress_update is not None:
+                on_progress_update(dict(progress_payload))
             try:
                 chunk_result = await self._run_async_with_retries(
                     "rest_book_seed",
@@ -725,23 +815,24 @@ class ConditionalArbScanner:
                     len(chunk),
                     exc,
                 )
-                progress(
-                    {
-                        "total_tokens": total_tokens,
-                        "completed_tokens": completed_tokens,
-                        "remaining_tokens": total_tokens - completed_tokens,
-                        "received_books": received_books,
-                        "failed_tokens": failed_tokens,
-                        "current_batch_number": batch_number,
-                        "total_batches": total_batches,
-                        "current_batch_start_token": batch_start_token,
-                        "current_batch_end_token": batch_end_token,
-                        "current_batch_status": "failed",
-                        "current_batch_started_at_utc": batch_started_at_utc,
-                        "failed_token_sample": failed_token_sample,
-                        "failure_categories": failure_categories,
-                    }
-                )
+                progress_payload = {
+                    "total_tokens": total_tokens,
+                    "completed_tokens": completed_tokens,
+                    "remaining_tokens": total_tokens - completed_tokens,
+                    "received_books": received_books,
+                    "failed_tokens": failed_tokens,
+                    "current_batch_number": batch_number,
+                    "total_batches": total_batches,
+                    "current_batch_start_token": batch_start_token,
+                    "current_batch_end_token": batch_end_token,
+                    "current_batch_status": "failed",
+                    "current_batch_started_at_utc": batch_started_at_utc,
+                    "failed_token_sample": failed_token_sample,
+                    "failure_categories": failure_categories,
+                }
+                progress(progress_payload)
+                if on_progress_update is not None:
+                    on_progress_update(dict(progress_payload))
                 continue
 
             completed_tokens += len(chunk)
@@ -753,23 +844,24 @@ class ConditionalArbScanner:
             self._merge_failure_categories(failure_categories, chunk_result.failure_categories)
             updated = cache.seed_ask_books(chunk_result.books)
             all_updated.update(updated)
-            progress(
-                {
-                    "total_tokens": total_tokens,
-                    "completed_tokens": completed_tokens,
-                    "remaining_tokens": total_tokens - completed_tokens,
-                    "received_books": received_books,
-                    "failed_tokens": failed_tokens,
-                    "current_batch_number": batch_number,
-                    "total_batches": total_batches,
-                    "current_batch_start_token": batch_start_token,
-                    "current_batch_end_token": batch_end_token,
-                    "current_batch_status": "complete",
-                    "current_batch_started_at_utc": batch_started_at_utc,
-                    "failed_token_sample": failed_token_sample,
-                    "failure_categories": failure_categories,
-                }
-            )
+            progress_payload = {
+                "total_tokens": total_tokens,
+                "completed_tokens": completed_tokens,
+                "remaining_tokens": total_tokens - completed_tokens,
+                "received_books": received_books,
+                "failed_tokens": failed_tokens,
+                "current_batch_number": batch_number,
+                "total_batches": total_batches,
+                "current_batch_start_token": batch_start_token,
+                "current_batch_end_token": batch_end_token,
+                "current_batch_status": "complete",
+                "current_batch_started_at_utc": batch_started_at_utc,
+                "failed_token_sample": failed_token_sample,
+                "failure_categories": failure_categories,
+            }
+            progress(progress_payload)
+            if on_progress_update is not None:
+                on_progress_update(dict(progress_payload))
             if updated and on_chunk_seeded is not None:
                 callback_result = on_chunk_seeded(set(updated))
                 if hasattr(callback_result, "__await__"):
@@ -1003,6 +1095,7 @@ class ConditionalArbScanner:
                 endpoint=self.config.market_ws_endpoint,
                 heartbeat_seconds=self.config.market_ws_heartbeat_seconds,
                 max_assets_per_connection=self.config.market_ws_max_assets_per_connection,
+                max_message_size_bytes=self.config.market_ws_max_message_size_bytes,
             ),
             cache=cache,
             logger=self.logger,
@@ -1030,6 +1123,13 @@ class ConditionalArbScanner:
         reconcile_task: asyncio.Task[float] | None = None
         targeted_backfill_task: asyncio.Task[None] | None = None
         targeted_backfill_tokens: set[str] = set()
+        targeted_backfill_stall_monitor = _RestBookSeedBatchStallMonitor(
+            reason="dirty_pair_backfill",
+            stall_seconds=self.config.rest_book_seed_batch_stall_seconds,
+            logger=self.logger,
+            runtime_update=self._runtime_update,
+            runtime_snapshot=self.runtime.snapshot,
+        )
 
         def _finish_refresh_task_if_ready(current_universe: MarketUniverse) -> MarketUniverse:
             nonlocal refresh_task
@@ -1078,6 +1178,10 @@ class ConditionalArbScanner:
                     token_ids,
                     reason="dirty_pair_backfill",
                     on_chunk_seeded=_mark_backfill_seeded,
+                    on_progress_update=lambda progress: targeted_backfill_stall_monitor.note_progress(
+                        progress,
+                        loop_time=loop.time(),
+                    ),
                 )
 
         def _schedule_targeted_backfill(token_ids: set[str]) -> None:
@@ -1097,7 +1201,14 @@ class ConditionalArbScanner:
             except Exception as exc:
                 self.logger.warning("dirty_pair_backfill_failed error=%s", exc)
                 self._runtime_error(exc)
+            finally:
+                targeted_backfill_stall_monitor.reset()
             targeted_backfill_task = None
+
+        def _warn_targeted_backfill_stall_if_needed() -> None:
+            if targeted_backfill_task is None or targeted_backfill_task.done():
+                return
+            targeted_backfill_stall_monitor.maybe_warn(loop_time=loop.time())
 
         def _evaluate_dirty_batch(
             current_universe: MarketUniverse,
@@ -1210,6 +1321,7 @@ class ConditionalArbScanner:
 
             while self.running:
                 _finish_targeted_backfill_if_ready()
+                _warn_targeted_backfill_stall_if_needed()
                 universe = _finish_refresh_task_if_ready(universe)
                 if reconcile_task is not None and reconcile_task.done():
                     try:
@@ -1227,6 +1339,7 @@ class ConditionalArbScanner:
                 timeout = min(timeout, 1.0)
                 dirty_batch = await dirty_updates.wait(timeout=timeout)
                 _finish_targeted_backfill_if_ready()
+                _warn_targeted_backfill_stall_if_needed()
                 universe = _finish_refresh_task_if_ready(universe)
 
                 if dirty_batch is not None:

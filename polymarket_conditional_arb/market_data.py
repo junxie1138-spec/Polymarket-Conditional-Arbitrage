@@ -18,6 +18,7 @@ MarketWsSide = Literal["BUY", "SELL", "bid", "ask"]
 
 
 DEFAULT_MARKET_WS_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+DEFAULT_MARKET_WS_MAX_MESSAGE_SIZE_BYTES = 8_388_608
 DEFAULT_SKIPPED_SNAPSHOT_WARNING_INTERVAL_SECONDS = 60.0
 DEFAULT_RECENT_PUBLIC_EVIDENCE_LIMIT = 50
 
@@ -687,6 +688,7 @@ class MarketWebSocketSettings:
     endpoint: str = DEFAULT_MARKET_WS_ENDPOINT
     heartbeat_seconds: float = 10.0
     max_assets_per_connection: int = 500
+    max_message_size_bytes: int = DEFAULT_MARKET_WS_MAX_MESSAGE_SIZE_BYTES
     reconnect_initial_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
 
@@ -699,7 +701,7 @@ class _MarketWebSocketWorker:
         asset_ids: Iterable[str],
         cache: MarketDataCache,
         logger: logging.Logger,
-        connect_factory: Callable[[str], Any],
+        connect_factory: Callable[..., Any],
         on_dirty_tokens: Callable[[set[str]], None] | None = None,
         on_connection_lost: Callable[[set[str]], None] | None = None,
         on_connection_error: Callable[[Exception], None] | None = None,
@@ -724,7 +726,10 @@ class _MarketWebSocketWorker:
             connected = False
             heartbeat_task: asyncio.Task[None] | None = None
             try:
-                async with self.connect_factory(self.settings.endpoint) as websocket:
+                async with self.connect_factory(
+                    self.settings.endpoint,
+                    max_size=self.settings.max_message_size_bytes,
+                ) as websocket:
                     async with self._lock:
                         self.websocket = websocket
                         await websocket.send(json.dumps(market_subscribe_payload(sorted(self.asset_ids))))
@@ -790,10 +795,10 @@ class _MarketWebSocketWorker:
             await websocket.send("PING")
 
 
-def _default_connect_factory(endpoint: str) -> Any:
+def _default_connect_factory(endpoint: str, *, max_size: int) -> Any:
     import websockets
 
-    return websockets.connect(endpoint, ping_interval=None)
+    return websockets.connect(endpoint, ping_interval=None, max_size=max_size)
 
 
 class MarketWebSocketManager:
@@ -803,7 +808,7 @@ class MarketWebSocketManager:
         settings: MarketWebSocketSettings,
         cache: MarketDataCache,
         logger: logging.Logger | None = None,
-        connect_factory: Callable[[str], Any] | None = None,
+        connect_factory: Callable[..., Any] | None = None,
         on_dirty_tokens: Callable[[set[str]], None] | None = None,
         on_connection_lost: Callable[[set[str]], None] | None = None,
         on_connection_error: Callable[[Exception], None] | None = None,

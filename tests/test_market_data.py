@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import polymarket_conditional_arb.market_data as market_data_module
 from polymarket_conditional_arb.market_data import (
     MarketDataCache,
     MarketWebSocketManager,
@@ -63,9 +66,11 @@ class FakeConnection:
 class FakeConnectFactory:
     def __init__(self, *, disconnect_immediately: bool = False) -> None:
         self.disconnect_immediately = disconnect_immediately
+        self.calls: list[dict[str, object]] = []
         self.websockets: list[FakeWebSocket] = []
 
-    def __call__(self, _endpoint: str) -> FakeConnection:
+    def __call__(self, _endpoint: str, *, max_size: int | None = None) -> FakeConnection:
+        self.calls.append({"endpoint": _endpoint, "max_size": max_size})
         websocket = FakeWebSocket(disconnect_immediately=self.disconnect_immediately)
         self.websockets.append(websocket)
         return FakeConnection(websocket)
@@ -75,7 +80,8 @@ class FailingConnectFactory:
     def __init__(self) -> None:
         self.calls = 0
 
-    def __call__(self, _endpoint: str):
+    def __call__(self, _endpoint: str, *, max_size: int | None = None):
+        _ = max_size
         self.calls += 1
         raise RuntimeError("connect failed")
 
@@ -355,6 +361,21 @@ def test_chunk_asset_ids_uses_stable_500_token_style_partitions():
     assert chunk_asset_ids(["b", "a", "a", "c"], 2) == [["a", "b"], ["c"]]
 
 
+def test_default_connect_factory_passes_max_size(monkeypatch):
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_connect(endpoint: str, **kwargs):
+        calls.append((endpoint, kwargs))
+        return "fake-connection"
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_connect))
+
+    connection = market_data_module._default_connect_factory("ws://example", max_size=4_321)
+
+    assert connection == "fake-connection"
+    assert calls == [("ws://example", {"ping_interval": None, "max_size": 4_321})]
+
+
 class MarketWebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         manager = getattr(self, "manager", None)
@@ -379,6 +400,26 @@ class MarketWebSocketManagerTests(unittest.IsolatedAsyncioTestCase):
             "type": "market",
             "custom_feature_enabled": True,
         }
+
+    async def test_manager_passes_configured_max_message_size_to_connect_factory(self):
+        factory = FakeConnectFactory()
+        self.manager = MarketWebSocketManager(
+            settings=MarketWebSocketSettings(
+                endpoint="ws://example",
+                heartbeat_seconds=1,
+                max_assets_per_connection=500,
+                max_message_size_bytes=6_543,
+            ),
+            cache=MarketDataCache(),
+            logger=logging.getLogger("test_market_ws"),
+            connect_factory=factory,
+        )
+
+        await self.manager.start(["token-a"])
+        await wait_for(lambda: len(factory.websockets) == 1 and factory.websockets[0].sent)
+
+        assert self.manager.settings.max_message_size_bytes == 6_543
+        assert factory.calls == [{"endpoint": "ws://example", "max_size": 6_543}]
 
     async def test_token_chunking_creates_multiple_connections(self):
         factory = FakeConnectFactory()

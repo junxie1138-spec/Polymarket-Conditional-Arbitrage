@@ -31,8 +31,11 @@ DEFAULT_INCLUDE_NEG_RISK = False
 DEFAULT_MARKET_WS_ENABLED = True
 DEFAULT_MARKET_WS_HEARTBEAT_SECONDS = 10.0
 DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION = 500
+MIN_MARKET_WS_MAX_MESSAGE_SIZE_BYTES = 1_048_576
+DEFAULT_MARKET_WS_MAX_MESSAGE_SIZE_BYTES = 8_388_608
 DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_REST_RECONCILE_INTERVAL_SECONDS = 60
+DEFAULT_REST_BOOK_SEED_BATCH_STALL_SECONDS = 300.0
 DEFAULT_WS_STALE_SECONDS = 5.0
 DEFAULT_FAST_START_ENABLED = False
 DEFAULT_FAST_START_EVENT_LIMIT = 20
@@ -448,12 +451,29 @@ def market_ws_max_assets_per_connection() -> int:
     return max(1, env_int("COND_ARB_MARKET_WS_MAX_ASSETS_PER_CONNECTION", DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION))
 
 
+def market_ws_max_message_size_bytes() -> int:
+    return max(
+        MIN_MARKET_WS_MAX_MESSAGE_SIZE_BYTES,
+        env_int("COND_ARB_MARKET_WS_MAX_MESSAGE_SIZE_BYTES", DEFAULT_MARKET_WS_MAX_MESSAGE_SIZE_BYTES),
+    )
+
+
 def market_refresh_interval_seconds() -> int:
     return max(1, env_int("COND_ARB_MARKET_REFRESH_INTERVAL_SECONDS", DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS))
 
 
 def rest_reconcile_interval_seconds() -> int:
     return max(1, env_int("COND_ARB_REST_RECONCILE_INTERVAL_SECONDS", DEFAULT_REST_RECONCILE_INTERVAL_SECONDS))
+
+
+def rest_book_seed_batch_stall_seconds() -> float:
+    return max(
+        1.0,
+        env_float(
+            "COND_ARB_REST_BOOK_SEED_BATCH_STALL_SECONDS",
+            DEFAULT_REST_BOOK_SEED_BATCH_STALL_SECONDS,
+        ),
+    )
 
 
 def ws_stale_seconds() -> float:
@@ -662,8 +682,10 @@ class ScanConfig:
     market_ws_endpoint: str = MARKET_WS_PRODUCTION_ENDPOINT
     market_ws_heartbeat_seconds: float = DEFAULT_MARKET_WS_HEARTBEAT_SECONDS
     market_ws_max_assets_per_connection: int = DEFAULT_MARKET_WS_MAX_ASSETS_PER_CONNECTION
+    market_ws_max_message_size_bytes: int = DEFAULT_MARKET_WS_MAX_MESSAGE_SIZE_BYTES
     market_refresh_interval_seconds: int = DEFAULT_MARKET_REFRESH_INTERVAL_SECONDS
     rest_reconcile_interval_seconds: int = DEFAULT_REST_RECONCILE_INTERVAL_SECONDS
+    rest_book_seed_batch_stall_seconds: float = DEFAULT_REST_BOOK_SEED_BATCH_STALL_SECONDS
     ws_stale_seconds: float = DEFAULT_WS_STALE_SECONDS
     fast_start_enabled: bool = DEFAULT_FAST_START_ENABLED
     fast_start_event_limit: int = DEFAULT_FAST_START_EVENT_LIMIT
@@ -719,8 +741,10 @@ def load_scan_config() -> ScanConfig:
         market_ws_endpoint=market_ws_endpoint(),
         market_ws_heartbeat_seconds=market_ws_heartbeat_seconds(),
         market_ws_max_assets_per_connection=market_ws_max_assets_per_connection(),
+        market_ws_max_message_size_bytes=market_ws_max_message_size_bytes(),
         market_refresh_interval_seconds=market_refresh_interval_seconds(),
         rest_reconcile_interval_seconds=rest_reconcile_interval_seconds(),
+        rest_book_seed_batch_stall_seconds=rest_book_seed_batch_stall_seconds(),
         ws_stale_seconds=ws_stale_seconds(),
         fast_start_enabled=fast_start_enabled(),
         fast_start_event_limit=fast_start_event_limit(),
