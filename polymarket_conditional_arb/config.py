@@ -687,6 +687,10 @@ def paper_portfolio_runtime_path(base_data_dir: Path | None = None) -> Path:
     return (base_data_dir or data_dir()) / "paper_portfolio_runtime.json"
 
 
+def latency_report_path(base_data_dir: Path | None = None) -> Path:
+    return (base_data_dir or data_dir()) / "polymarket_latency_report.json"
+
+
 def scan_log_path(base_log_dir: Path | None = None) -> Path:
     return (base_log_dir or log_dir()) / "conditional_arb_scan.log"
 
@@ -744,6 +748,10 @@ class ScanConfig:
     @property
     def paper_portfolio_runtime_path(self) -> Path:
         return paper_portfolio_runtime_path(self.data_dir)
+
+    @property
+    def latency_report_path(self) -> Path:
+        return latency_report_path(self.data_dir)
 
     @property
     def scan_log_path(self) -> Path:

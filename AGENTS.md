@@ -32,6 +32,7 @@ Important runtime files:
 - `data/paper_portfolio_runtime.json`: runner heartbeat and current phase for `status`.
 - `data/paper_portfolio_instance.json.lock`: run/reset process lock.
 - `data/market_universe_cache.json`: generated market-universe cache.
+- `data/polymarket_latency_report.json`: optional saved public latency probe report.
 
 Do not revert or delete user-generated data casually. If a test or smoke run creates unwanted artifacts, explain what changed before cleaning them up.
 

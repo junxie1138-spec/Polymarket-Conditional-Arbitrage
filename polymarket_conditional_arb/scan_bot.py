@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import signal
 import time
@@ -16,6 +17,12 @@ from . import config
 from .arb_models import BinaryMarket, OrderBookSide
 from .event_log import utc_iso
 from .fetcher import GammaClobClient
+from .latency import (
+    LatencyProbeSettings,
+    format_latency_report,
+    measure_polymarket_latency,
+    write_latency_report,
+)
 from .market_data import MarketDataCache, MarketWebSocketManager, MarketWebSocketSettings
 from .market_universe_cache import (
     MarketUniverseCacheRecord,
@@ -2308,6 +2315,58 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show backend status history when the runtime payload includes it",
     )
+    latency_parser = subparsers.add_parser("latency", help="Measure public Polymarket endpoint latency")
+    latency_parser.add_argument(
+        "--samples",
+        type=int,
+        default=5,
+        help="REST samples per endpoint",
+    )
+    latency_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Timeout for each public endpoint probe",
+    )
+    latency_parser.add_argument(
+        "--pause-seconds",
+        type=float,
+        default=0.25,
+        help="Pause between samples for the same endpoint",
+    )
+    latency_parser.add_argument(
+        "--discovery-limit",
+        type=int,
+        default=20,
+        help="Gamma events to fetch while discovering a probe market",
+    )
+    latency_parser.add_argument(
+        "--include-websocket",
+        action="store_true",
+        help="Also measure market WebSocket connect and first-message latency",
+    )
+    latency_parser.add_argument(
+        "--ws-samples",
+        type=int,
+        default=1,
+        help="WebSocket samples when --include-websocket is set",
+    )
+    latency_parser.add_argument(
+        "--ws-first-message-timeout-seconds",
+        type=float,
+        default=5.0,
+        help="Time to wait for a subscribed market WebSocket message",
+    )
+    latency_parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Write the JSON report to data/polymarket_latency_report.json",
+    )
+    latency_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the raw JSON report instead of a table",
+    )
     reset_parser = subparsers.add_parser("reset", help="Reset the local paper portfolio state")
     reset_parser.add_argument("--yes", action="store_true", help="Confirm resetting the paper portfolio")
     return parser
@@ -2340,14 +2399,14 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     scan_config = _config_from_args(args)
     command = args.command or "run"
-    params = PaperPortfolioParams.from_config(scan_config)
-    portfolio = PaperPortfolio(
-        scan_config.paper_portfolio_instance_path,
-        events_path=scan_config.paper_portfolio_events_path,
-        params=params,
-    )
 
     if command == "status":
+        params = PaperPortfolioParams.from_config(scan_config)
+        portfolio = PaperPortfolio(
+            scan_config.paper_portfolio_instance_path,
+            events_path=scan_config.paper_portfolio_events_path,
+            params=params,
+        )
         refresh_seconds = max(0.1, float(getattr(args, "refresh_seconds", 2.0)))
         show_log = bool(getattr(args, "show_log", False))
 
@@ -2365,7 +2424,39 @@ def main(argv: list[str] | None = None) -> None:
             parser.exit(2, f"{exc}\n")
         return
 
+    if command == "latency":
+        settings = LatencyProbeSettings(
+            rest_samples=max(1, int(getattr(args, "samples", 5))),
+            ws_samples=max(1, int(getattr(args, "ws_samples", 1))),
+            timeout_seconds=max(0.1, float(getattr(args, "timeout_seconds", 10.0))),
+            pause_seconds=max(0.0, float(getattr(args, "pause_seconds", 0.25))),
+            discovery_limit=max(1, int(getattr(args, "discovery_limit", 20))),
+            include_websocket=bool(getattr(args, "include_websocket", False)),
+            ws_first_message_timeout_seconds=max(
+                0.1,
+                float(getattr(args, "ws_first_message_timeout_seconds", 5.0)),
+            ),
+        )
+        try:
+            report = measure_polymarket_latency(scan_config=scan_config, settings=settings)
+        except Exception as exc:
+            parser.exit(2, f"{type(exc).__name__}: {exc}\n")
+        if getattr(args, "save", False):
+            write_latency_report(scan_config.latency_report_path, report)
+            print(f"Wrote latency report to {scan_config.latency_report_path}")
+        if getattr(args, "json", False):
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(format_latency_report(report))
+        return
+
     if command == "reset":
+        params = PaperPortfolioParams.from_config(scan_config)
+        portfolio = PaperPortfolio(
+            scan_config.paper_portfolio_instance_path,
+            events_path=scan_config.paper_portfolio_events_path,
+            params=params,
+        )
         if not getattr(args, "yes", False):
             parser.error("reset requires --yes")
         try:
@@ -2375,6 +2466,13 @@ def main(argv: list[str] | None = None) -> None:
             parser.exit(2, f"{exc}\n")
         print(f"Paper portfolio reset to {_money(params.starting_capital_usd)}")
         return
+
+    params = PaperPortfolioParams.from_config(scan_config)
+    portfolio = PaperPortfolio(
+        scan_config.paper_portfolio_instance_path,
+        events_path=scan_config.paper_portfolio_events_path,
+        params=params,
+    )
 
     try:
         with PortfolioDataLock(scan_config.paper_portfolio_instance_path):

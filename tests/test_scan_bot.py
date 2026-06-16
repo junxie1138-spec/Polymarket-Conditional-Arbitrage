@@ -2146,6 +2146,39 @@ def test_cli_run_fails_fast_when_portfolio_lock_exists(tmp_path, monkeypatch, ca
     assert "paper portfolio data is locked" in capsys.readouterr().err
 
 
+def test_cli_latency_is_read_only_and_can_save_report(tmp_path, monkeypatch, capsys):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COND_ARB_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COND_ARB_LOG_DIR", str(tmp_path / "logs"))
+    state_path = config.paper_portfolio_instance_path(data_dir)
+    state_path.parent.mkdir(parents=True)
+    lock = PortfolioDataLock(state_path).acquire()
+    report = {
+        "schema_version": 1,
+        "measured_at_utc": "2026-06-16T00:00:00Z",
+        "probe_market": None,
+        "summaries": {},
+        "recommendation": {"source": None, "latency_ms": None, "env": []},
+    }
+
+    def fake_measure(*, scan_config, settings):
+        assert scan_config.data_dir == data_dir
+        assert settings.rest_samples == 2
+        return report
+
+    monkeypatch.setattr("polymarket_conditional_arb.scan_bot.measure_polymarket_latency", fake_measure)
+    try:
+        main(["latency", "--samples", "2", "--pause-seconds", "0", "--save"])
+    finally:
+        lock.release()
+
+    captured = capsys.readouterr()
+    assert "Wrote latency report" in captured.out
+    assert "Polymarket public latency probe" in captured.out
+    assert not state_path.exists()
+    assert json.loads(config.latency_report_path(data_dir).read_text(encoding="utf-8")) == report
+
+
 def test_scanner_package_has_no_live_order_or_auth_imports():
     package_root = Path(__file__).resolve().parents[1] / "polymarket_conditional_arb"
     text = "\n".join(path.read_text(encoding="utf-8") for path in package_root.glob("*.py"))

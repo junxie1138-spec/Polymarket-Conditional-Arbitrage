@@ -44,6 +44,14 @@ Print one status snapshot for scripts or quick checks:
 uv run poly-cond-arb status --once
 ```
 
+Measure public Polymarket endpoint latency and print a simulation suggestion:
+
+```powershell
+uv run poly-cond-arb latency
+```
+
+Add `--include-websocket` to also sample market WebSocket connect and first-message latency, and `--save` to write the raw report to `data/polymarket_latency_report.json`.
+
 Reset the local simulated portfolio:
 
 ```powershell
@@ -88,6 +96,7 @@ The files below are generated local operational state and are ignored by Git. Tr
 - `data/paper_portfolio_instance.json`: current cash, equity, realized PnL, costs, executions, inventory, book fingerprints, live-public-data simulation metadata, and run metadata.
 - `data/paper_portfolio_events.jsonl`: append-only portfolio lifecycle, cycle, execution, settlement, and simulated execution-failure events.
 - `data/paper_portfolio_runtime.json`: current runner heartbeat, phase, executor and coverage status, warmup/cache counts, REST book-seed progress including active batch telemetry and compact failure samples/categories, WebSocket health counters, dirty WebSocket backlog counters, best-effort runtime write failure counters, last cycle summary, settlement counters, and simulation failure counts.
+- `data/polymarket_latency_report.json`: optional saved public latency probe results and simulation calibration suggestion.
 - `data/paper_portfolio_instance.json.lock`: local process lock for `run` and `reset --yes`.
 - `data/market_universe_cache.json`: warm-start cache of public tradable market metadata, kept in priority order.
 
