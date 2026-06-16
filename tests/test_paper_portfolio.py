@@ -905,6 +905,181 @@ def test_capped_deep_book_fingerprint_prevents_duplicate_execution(tmp_path):
     assert len(portfolio.state["executions"]) == 1
 
 
+def test_stepped_execution_persists_active_state_then_finalizes(tmp_path):
+    p = params(
+        simulation=simulation(
+            queue_depth_ratio=0.5,
+            queue_fill_probability=1.0,
+            partial_fill_probability=1.0,
+            partial_fill_min_ratio=1.0,
+            allow_deterministic_fill_fallback=True,
+            max_step_count=4,
+            step_quantity_shares=5.0,
+            merge_cost_per_step=False,
+        )
+    )
+    portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 20)]),
+        asks("no-token", [(0.49, 20)]),
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution is not None
+    assert decision.execution["quantity"] == pytest.approx(10.0)
+    assert decision.execution["quantity_redeemed"] == pytest.approx(10.0)
+    assert decision.execution["details"]["stepped_execution"]["step_count"] == 2
+    assert "active_execution" not in portfolio.state
+    assert len(portfolio.state["executions"]) == 1
+    assert portfolio.state["executions"][0]["details"]["stepped_execution"]["step_count"] == 2
+    saved = json.loads((tmp_path / "portfolio.json").read_text(encoding="utf-8"))
+    assert "active_execution" not in saved
+    assert saved["executions"][0]["details"]["stepped_execution"]["step_count"] == 2
+
+
+def test_resumed_active_execution_finishes_and_clears_state(tmp_path):
+    p = params(
+        simulation=simulation(
+            queue_depth_ratio=0.5,
+            queue_fill_probability=1.0,
+            partial_fill_probability=1.0,
+            partial_fill_min_ratio=1.0,
+            allow_deterministic_fill_fallback=True,
+            max_step_count=4,
+            step_quantity_shares=5.0,
+            merge_cost_per_step=False,
+        )
+    )
+    path = tmp_path / "portfolio.json"
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    portfolio.state["cash"] = 1000.15
+    portfolio.state["realized_pnl"] = 0.15
+    portfolio.state["total_equity"] = 1000.15
+    portfolio.state["active_execution"] = {
+        "execution_id": "paper:m1:1:deadbeef",
+        "market_id": "m1",
+        "condition_id": "c1",
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "book_fingerprint": "deadbeef",
+        "target_quantity": 10.0,
+        "target_yes_filled_quantity": 10.0,
+        "target_no_filled_quantity": 10.0,
+        "completed_quantity": 5.0,
+        "completed_yes_filled_quantity": 5.0,
+        "completed_no_filled_quantity": 5.0,
+        "current_step_quantity": 5.0,
+        "step_plan": {
+            "step_quantity_shares": 5.0,
+            "max_step_count": 4,
+            "grow_step_size_after_success": False,
+            "merge_cost_per_step": False,
+        },
+        "planned_execution": {
+            "execution_id": "paper:m1:1:deadbeef",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "event_id": "e1",
+            "event_title": "Event",
+            "question": "Will X happen?",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "executed_at_utc": "2026-06-08T12:00:00Z",
+            "book_fingerprint": "deadbeef",
+            "quantity": 10.0,
+            "quantity_redeemed": 10.0,
+            "yes_filled_quantity": 10.0,
+            "no_filled_quantity": 10.0,
+            "yes_vwap": 0.48,
+            "no_vwap": 0.49,
+            "yes_cost": 4.8,
+            "no_cost": 4.9,
+            "gross_cost": 9.7,
+            "estimated_fees": 0.0,
+            "slippage_buffer": 0.0,
+            "tax_cost": 0.0,
+            "merge_cost": 0.0,
+            "capital_used": 9.7,
+            "redeemed_value": 10.0,
+            "net_profit": 0.3,
+            "net_return_bps": 309.27835051546396,
+            "effective_slippage_bps": 0.0,
+            "trade_ceiling_usd": 100.0,
+            "ceiling_used_usd": 9.7,
+            "stop_reason": "cash_or_ceiling_limit",
+            "simulation": {
+                "fill_timestamp_utc": "2026-06-08T12:00:00Z",
+                "step_index": 1,
+                "partial_fill": {
+                    "applied": False,
+                    "source": "full_public_depth",
+                    "target_quantity": 10.0,
+                    "yes_filled_quantity": 5.0,
+                    "no_filled_quantity": 5.0,
+                    "matched_quantity": 5.0,
+                    "unmatched_yes_quantity": 0.0,
+                    "unmatched_no_quantity": 0.0,
+                },
+            },
+            "details": {
+                "yes_best_ask": 0.48,
+                "no_best_ask": 0.49,
+                "yes_source": "rest_book",
+                "no_source": "rest_book",
+                "min_order_size": 5.0,
+                "tranches": [
+                    {"quantity": 5.0, "yes_price": 0.48, "no_price": 0.49, "unit_gross_cost": 0.97},
+                ],
+                "signal_book_fingerprint": "deadbeef",
+                "stepped_execution": {"step_count": 1},
+            },
+        },
+        "steps": [
+            {
+                "execution_id": "paper:m1:1:deadbeef:step:1",
+                "executed_at_utc": "2026-06-08T12:00:00Z",
+                "book_fingerprint": "deadbeef-step-1",
+                "quantity": 5.0,
+                "yes_filled_quantity": 5.0,
+                "no_filled_quantity": 5.0,
+                "quantity_redeemed": 5.0,
+                "yes_cost": 2.4,
+                "no_cost": 2.45,
+                "gross_cost": 4.85,
+                "estimated_fees": 0.0,
+                "slippage_buffer": 0.0,
+                "tax_cost": 0.0,
+                "merge_cost": 0.0,
+                "capital_used": 4.85,
+                "redeemed_value": 5.0,
+                "net_profit": 0.15,
+                "cash_before": 1000.0,
+                "cash_after": 1000.15,
+                "simulation": {"step_index": 1},
+            }
+        ],
+    }
+    portfolio.save()
+    portfolio.load()
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 20)]),
+        asks("no-token", [(0.49, 20)]),
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution is not None
+    assert "active_execution" not in portfolio.state
+    assert len(portfolio.state["executions"]) == 1
+    assert portfolio.state["cash"] == pytest.approx(1000.3)
+    assert portfolio.state["executions"][-1]["details"]["stepped_execution"]["step_count"] == 2
+
+
 def test_state_file_load_ignores_leftover_tmp_file(tmp_path):
     p = params()
     path = tmp_path / "portfolio.json"

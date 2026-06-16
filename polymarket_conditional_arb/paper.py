@@ -15,7 +15,7 @@ from .event_log import AppendOnlyJsonl, jsonable, utc_iso
 
 EPSILON = 1e-9
 SCHEMA_VERSION = 1
-PORTFOLIO_SCHEMA_VERSION = 2
+PORTFOLIO_SCHEMA_VERSION = 3
 LOGGER = logging.getLogger(__name__)
 
 
@@ -149,12 +149,22 @@ def _rounded_tranches(tranches: tuple[dict[str, float], ...]) -> list[dict[str, 
     ]
 
 
+def _step_plan_payload(simulation: config.PaperExecutionSimulationConfig) -> dict[str, Any]:
+    return {
+        "step_quantity_shares": simulation.step_quantity_shares,
+        "max_step_count": simulation.max_step_count,
+        "grow_step_size_after_success": simulation.grow_step_size_after_success,
+        "merge_cost_per_step": simulation.merge_cost_per_step,
+    }
+
+
 def book_pair_fingerprint(
     market: BinaryMarket,
     yes_asks: OrderBookSide,
     no_asks: OrderBookSide,
     *,
     tranches: tuple[dict[str, float], ...] = (),
+    step_plan: Mapping[str, Any] | None = None,
 ) -> str:
     payload = {
         "market_id": market.market_id,
@@ -163,6 +173,8 @@ def book_pair_fingerprint(
         "no_token_id": market.no_token_id,
         "tranches": _rounded_tranches(tranches),
     }
+    if step_plan:
+        payload["step_plan"] = dict(step_plan)
     source_revisions = {
         side: revision
         for side, revision in (
@@ -428,6 +440,580 @@ def _stable_unit_interval(*parts: Any) -> float:
     payload = "|".join(str(part) for part in parts)
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+
+
+def _active_execution_state(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    active = state.get("active_execution")
+    return dict(active) if isinstance(active, Mapping) else None
+
+
+def _normalize_step_history(raw_steps: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_steps, list):
+        return []
+    steps: list[dict[str, Any]] = []
+    for row in raw_steps:
+        if isinstance(row, Mapping):
+            steps.append(dict(row))
+    return steps
+
+
+def _merge_cost_for_step(params: PaperPortfolioParams, step_index: int) -> float:
+    if params.simulation.merge_cost_per_step:
+        return params.merge_cost_usd
+    return params.merge_cost_usd if step_index == 1 else 0.0
+
+
+def _step_target_quantity(
+    *,
+    remaining_quantity: float,
+    params: PaperPortfolioParams,
+    current_step_quantity: float,
+) -> float:
+    return max(
+        0.0,
+        min(
+            remaining_quantity,
+            max(
+                params.simulation.step_quantity_shares,
+                current_step_quantity,
+            ),
+        ),
+    )
+
+
+def _execute_paper_step(
+    market: BinaryMarket,
+    yes_asks: OrderBookSide,
+    no_asks: OrderBookSide,
+    *,
+    state: Mapping[str, Any],
+    params: PaperPortfolioParams,
+    as_of: datetime,
+    max_quantity: float | None,
+    simulation_metadata: dict[str, Any],
+    signal_execution: Mapping[str, Any],
+    evidence: FillTimeBookEvidence | None = None,
+    side_fill_quantities: Mapping[str, float] | None = None,
+) -> PaperPortfolioDecision:
+    cash = _as_float(state.get("cash"), params.starting_capital_usd)
+    quantity, yes_cost, no_cost, tranches, stop_reason = _simulate_paired_tranches(
+        yes_asks,
+        no_asks,
+        cash=cash,
+        params=params,
+        max_quantity=max_quantity,
+    )
+    fingerprint = book_pair_fingerprint(
+        market,
+        yes_asks,
+        no_asks,
+        tranches=tranches,
+        step_plan=_step_plan_payload(params.simulation),
+    )
+    simulation_metadata = dict(simulation_metadata)
+    simulation_metadata.update(
+        {
+            "fill_book_source": simulation_metadata.get("book_source", "fill_time"),
+            "fill_book_fingerprint": fingerprint,
+            "fill_source_timestamps": _book_timestamps(yes_asks, no_asks),
+        }
+    )
+
+    if _known_fingerprint(state, market.market_id) == fingerprint:
+        return PaperPortfolioDecision.skip(
+            "unchanged_book_snapshot",
+            market_id=market.market_id,
+            book_fingerprint=fingerprint,
+            simulation=simulation_metadata,
+        )
+
+    min_quantity = market.effective_min_order_size
+    if quantity <= EPSILON:
+        return _simulation_failure_decision(
+            stop_reason,
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            yes_best_ask=yes_asks.best_price,
+            no_best_ask=no_asks.best_price,
+        )
+    if quantity + EPSILON < min_quantity:
+        return _simulation_failure_decision(
+            "simulation_insufficient_depth",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            available_equal_depth=quantity,
+            min_quantity=min_quantity,
+        )
+
+    gross_cost = yes_cost + no_cost
+    signal_quantity = _as_float(signal_execution.get("quantity"))
+    signal_gross_cost = _as_float(signal_execution.get("gross_cost"))
+    if params.simulation.max_fill_price_move_bps > 0.0 and signal_quantity > EPSILON and signal_gross_cost > EPSILON:
+        signal_unit_cost = signal_gross_cost / signal_quantity
+        fill_unit_cost = gross_cost / quantity
+        move_bps = ((fill_unit_cost - signal_unit_cost) / signal_unit_cost) * 10_000.0
+        simulation_metadata["price_move_bps"] = move_bps
+        if move_bps > params.simulation.max_fill_price_move_bps + EPSILON:
+            return _simulation_failure_decision(
+                "simulation_fill_price_moved",
+                market=market,
+                simulation=simulation_metadata,
+                book_fingerprint=fingerprint,
+                signal_unit_cost=signal_unit_cost,
+                fill_unit_cost=fill_unit_cost,
+                max_fill_price_move_bps=params.simulation.max_fill_price_move_bps,
+            )
+
+    effective_slippage_bps, slippage_metadata = _calibrated_slippage(
+        params=params,
+        simulation=params.simulation,
+        market=market,
+        quantity=quantity,
+        yes_book=yes_asks,
+        no_book=no_asks,
+        signal_execution=signal_execution,
+        evidence=evidence,
+        as_of=as_of,
+    )
+    simulation_metadata["slippage"] = slippage_metadata
+    full_fill_costs = _cost_breakdown(gross_cost, params, slippage_bps=effective_slippage_bps)
+    full_fill_capital_used = gross_cost + sum(full_fill_costs.values())
+    full_fill_net_profit = quantity - full_fill_capital_used
+    full_fill_net_return_bps = (
+        (full_fill_net_profit / full_fill_capital_used) * 10_000.0 if full_fill_capital_used > 0 else 0.0
+    )
+    if (
+        full_fill_net_profit <= EPSILON
+        or full_fill_net_profit + EPSILON < params.min_net_profit_usd
+        or full_fill_net_return_bps + EPSILON < params.min_net_return_bps
+    ):
+        return _simulation_failure_decision(
+            "simulation_not_profitable_at_fill",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            quantity=quantity,
+            gross_cost=gross_cost,
+            capital_used=full_fill_capital_used,
+            net_profit=full_fill_net_profit,
+            net_return_bps=full_fill_net_return_bps,
+        )
+
+    partial_applied = False
+    side_fill_source = "full_public_depth"
+    yes_filled_quantity = quantity
+    no_filled_quantity = quantity
+    if isinstance(side_fill_quantities, Mapping):
+        yes_filled_quantity = min(quantity, max(0.0, _as_float(side_fill_quantities.get("yes"), quantity)))
+        no_filled_quantity = min(quantity, max(0.0, _as_float(side_fill_quantities.get("no"), quantity)))
+        partial_applied = yes_filled_quantity + EPSILON < quantity or no_filled_quantity + EPSILON < quantity
+        side_fill_source = "public_queue_evidence"
+    elif (
+        params.simulation.partial_fill_probability > 0.0
+        and _stage_random(params.simulation, market, fingerprint, "partial_fill") <= params.simulation.partial_fill_probability
+    ):
+        partial_applied = True
+        side_fill_source = "deterministic_partial_fallback"
+        min_ratio = max(0.0, min(1.0, params.simulation.partial_fill_min_ratio))
+        yes_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
+            params.simulation,
+            market,
+            fingerprint,
+            "partial_ratio",
+            "yes",
+        )
+        no_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
+            params.simulation,
+            market,
+            fingerprint,
+            "partial_ratio",
+            "no",
+        )
+        yes_filled_quantity = quantity * yes_ratio
+        no_filled_quantity = quantity * no_ratio
+
+    yes_actual_cost = _fill_cost(yes_asks, yes_filled_quantity)
+    no_actual_cost = _fill_cost(no_asks, no_filled_quantity)
+    gross_cost = yes_actual_cost + no_actual_cost
+    matched_quantity = min(yes_filled_quantity, no_filled_quantity)
+    merge_cost = _merge_cost_for_step(params, int(_as_float(simulation_metadata.get("step_index"), 1.0)))
+    costs = _cost_breakdown(
+        gross_cost,
+        params,
+        merge_cost_usd=merge_cost,
+        slippage_bps=effective_slippage_bps,
+    )
+    capital_used = gross_cost + sum(costs.values())
+    redeemed_value = matched_quantity
+    net_profit = redeemed_value - capital_used
+    net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > 0 else 0.0
+
+    simulation_metadata["partial_fill"] = {
+        "applied": partial_applied,
+        "source": side_fill_source,
+        "target_quantity": quantity,
+        "yes_filled_quantity": yes_filled_quantity,
+        "no_filled_quantity": no_filled_quantity,
+        "matched_quantity": matched_quantity,
+        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
+        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+    }
+    execution_count = len(state.get("executions") or [])
+    execution_id = f"paper:{market.market_id}:{execution_count + 1}:{fingerprint[:12]}"
+    execution = {
+        "execution_id": execution_id,
+        "opportunity_id": f"binary:{market.market_id}:{fingerprint[:12]}",
+        "kind": "binary_complete_set",
+        "mode": "paper_portfolio_instance",
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "event_id": market.event_id,
+        "event_title": market.event_title,
+        "question": market.question,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "executed_at_utc": simulation_metadata["fill_timestamp_utc"],
+        "book_fingerprint": fingerprint,
+        "quantity": quantity,
+        "quantity_redeemed": matched_quantity,
+        "yes_filled_quantity": yes_filled_quantity,
+        "no_filled_quantity": no_filled_quantity,
+        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
+        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+        "yes_vwap": yes_actual_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
+        "no_vwap": no_actual_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
+        "yes_cost": yes_actual_cost,
+        "no_cost": no_actual_cost,
+        "gross_cost": gross_cost,
+        "estimated_fees": costs["fees_usd"],
+        "slippage_buffer": costs["slippage_usd"],
+        "tax_cost": costs["tax_usd"],
+        "merge_cost": costs["merge_usd"],
+        "capital_used": capital_used,
+        "redeemed_value": redeemed_value,
+        "net_profit": net_profit,
+        "net_return_bps": net_return_bps,
+        "effective_slippage_bps": effective_slippage_bps,
+        "trade_ceiling_usd": params.trade_ceiling_usd,
+        "ceiling_used_usd": capital_used,
+        "stop_reason": stop_reason,
+        "simulation": simulation_metadata,
+        "source_timestamps": _book_timestamps(yes_asks, no_asks),
+        "details": {
+            "yes_best_ask": yes_asks.best_price,
+            "no_best_ask": no_asks.best_price,
+            "yes_source": yes_asks.source,
+            "no_source": no_asks.source,
+            "min_order_size": min_quantity,
+            "tranches": list(tranches),
+            "signal_book_fingerprint": signal_execution.get("book_fingerprint"),
+        },
+    }
+    return PaperPortfolioDecision.execute(execution)
+
+
+def _step_completed_reason(stop_reason: str) -> bool:
+    return stop_reason in {
+        "cash_or_ceiling_limit",
+        "edge_disappeared",
+        "depth_exhausted",
+        "target_quantity_limit",
+        "simulation_queue_unfilled",
+        "simulation_queue_min_size",
+        "simulation_local_pressure_min_size",
+    }
+
+
+def _step_fingerprint(parent_fingerprint: str, step_index: int, step_quantity: float) -> str:
+    payload = json.dumps(
+        {
+            "parent_book_fingerprint": parent_fingerprint,
+            "step_index": step_index,
+            "step_quantity": round(float(step_quantity), 12),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _slice_tranches(
+    raw_tranches: Any,
+    *,
+    offset_quantity: float,
+    step_quantity: float,
+) -> list[dict[str, float]]:
+    if not isinstance(raw_tranches, list):
+        return []
+    remaining_offset = max(0.0, offset_quantity)
+    remaining_step = max(0.0, step_quantity)
+    sliced: list[dict[str, float]] = []
+    for tranche in raw_tranches:
+        if not isinstance(tranche, Mapping):
+            continue
+        tranche_quantity = max(0.0, _as_float(tranche.get("quantity")))
+        if tranche_quantity <= EPSILON:
+            continue
+        if remaining_offset >= tranche_quantity - EPSILON:
+            remaining_offset -= tranche_quantity
+            continue
+        quantity_available = tranche_quantity - remaining_offset
+        remaining_offset = 0.0
+        take = min(quantity_available, remaining_step)
+        if take <= EPSILON:
+            break
+        yes_price = _as_float(tranche.get("yes_price"))
+        no_price = _as_float(tranche.get("no_price"))
+        if yes_price <= EPSILON or no_price <= EPSILON:
+            continue
+        sliced.append(
+            {
+                "quantity": take,
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "unit_gross_cost": _as_float(tranche.get("unit_gross_cost"), yes_price + no_price),
+            }
+        )
+        remaining_step -= take
+        if remaining_step <= EPSILON:
+            break
+    return sliced
+
+
+def _scaled_partial_fill(
+    partial_fill: Any,
+    *,
+    ratio: float,
+    target_quantity: float,
+    yes_filled_quantity: float,
+    no_filled_quantity: float,
+) -> dict[str, Any]:
+    base = dict(partial_fill) if isinstance(partial_fill, Mapping) else {}
+    matched_quantity = min(yes_filled_quantity, no_filled_quantity)
+    base.update(
+        {
+            "target_quantity": target_quantity,
+            "yes_filled_quantity": yes_filled_quantity,
+            "no_filled_quantity": no_filled_quantity,
+            "matched_quantity": matched_quantity,
+            "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
+            "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+            "parent_scale_ratio": ratio,
+        }
+    )
+    return base
+
+
+def _build_step_execution(
+    planned_execution: Mapping[str, Any],
+    *,
+    active_execution_id: str,
+    step_index: int,
+    offset_quantity: float,
+    step_quantity: float,
+    yes_fill_quantity: float,
+    no_fill_quantity: float,
+    params: PaperPortfolioParams,
+) -> dict[str, Any]:
+    planned = deepcopy(dict(planned_execution))
+    planned_quantity = max(EPSILON, _as_float(planned.get("quantity")))
+    step_fingerprint = _step_fingerprint(str(planned.get("book_fingerprint") or ""), step_index, step_quantity)
+
+    planned_yes_filled = max(0.0, _as_float(planned.get("yes_filled_quantity"), planned_quantity))
+    planned_no_filled = max(0.0, _as_float(planned.get("no_filled_quantity"), planned_quantity))
+    yes_filled_quantity = min(max(0.0, yes_fill_quantity), step_quantity)
+    no_filled_quantity = min(max(0.0, no_fill_quantity), step_quantity)
+    yes_ratio = yes_filled_quantity / planned_yes_filled if planned_yes_filled > EPSILON else 0.0
+    no_ratio = no_filled_quantity / planned_no_filled if planned_no_filled > EPSILON else 0.0
+    yes_cost = _as_float(planned.get("yes_cost")) * yes_ratio
+    no_cost = _as_float(planned.get("no_cost")) * no_ratio
+    gross_cost = yes_cost + no_cost
+    planned_gross_cost = _as_float(planned.get("gross_cost"))
+    gross_ratio = gross_cost / planned_gross_cost if planned_gross_cost > EPSILON else 0.0
+    estimated_fees = _as_float(planned.get("estimated_fees")) * gross_ratio
+    slippage_buffer = _as_float(planned.get("slippage_buffer")) * gross_ratio
+    tax_cost = _as_float(planned.get("tax_cost")) * gross_ratio
+    merge_cost = _merge_cost_for_step(params, step_index)
+    capital_used = gross_cost + estimated_fees + slippage_buffer + tax_cost + merge_cost
+    matched_quantity = min(yes_filled_quantity, no_filled_quantity)
+    net_profit = matched_quantity - capital_used
+    net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > EPSILON else 0.0
+    target_ratio = step_quantity / planned_quantity if planned_quantity > EPSILON else 0.0
+
+    details = dict(planned.get("details")) if isinstance(planned.get("details"), Mapping) else {}
+    details["parent_execution_id"] = active_execution_id
+    details["parent_book_fingerprint"] = planned.get("book_fingerprint")
+    details["step_index"] = step_index
+    details["step_offset_quantity"] = offset_quantity
+    details["tranches"] = _slice_tranches(
+        details.get("tranches"),
+        offset_quantity=offset_quantity,
+        step_quantity=step_quantity,
+    )
+
+    simulation = dict(planned.get("simulation")) if isinstance(planned.get("simulation"), Mapping) else {}
+    partial_fill = simulation.get("partial_fill")
+    simulation["partial_fill"] = _scaled_partial_fill(
+        partial_fill,
+        ratio=target_ratio,
+        target_quantity=step_quantity,
+        yes_filled_quantity=yes_filled_quantity,
+        no_filled_quantity=no_filled_quantity,
+    )
+    simulation["stepped_execution"] = {
+        "active_execution_id": active_execution_id,
+        "parent_book_fingerprint": planned.get("book_fingerprint"),
+        "step_index": step_index,
+        "step_offset_quantity": offset_quantity,
+        "step_quantity": step_quantity,
+        "target_scale_ratio": target_ratio,
+        "yes_fill_scale_ratio": yes_ratio,
+        "no_fill_scale_ratio": no_ratio,
+        "gross_cost_scale_ratio": gross_ratio,
+    }
+    simulation["step_index"] = step_index
+
+    step_execution = {
+        **planned,
+        "execution_id": f"{active_execution_id}:step:{step_index}",
+        "parent_execution_id": active_execution_id,
+        "book_fingerprint": step_fingerprint,
+        "quantity": step_quantity,
+        "quantity_redeemed": matched_quantity,
+        "yes_filled_quantity": yes_filled_quantity,
+        "no_filled_quantity": no_filled_quantity,
+        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
+        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+        "yes_vwap": yes_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
+        "no_vwap": no_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
+        "yes_cost": yes_cost,
+        "no_cost": no_cost,
+        "gross_cost": gross_cost,
+        "estimated_fees": estimated_fees,
+        "slippage_buffer": slippage_buffer,
+        "tax_cost": tax_cost,
+        "merge_cost": merge_cost,
+        "capital_used": capital_used,
+        "redeemed_value": matched_quantity,
+        "net_profit": net_profit,
+        "net_return_bps": net_return_bps,
+        "ceiling_used_usd": capital_used,
+        "stop_reason": "target_quantity_limit",
+        "simulation": simulation,
+        "details": details,
+    }
+    return step_execution
+
+
+def _step_summary_rows(steps: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "execution_id": step.get("execution_id"),
+            "step_index": step.get("simulation", {}).get("step_index") if isinstance(step.get("simulation"), Mapping) else None,
+            "book_fingerprint": step.get("book_fingerprint"),
+            "quantity": _as_float(step.get("quantity")),
+            "yes_filled_quantity": _as_float(step.get("yes_filled_quantity"), _as_float(step.get("quantity"))),
+            "no_filled_quantity": _as_float(step.get("no_filled_quantity"), _as_float(step.get("quantity"))),
+            "quantity_redeemed": _as_float(step.get("quantity_redeemed")),
+            "capital_used": _as_float(step.get("capital_used")),
+            "net_profit": _as_float(step.get("net_profit")),
+            "cash_before": step.get("cash_before"),
+            "cash_after": step.get("cash_after"),
+        }
+        for step in steps
+    ]
+
+
+def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfolioParams) -> dict[str, Any]:
+    planned = deepcopy(dict(active.get("planned_execution") if isinstance(active.get("planned_execution"), Mapping) else {}))
+    steps = _normalize_step_history(active.get("steps"))
+    if not steps:
+        return planned
+
+    def total(field: str, default: float = 0.0) -> float:
+        return sum(_as_float(step.get(field), default) for step in steps)
+
+    quantity = total("quantity")
+    yes_filled_quantity = total("yes_filled_quantity")
+    no_filled_quantity = total("no_filled_quantity")
+    quantity_redeemed = total("quantity_redeemed")
+    yes_cost = total("yes_cost")
+    no_cost = total("no_cost")
+    gross_cost = yes_cost + no_cost
+    estimated_fees = total("estimated_fees")
+    slippage_buffer = total("slippage_buffer")
+    tax_cost = total("tax_cost")
+    merge_cost = total("merge_cost")
+    capital_used = gross_cost + estimated_fees + slippage_buffer + tax_cost + merge_cost
+    net_profit = total("net_profit")
+    net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > EPSILON else 0.0
+    weighted_slippage_bps = (
+        (slippage_buffer / gross_cost) * 10_000.0 if gross_cost > EPSILON else _as_float(planned.get("effective_slippage_bps"))
+    )
+
+    details = dict(planned.get("details")) if isinstance(planned.get("details"), Mapping) else {}
+    details["stepped_execution"] = {
+        "step_count": len(steps),
+        "max_step_count": params.simulation.max_step_count,
+        "step_plan": dict(active.get("step_plan")) if isinstance(active.get("step_plan"), Mapping) else {},
+        "steps": _step_summary_rows(steps),
+    }
+
+    simulation = dict(planned.get("simulation")) if isinstance(planned.get("simulation"), Mapping) else {}
+    simulation["stepped_execution"] = {
+        "active_execution_id": active.get("execution_id"),
+        "step_count": len(steps),
+        "completed_quantity": quantity,
+        "target_quantity": _as_float(active.get("target_quantity"), _as_float(planned.get("quantity"))),
+        "max_step_count": params.simulation.max_step_count,
+        "step_plan": dict(active.get("step_plan")) if isinstance(active.get("step_plan"), Mapping) else {},
+        "started_at_utc": active.get("started_at_utc"),
+        "completed_at_utc": steps[-1].get("executed_at_utc"),
+        "step_execution_ids": [step.get("execution_id") for step in steps],
+    }
+
+    planned.update(
+        {
+            "execution_id": str(active.get("execution_id") or planned.get("execution_id") or ""),
+            "book_fingerprint": str(active.get("book_fingerprint") or planned.get("book_fingerprint") or ""),
+            "executed_at_utc": steps[-1].get("executed_at_utc"),
+            "quantity": quantity,
+            "quantity_redeemed": quantity_redeemed,
+            "yes_filled_quantity": yes_filled_quantity,
+            "no_filled_quantity": no_filled_quantity,
+            "unmatched_yes_quantity": max(0.0, yes_filled_quantity - quantity_redeemed),
+            "unmatched_no_quantity": max(0.0, no_filled_quantity - quantity_redeemed),
+            "yes_vwap": yes_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
+            "no_vwap": no_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
+            "yes_cost": yes_cost,
+            "no_cost": no_cost,
+            "gross_cost": gross_cost,
+            "estimated_fees": estimated_fees,
+            "slippage_buffer": slippage_buffer,
+            "tax_cost": tax_cost,
+            "merge_cost": merge_cost,
+            "capital_used": capital_used,
+            "redeemed_value": quantity_redeemed,
+            "net_profit": net_profit,
+            "net_return_bps": net_return_bps,
+            "effective_slippage_bps": weighted_slippage_bps,
+            "ceiling_used_usd": capital_used,
+            "stop_reason": str(active.get("stop_reason") or planned.get("stop_reason") or "target_quantity_limit"),
+            "cash_before": steps[0].get("cash_before"),
+            "cash_after": steps[-1].get("cash_after"),
+            "redeemed_cost_basis_usd": total("redeemed_cost_basis_usd"),
+            "simulation": simulation,
+            "details": details,
+        }
+    )
+    preexisting_redeemed = total("preexisting_redeemed_value")
+    preexisting_cost_basis = total("preexisting_redeemed_cost_basis_usd")
+    if preexisting_redeemed > EPSILON:
+        planned["preexisting_redeemed_value"] = preexisting_redeemed
+        planned["preexisting_redeemed_cost_basis_usd"] = preexisting_cost_basis
+    return planned
 
 
 def _stage_random(
@@ -1078,233 +1664,6 @@ def _calibrated_slippage(
     return final_bps, metadata
 
 
-def _finalize_execution_from_books(
-    market: BinaryMarket,
-    yes_asks: OrderBookSide,
-    no_asks: OrderBookSide,
-    *,
-    state: Mapping[str, Any],
-    params: PaperPortfolioParams,
-    as_of: datetime,
-    max_quantity: float | None,
-    simulation_metadata: dict[str, Any],
-    signal_execution: Mapping[str, Any],
-    evidence: FillTimeBookEvidence | None = None,
-    side_fill_quantities: Mapping[str, float] | None = None,
-) -> PaperPortfolioDecision:
-    cash = _as_float(state.get("cash"), params.starting_capital_usd)
-    quantity, yes_cost, no_cost, tranches, stop_reason = _simulate_paired_tranches(
-        yes_asks,
-        no_asks,
-        cash=cash,
-        params=params,
-        max_quantity=max_quantity,
-    )
-    fingerprint = book_pair_fingerprint(market, yes_asks, no_asks, tranches=tranches)
-    simulation_metadata = dict(simulation_metadata)
-    simulation_metadata.update(
-        {
-            "fill_book_source": simulation_metadata.get("book_source", "fill_time"),
-            "fill_book_fingerprint": fingerprint,
-            "fill_source_timestamps": _book_timestamps(yes_asks, no_asks),
-        }
-    )
-
-    if _known_fingerprint(state, market.market_id) == fingerprint:
-        return PaperPortfolioDecision.skip(
-            "unchanged_book_snapshot",
-            market_id=market.market_id,
-            book_fingerprint=fingerprint,
-            simulation=simulation_metadata,
-        )
-
-    min_quantity = market.effective_min_order_size
-    if quantity <= EPSILON:
-        return _simulation_failure_decision(
-            stop_reason,
-            market=market,
-            simulation=simulation_metadata,
-            book_fingerprint=fingerprint,
-            yes_best_ask=yes_asks.best_price,
-            no_best_ask=no_asks.best_price,
-        )
-    if quantity + EPSILON < min_quantity:
-        return _simulation_failure_decision(
-            "simulation_insufficient_depth",
-            market=market,
-            simulation=simulation_metadata,
-            book_fingerprint=fingerprint,
-            available_equal_depth=quantity,
-            min_quantity=min_quantity,
-        )
-
-    gross_cost = yes_cost + no_cost
-    signal_quantity = _as_float(signal_execution.get("quantity"))
-    signal_gross_cost = _as_float(signal_execution.get("gross_cost"))
-    if params.simulation.max_fill_price_move_bps > 0.0 and signal_quantity > EPSILON and signal_gross_cost > EPSILON:
-        signal_unit_cost = signal_gross_cost / signal_quantity
-        fill_unit_cost = gross_cost / quantity
-        move_bps = ((fill_unit_cost - signal_unit_cost) / signal_unit_cost) * 10_000.0
-        simulation_metadata["price_move_bps"] = move_bps
-        if move_bps > params.simulation.max_fill_price_move_bps + EPSILON:
-            return _simulation_failure_decision(
-                "simulation_fill_price_moved",
-                market=market,
-                simulation=simulation_metadata,
-                book_fingerprint=fingerprint,
-                signal_unit_cost=signal_unit_cost,
-                fill_unit_cost=fill_unit_cost,
-                max_fill_price_move_bps=params.simulation.max_fill_price_move_bps,
-            )
-
-    effective_slippage_bps, slippage_metadata = _calibrated_slippage(
-        params=params,
-        simulation=params.simulation,
-        market=market,
-        quantity=quantity,
-        yes_book=yes_asks,
-        no_book=no_asks,
-        signal_execution=signal_execution,
-        evidence=evidence,
-        as_of=as_of,
-    )
-    simulation_metadata["slippage"] = slippage_metadata
-    full_fill_costs = _cost_breakdown(gross_cost, params, slippage_bps=effective_slippage_bps)
-    full_fill_capital_used = gross_cost + sum(full_fill_costs.values())
-    full_fill_net_profit = quantity - full_fill_capital_used
-    full_fill_net_return_bps = (
-        (full_fill_net_profit / full_fill_capital_used) * 10_000.0 if full_fill_capital_used > 0 else 0.0
-    )
-    if (
-        full_fill_net_profit <= EPSILON
-        or full_fill_net_profit + EPSILON < params.min_net_profit_usd
-        or full_fill_net_return_bps + EPSILON < params.min_net_return_bps
-    ):
-        return _simulation_failure_decision(
-            "simulation_not_profitable_at_fill",
-            market=market,
-            simulation=simulation_metadata,
-            book_fingerprint=fingerprint,
-            quantity=quantity,
-            gross_cost=gross_cost,
-            capital_used=full_fill_capital_used,
-            net_profit=full_fill_net_profit,
-            net_return_bps=full_fill_net_return_bps,
-        )
-
-    partial_applied = False
-    side_fill_source = "full_public_depth"
-    yes_filled_quantity = quantity
-    no_filled_quantity = quantity
-    if isinstance(side_fill_quantities, Mapping):
-        yes_filled_quantity = min(quantity, max(0.0, _as_float(side_fill_quantities.get("yes"), quantity)))
-        no_filled_quantity = min(quantity, max(0.0, _as_float(side_fill_quantities.get("no"), quantity)))
-        partial_applied = yes_filled_quantity + EPSILON < quantity or no_filled_quantity + EPSILON < quantity
-        side_fill_source = "public_queue_evidence"
-    elif (
-        params.simulation.partial_fill_probability > 0.0
-        and _stage_random(params.simulation, market, fingerprint, "partial_fill") <= params.simulation.partial_fill_probability
-    ):
-        partial_applied = True
-        side_fill_source = "deterministic_partial_fallback"
-        min_ratio = max(0.0, min(1.0, params.simulation.partial_fill_min_ratio))
-        yes_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
-            params.simulation,
-            market,
-            fingerprint,
-            "partial_ratio",
-            "yes",
-        )
-        no_ratio = min_ratio + (1.0 - min_ratio) * _stage_random(
-            params.simulation,
-            market,
-            fingerprint,
-            "partial_ratio",
-            "no",
-        )
-        yes_filled_quantity = quantity * yes_ratio
-        no_filled_quantity = quantity * no_ratio
-
-    yes_actual_cost = _fill_cost(yes_asks, yes_filled_quantity)
-    no_actual_cost = _fill_cost(no_asks, no_filled_quantity)
-    gross_cost = yes_actual_cost + no_actual_cost
-    matched_quantity = min(yes_filled_quantity, no_filled_quantity)
-    merge_cost = params.merge_cost_usd if matched_quantity > EPSILON else 0.0
-    costs = _cost_breakdown(
-        gross_cost,
-        params,
-        merge_cost_usd=merge_cost,
-        slippage_bps=effective_slippage_bps,
-    )
-    capital_used = gross_cost + sum(costs.values())
-    redeemed_value = matched_quantity
-    net_profit = redeemed_value - capital_used
-    net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > 0 else 0.0
-
-    simulation_metadata["partial_fill"] = {
-        "applied": partial_applied,
-        "source": side_fill_source,
-        "target_quantity": quantity,
-        "yes_filled_quantity": yes_filled_quantity,
-        "no_filled_quantity": no_filled_quantity,
-        "matched_quantity": matched_quantity,
-        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
-        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
-    }
-    execution_count = len(state.get("executions") or [])
-    execution_id = f"paper:{market.market_id}:{execution_count + 1}:{fingerprint[:12]}"
-    execution = {
-        "execution_id": execution_id,
-        "opportunity_id": f"binary:{market.market_id}:{fingerprint[:12]}",
-        "kind": "binary_complete_set",
-        "mode": "paper_portfolio_instance",
-        "market_id": market.market_id,
-        "condition_id": market.condition_id,
-        "event_id": market.event_id,
-        "event_title": market.event_title,
-        "question": market.question,
-        "yes_token_id": market.yes_token_id,
-        "no_token_id": market.no_token_id,
-        "executed_at_utc": simulation_metadata["fill_timestamp_utc"],
-        "book_fingerprint": fingerprint,
-        "quantity": quantity,
-        "quantity_redeemed": matched_quantity,
-        "yes_filled_quantity": yes_filled_quantity,
-        "no_filled_quantity": no_filled_quantity,
-        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
-        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
-        "yes_vwap": yes_actual_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
-        "no_vwap": no_actual_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
-        "yes_cost": yes_actual_cost,
-        "no_cost": no_actual_cost,
-        "gross_cost": gross_cost,
-        "estimated_fees": costs["fees_usd"],
-        "slippage_buffer": costs["slippage_usd"],
-        "tax_cost": costs["tax_usd"],
-        "merge_cost": costs["merge_usd"],
-        "capital_used": capital_used,
-        "redeemed_value": redeemed_value,
-        "net_profit": net_profit,
-        "net_return_bps": net_return_bps,
-        "effective_slippage_bps": effective_slippage_bps,
-        "trade_ceiling_usd": params.trade_ceiling_usd,
-        "ceiling_used_usd": capital_used,
-        "stop_reason": stop_reason,
-        "simulation": simulation_metadata,
-        "source_timestamps": _book_timestamps(yes_asks, no_asks),
-        "details": {
-            "yes_best_ask": yes_asks.best_price,
-            "no_best_ask": no_asks.best_price,
-            "yes_source": yes_asks.source,
-            "no_source": no_asks.source,
-            "min_order_size": min_quantity,
-            "tranches": list(tranches),
-            "signal_book_fingerprint": signal_execution.get("book_fingerprint"),
-        },
-    }
-    return PaperPortfolioDecision.execute(execution)
-
-
 def _evaluate_optimistic_binary_paper_execution(
     market: BinaryMarket,
     yes_asks: OrderBookSide,
@@ -1661,6 +2020,8 @@ def evaluate_binary_paper_execution(
     params: PaperPortfolioParams,
     as_of: datetime | None = None,
     fill_time_book_reader: FillTimeBookReader | None = None,
+    max_quantity: float | None = None,
+    step_index: int | None = None,
 ) -> PaperPortfolioDecision:
     signal_time = _ensure_aware(as_of or _utc_now())
     signal_decision = _evaluate_optimistic_binary_paper_execution(
@@ -1693,8 +2054,12 @@ def evaluate_binary_paper_execution(
     }
     simulation_metadata["inferred"] = {}
     simulation_metadata["fallback"] = {}
+    if step_index is not None:
+        simulation_metadata["step_index"] = step_index
 
     target_quantity = _as_float(signal_execution.get("quantity"))
+    if max_quantity is not None:
+        target_quantity = min(target_quantity, max(0.0, max_quantity))
 
     if fill_time_book_reader is not None:
         try:
@@ -2037,7 +2402,7 @@ def evaluate_binary_paper_execution(
             book_fingerprint=signal_fingerprint,
         )
 
-    return _finalize_execution_from_books(
+    return _execute_paper_step(
         market,
         working_fill_yes,
         working_fill_no,
@@ -2131,6 +2496,29 @@ class PaperPortfolio:
         record.update(merged)
         self.events.append(record)
         return record
+
+    def _append_execution_failure_event(self, market: BinaryMarket, decision: PaperPortfolioDecision) -> None:
+        simulation_details = decision.details.get("simulation")
+        simulation_payload = dict(simulation_details) if isinstance(simulation_details, Mapping) else {}
+        try:
+            self.append_event(
+                "paper_portfolio_execution_failed",
+                {
+                    "market_id": market.market_id,
+                    "reason": decision.reason,
+                    "simulation": simulation_payload,
+                    "failure_stage": simulation_payload.get("failure_stage") or decision.reason,
+                    "failure_reason": simulation_payload.get("failure_reason") or decision.reason,
+                    "details": dict(decision.details),
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "paper_portfolio_execution_failed_event_append_failed market_id=%s reason=%s error=%r",
+                market.market_id,
+                decision.reason,
+                exc,
+            )
 
     def reset(self, *, yes: bool) -> dict[str, Any]:
         if not yes:
@@ -2435,6 +2823,27 @@ class PaperPortfolio:
         if not self.state:
             self.load()
         execution_params = params or self.params
+        if execution_params.simulation.is_zero_friction:
+            return self._execute_binary_complete_set_once(
+                market,
+                yes_asks,
+                no_asks,
+                as_of=as_of,
+                params=execution_params,
+                fill_time_book_reader=fill_time_book_reader,
+            )
+
+        active = _active_execution_state(self.state)
+        if active is not None:
+            if str(active.get("market_id") or "") != market.market_id:
+                return PaperPortfolioDecision.skip(
+                    "active_execution_in_progress",
+                    market_id=market.market_id,
+                    active_market_id=active.get("market_id"),
+                    active_execution_id=active.get("execution_id"),
+                )
+            return self._continue_stepped_execution(active, market, params=execution_params)
+
         base_state = deepcopy(self.state)
         decision = evaluate_binary_paper_execution(
             market,
@@ -2447,32 +2856,43 @@ class PaperPortfolio:
         )
         if decision.action != "EXECUTE" or decision.execution is None:
             if decision.details.get("simulation_failure"):
-                simulation_details = decision.details.get("simulation")
-                simulation_payload = dict(simulation_details) if isinstance(simulation_details, Mapping) else {}
-                try:
-                    self.append_event(
-                        "paper_portfolio_execution_failed",
-                        {
-                            "market_id": market.market_id,
-                            "reason": decision.reason,
-                            "simulation": simulation_payload,
-                            "failure_stage": simulation_payload.get("failure_stage") or decision.reason,
-                            "failure_reason": simulation_payload.get("failure_reason") or decision.reason,
-                            "details": dict(decision.details),
-                        },
-                    )
-                except Exception as exc:
-                    LOGGER.warning(
-                        "paper_portfolio_execution_failed_event_append_failed market_id=%s reason=%s error=%r",
-                        market.market_id,
-                        decision.reason,
-                        exc,
-                    )
+                self._append_execution_failure_event(market, decision)
+            return decision
+        return self._start_stepped_execution(
+            market,
+            decision.execution,
+            base_state=base_state,
+            params=execution_params,
+        )
+
+    def _execute_binary_complete_set_once(
+        self,
+        market: BinaryMarket,
+        yes_asks: OrderBookSide,
+        no_asks: OrderBookSide,
+        *,
+        as_of: datetime | None = None,
+        params: PaperPortfolioParams,
+        fill_time_book_reader: FillTimeBookReader | None = None,
+    ) -> PaperPortfolioDecision:
+        base_state = deepcopy(self.state)
+        decision = evaluate_binary_paper_execution(
+            market,
+            yes_asks,
+            no_asks,
+            state=base_state,
+            params=params,
+            as_of=as_of,
+            fill_time_book_reader=fill_time_book_reader,
+        )
+        if decision.action != "EXECUTE" or decision.execution is None:
+            if decision.details.get("simulation_failure"):
+                self._append_execution_failure_event(market, decision)
             return decision
 
         working_state = deepcopy(base_state)
         execution = deepcopy(decision.execution)
-        self._apply_execution_to_state(working_state, execution, params=execution_params)
+        self._apply_execution_to_state(working_state, execution, params=params)
         try:
             self._save_state(working_state)
         except Exception:
@@ -2499,6 +2919,230 @@ class PaperPortfolio:
             details=details,
         )
 
+    def _active_execution_payload(
+        self,
+        market: BinaryMarket,
+        planned_execution: Mapping[str, Any],
+        *,
+        params: PaperPortfolioParams,
+    ) -> dict[str, Any]:
+        execution_count = len(self.state.get("executions") or [])
+        parent_fingerprint = str(planned_execution.get("book_fingerprint") or "")
+        active_execution_id = f"paper:{market.market_id}:{execution_count + 1}:{parent_fingerprint[:12]}"
+        now = utc_iso()
+        return {
+            "execution_id": active_execution_id,
+            "market_id": market.market_id,
+            "condition_id": market.condition_id,
+            "yes_token_id": market.yes_token_id,
+            "no_token_id": market.no_token_id,
+            "book_fingerprint": parent_fingerprint,
+            "target_quantity": _as_float(planned_execution.get("quantity")),
+            "target_yes_filled_quantity": _as_float(
+                planned_execution.get("yes_filled_quantity"),
+                _as_float(planned_execution.get("quantity")),
+            ),
+            "target_no_filled_quantity": _as_float(
+                planned_execution.get("no_filled_quantity"),
+                _as_float(planned_execution.get("quantity")),
+            ),
+            "completed_quantity": 0.0,
+            "completed_yes_filled_quantity": 0.0,
+            "completed_no_filled_quantity": 0.0,
+            "current_step_quantity": params.simulation.step_quantity_shares,
+            "step_plan": _step_plan_payload(params.simulation),
+            "planned_execution": deepcopy(dict(planned_execution)),
+            "steps": [],
+            "status": "active",
+            "started_at_utc": now,
+            "updated_at_utc": now,
+        }
+
+    def _start_stepped_execution(
+        self,
+        market: BinaryMarket,
+        planned_execution: Mapping[str, Any],
+        *,
+        base_state: Mapping[str, Any],
+        params: PaperPortfolioParams,
+    ) -> PaperPortfolioDecision:
+        working_state = deepcopy(dict(base_state))
+        active = self._active_execution_payload(market, planned_execution, params=params)
+        working_state["active_execution"] = active
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+        self.state = working_state
+        return self._continue_stepped_execution(active, market, params=params)
+
+    def _next_step_quantities(
+        self,
+        active: Mapping[str, Any],
+        *,
+        params: PaperPortfolioParams,
+    ) -> tuple[float, float, float]:
+        target_quantity = _as_float(active.get("target_quantity"))
+        completed_quantity = _as_float(active.get("completed_quantity"))
+        remaining_quantity = max(0.0, target_quantity - completed_quantity)
+        if remaining_quantity <= EPSILON:
+            return 0.0, 0.0, 0.0
+        current_step_quantity = _as_float(
+            active.get("current_step_quantity"),
+            params.simulation.step_quantity_shares,
+        )
+        step_quantity = _step_target_quantity(
+            remaining_quantity=remaining_quantity,
+            params=params,
+            current_step_quantity=current_step_quantity,
+        )
+        target_yes = _as_float(active.get("target_yes_filled_quantity"), target_quantity)
+        target_no = _as_float(active.get("target_no_filled_quantity"), target_quantity)
+        yes_remaining = max(0.0, target_yes - _as_float(active.get("completed_yes_filled_quantity")))
+        no_remaining = max(0.0, target_no - _as_float(active.get("completed_no_filled_quantity")))
+        target_ratio = step_quantity / target_quantity if target_quantity > EPSILON else 0.0
+        yes_fill = min(step_quantity, yes_remaining, max(0.0, target_yes * target_ratio))
+        no_fill = min(step_quantity, no_remaining, max(0.0, target_no * target_ratio))
+        if remaining_quantity - step_quantity <= EPSILON:
+            yes_fill = min(step_quantity, yes_remaining)
+            no_fill = min(step_quantity, no_remaining)
+        return step_quantity, yes_fill, no_fill
+
+    def _continue_stepped_execution(
+        self,
+        active: Mapping[str, Any],
+        market: BinaryMarket,
+        *,
+        params: PaperPortfolioParams,
+    ) -> PaperPortfolioDecision:
+        current_active = deepcopy(dict(active))
+        final_execution: dict[str, Any] | None = None
+        step_limit_reached = False
+
+        while True:
+            steps = _normalize_step_history(current_active.get("steps"))
+            completed_quantity = _as_float(current_active.get("completed_quantity"))
+            target_quantity = _as_float(current_active.get("target_quantity"))
+            if target_quantity <= EPSILON or completed_quantity >= target_quantity - EPSILON:
+                final_execution = self._finalize_stepped_execution(current_active, params=params)
+                break
+            if len(steps) >= params.simulation.max_step_count:
+                step_limit_reached = True
+                final_execution = self._finalize_stepped_execution(
+                    {**current_active, "stop_reason": "max_step_count"},
+                    params=params,
+                )
+                break
+
+            step_quantity, yes_fill, no_fill = self._next_step_quantities(current_active, params=params)
+            if step_quantity <= EPSILON:
+                final_execution = self._finalize_stepped_execution(
+                    {**current_active, "stop_reason": "target_quantity_limit"},
+                    params=params,
+                )
+                break
+            planned_execution = current_active.get("planned_execution")
+            if not isinstance(planned_execution, Mapping):
+                return PaperPortfolioDecision.skip(
+                    "active_execution_missing_plan",
+                    market_id=market.market_id,
+                    active_execution_id=current_active.get("execution_id"),
+                )
+            step_index = len(steps) + 1
+            step_execution = _build_step_execution(
+                planned_execution,
+                active_execution_id=str(current_active.get("execution_id") or ""),
+                step_index=step_index,
+                offset_quantity=completed_quantity,
+                step_quantity=step_quantity,
+                yes_fill_quantity=yes_fill,
+                no_fill_quantity=no_fill,
+                params=params,
+            )
+            working_state = deepcopy(self.state)
+            self._apply_execution_to_state(
+                working_state,
+                step_execution,
+                params=params,
+                record_execution=False,
+                update_fingerprint=False,
+            )
+            next_steps = _normalize_step_history(current_active.get("steps"))
+            next_steps.append(deepcopy(step_execution))
+            next_active = deepcopy(dict(current_active))
+            next_active.update(
+                {
+                    "steps": next_steps,
+                    "completed_quantity": completed_quantity + step_quantity,
+                    "completed_yes_filled_quantity": _as_float(current_active.get("completed_yes_filled_quantity")) + yes_fill,
+                    "completed_no_filled_quantity": _as_float(current_active.get("completed_no_filled_quantity")) + no_fill,
+                    "current_step_quantity": (
+                        min(
+                            max(0.0, target_quantity - completed_quantity - step_quantity),
+                            step_quantity * 2.0,
+                        )
+                        if params.simulation.grow_step_size_after_success
+                        else step_quantity
+                    ),
+                    "updated_at_utc": step_execution["executed_at_utc"],
+                }
+            )
+            working_state["active_execution"] = next_active
+            try:
+                self._save_state(working_state)
+            except Exception:
+                self._reload_after_failed_save(self.state)
+                raise
+            self.state = working_state
+            current_active = next_active
+
+        assert final_execution is not None
+        returned_execution = deepcopy(final_execution)
+        details: dict[str, Any] = {}
+        try:
+            self.append_event("paper_portfolio_execution", returned_execution)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            details["event_log_error"] = error
+            returned_execution["event_log_error"] = error
+            LOGGER.warning(
+                "paper_portfolio_execution_event_append_failed execution_id=%s error=%r",
+                returned_execution.get("execution_id"),
+                exc,
+            )
+        if step_limit_reached:
+            details["step_limit_reached"] = True
+        return PaperPortfolioDecision(
+            action="EXECUTE",
+            execution=returned_execution,
+            details=details,
+        )
+
+    def _finalize_stepped_execution(self, active: Mapping[str, Any], *, params: PaperPortfolioParams) -> dict[str, Any]:
+        base_state = deepcopy(self.state)
+        working_state = deepcopy(self.state)
+        final_execution = _aggregate_step_executions(active, params=params)
+        executions = working_state.setdefault("executions", [])
+        if isinstance(executions, list):
+            executions.append(deepcopy(final_execution))
+        fingerprints = working_state.setdefault("book_fingerprints", {})
+        if isinstance(fingerprints, dict):
+            fingerprints[str(final_execution["market_id"])] = {
+                "fingerprint": final_execution["book_fingerprint"],
+                "execution_id": final_execution["execution_id"],
+                "executed_at_utc": final_execution["executed_at_utc"],
+            }
+        working_state["last_execution_at_utc"] = final_execution["executed_at_utc"]
+        working_state.pop("active_execution", None)
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+        self.state = working_state
+        return final_execution
+
     def _apply_execution(self, execution: dict[str, Any]) -> None:
         self._apply_execution_to_state(self.state, execution, params=self.params)
 
@@ -2508,6 +3152,8 @@ class PaperPortfolio:
         execution: dict[str, Any],
         *,
         params: PaperPortfolioParams,
+        record_execution: bool = True,
+        update_fingerprint: bool = True,
     ) -> None:
         preexisting_redeemed, preexisting_redeemed_cost = self._redeem_completed_pairs_with_cost_from_state(
             state,
@@ -2596,16 +3242,18 @@ class PaperPortfolio:
             costs["tax_usd"] = _as_float(costs.get("tax_usd")) + _as_float(execution.get("tax_cost"))
             costs["merge_usd"] = _as_float(costs.get("merge_usd")) + _as_float(execution.get("merge_cost"))
         state["realized_pnl"] = _as_float(state.get("realized_pnl")) + _as_float(execution.get("net_profit"))
-        executions = state.setdefault("executions", [])
-        if isinstance(executions, list):
-            executions.append(execution)
-        fingerprints = state.setdefault("book_fingerprints", {})
-        if isinstance(fingerprints, dict):
-            fingerprints[str(execution["market_id"])] = {
-                "fingerprint": execution["book_fingerprint"],
-                "execution_id": execution["execution_id"],
-                "executed_at_utc": execution["executed_at_utc"],
-            }
+        if record_execution:
+            executions = state.setdefault("executions", [])
+            if isinstance(executions, list):
+                executions.append(execution)
+        if update_fingerprint:
+            fingerprints = state.setdefault("book_fingerprints", {})
+            if isinstance(fingerprints, dict):
+                fingerprints[str(execution["market_id"])] = {
+                    "fingerprint": execution["book_fingerprint"],
+                    "execution_id": execution["execution_id"],
+                    "executed_at_utc": execution["executed_at_utc"],
+                }
         state["last_execution_at_utc"] = execution["executed_at_utc"]
         state["total_equity"] = state["cash"] + _inventory_equity_value(state)
 

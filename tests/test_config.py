@@ -109,6 +109,10 @@ def test_load_scan_config_reads_conservative_paper_simulation_defaults(monkeypat
     assert loaded.paper_simulation.slippage_max_bps == 100.0
     assert loaded.paper_simulation.slippage_lookback_events == 50
     assert loaded.paper_simulation.slippage_combine_mode == "max"
+    assert loaded.paper_simulation.step_quantity_shares == 5.0
+    assert loaded.paper_simulation.max_step_count == 20
+    assert loaded.paper_simulation.grow_step_size_after_success is False
+    assert loaded.paper_simulation.merge_cost_per_step is True
     assert loaded.paper_simulation.queue_depth_ratio == 0.75
     assert loaded.paper_simulation.queue_fill_probability == 0.95
     assert loaded.paper_simulation.partial_fill_probability == 0.15
@@ -160,6 +164,22 @@ def test_load_scan_config_reads_zero_friction_paper_simulation(monkeypatch):
     assert loaded.paper_simulation.enabled is True
     assert loaded.paper_simulation.seed == 42
     assert loaded.paper_simulation.is_zero_friction is True
+
+
+def test_load_scan_config_reads_step_simulation_overrides(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_CLOB_HOST", "https://clob.example")
+    monkeypatch.setenv("COND_ARB_MARKET_WS_ENDPOINT", "wss://ws.example/ws/market")
+    monkeypatch.setenv("COND_ARB_PAPER_STEP_QUANTITY_SHARES", "7.5")
+    monkeypatch.setenv("COND_ARB_PAPER_MAX_STEP_COUNT", "11")
+    monkeypatch.setenv("COND_ARB_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS", "true")
+    monkeypatch.setenv("COND_ARB_PAPER_MERGE_COST_PER_STEP", "false")
+
+    loaded = config.load_scan_config()
+
+    assert loaded.paper_simulation.step_quantity_shares == 7.5
+    assert loaded.paper_simulation.max_step_count == 11
+    assert loaded.paper_simulation.grow_step_size_after_success is True
+    assert loaded.paper_simulation.merge_cost_per_step is False
 
 
 def test_load_scan_config_rejects_invalid_paper_simulation_probability(monkeypatch):

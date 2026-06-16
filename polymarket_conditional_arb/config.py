@@ -76,6 +76,10 @@ DEFAULT_PAPER_SLIPPAGE_MODE = "fixed_plus_calibrated"
 DEFAULT_PAPER_SLIPPAGE_MAX_BPS = 100.0
 DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS = 50
 DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE = "max"
+DEFAULT_PAPER_STEP_QUANTITY_SHARES = 5.0
+DEFAULT_PAPER_MAX_STEP_COUNT = 20
+DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS = False
+DEFAULT_PAPER_MERGE_COST_PER_STEP = True
 
 LATENCY_MODES = {"fixed", "telemetry"}
 LATENCY_JITTER_SEED_SCOPES = {"global", "market", "market_stage", "market_book_stage"}
@@ -110,6 +114,10 @@ class PaperExecutionSimulationConfig:
     slippage_max_bps: float = DEFAULT_PAPER_SLIPPAGE_MAX_BPS
     slippage_lookback_events: int = DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS
     slippage_combine_mode: str = DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE
+    step_quantity_shares: float = DEFAULT_PAPER_STEP_QUANTITY_SHARES
+    max_step_count: int = DEFAULT_PAPER_MAX_STEP_COUNT
+    grow_step_size_after_success: bool = DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS
+    merge_cost_per_step: bool = DEFAULT_PAPER_MERGE_COST_PER_STEP
     queue_depth_ratio: float = DEFAULT_PAPER_QUEUE_DEPTH_RATIO
     queue_fill_probability: float = DEFAULT_PAPER_QUEUE_FILL_PROBABILITY
     partial_fill_probability: float = DEFAULT_PAPER_PARTIAL_FILL_PROBABILITY
@@ -165,6 +173,10 @@ class PaperExecutionSimulationConfig:
             raise ValueError("slippage_max_bps must be greater than or equal to 0")
         if self.slippage_lookback_events < 1:
             raise ValueError("slippage_lookback_events must be greater than or equal to 1")
+        if self.step_quantity_shares <= 0.0:
+            raise ValueError("step_quantity_shares must be greater than 0")
+        if self.max_step_count < 1:
+            raise ValueError("max_step_count must be greater than or equal to 1")
 
     @classmethod
     def zero_friction(cls) -> "PaperExecutionSimulationConfig":
@@ -190,6 +202,10 @@ class PaperExecutionSimulationConfig:
             slippage_max_bps=0.0,
             slippage_lookback_events=DEFAULT_PAPER_SLIPPAGE_LOOKBACK_EVENTS,
             slippage_combine_mode=DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE,
+            step_quantity_shares=DEFAULT_PAPER_STEP_QUANTITY_SHARES,
+            max_step_count=DEFAULT_PAPER_MAX_STEP_COUNT,
+            grow_step_size_after_success=DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS,
+            merge_cost_per_step=DEFAULT_PAPER_MERGE_COST_PER_STEP,
             queue_depth_ratio=0.0,
             queue_fill_probability=0.0,
             partial_fill_probability=0.0,
@@ -582,6 +598,22 @@ def paper_execution_simulation_config() -> PaperExecutionSimulationConfig:
             "COND_ARB_PAPER_SLIPPAGE_COMBINE_MODE",
             DEFAULT_PAPER_SLIPPAGE_COMBINE_MODE,
             SLIPPAGE_COMBINE_MODES,
+        ),
+        step_quantity_shares=_non_negative_float_env(
+            "COND_ARB_PAPER_STEP_QUANTITY_SHARES",
+            DEFAULT_PAPER_STEP_QUANTITY_SHARES,
+        ),
+        max_step_count=_non_negative_int_env(
+            "COND_ARB_PAPER_MAX_STEP_COUNT",
+            DEFAULT_PAPER_MAX_STEP_COUNT,
+        ),
+        grow_step_size_after_success=env_bool(
+            "COND_ARB_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS",
+            DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS,
+        ),
+        merge_cost_per_step=env_bool(
+            "COND_ARB_PAPER_MERGE_COST_PER_STEP",
+            DEFAULT_PAPER_MERGE_COST_PER_STEP,
         ),
         queue_depth_ratio=_ratio_env("COND_ARB_PAPER_QUEUE_DEPTH_RATIO", DEFAULT_PAPER_QUEUE_DEPTH_RATIO),
         queue_fill_probability=_probability_env(
