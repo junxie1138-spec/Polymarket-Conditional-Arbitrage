@@ -180,6 +180,12 @@ class RuntimeStatusWriter:
             "coverage_status": "unknown",
             "coverage_complete": False,
             "coverage_source": None,
+            "latency_calibration_source": None,
+            "latency_calibration_p50_ms": None,
+            "latency_calibration_p95_ms": None,
+            "latency_calibration_jitter_ms": None,
+            "latency_calibration_measured_at_utc": None,
+            "latency_report_path": None,
             "warmup_started_at_utc": None,
             "warmup_completed_at_utc": None,
             "book_seed_reason": None,
@@ -609,6 +615,18 @@ def format_status_dashboard(
                 _kv("WS errors", _format_count(ws_error_count)),
                 _kv("WS stale", f"{_format_count(ws_stale_batches)} batches / {_format_count(ws_stale_tokens)} tokens"),
                 _kv("WS error", ws_last_error or "none"),
+            ]
+        )
+    latency_source = runtime_row.get("latency_calibration_source")
+    if latency_source:
+        latency_p95 = _float_value(runtime_row.get("latency_calibration_p95_ms"))
+        latency_jitter = _float_value(runtime_row.get("latency_calibration_jitter_ms"))
+        health_lines.extend(
+            [
+                "",
+                _kv("Latency src", latency_source),
+                _kv("Latency p95", f"{latency_p95:.1f}ms" if latency_p95 is not None else "n/a"),
+                _kv("Latency jit", f"{latency_jitter:.1f}ms" if latency_jitter is not None else "n/a"),
             ]
         )
     if failures > 0:

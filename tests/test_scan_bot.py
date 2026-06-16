@@ -297,6 +297,7 @@ def scanner_for(tmp_path: Path, client, cfg=None):
         ),
         logger=null_logger(),
         params=params,
+        startup_latency_calibrator=None,
     )
     scanner.bootstrap()
     return scanner
@@ -333,6 +334,47 @@ def profitable_books(token_ids, *, updated_at):
     return books
 
 
+def latency_report(
+    *,
+    source="clob_books",
+    gamma_p50=10.0,
+    gamma_p95=20.0,
+    clob_p50=40.0,
+    clob_p95=85.0,
+):
+    return {
+        "schema_version": 1,
+        "measured_at_utc": "2026-06-16T00:00:00Z",
+        "probe_market": {
+            "market_id": "m1",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+        },
+        "summaries": {
+            "gamma_events": {
+                "sample_count": 5,
+                "success_count": 5,
+                "error_count": 0,
+                "p50_latency_ms": gamma_p50,
+                "p95_latency_ms": gamma_p95,
+            },
+            "clob_books": {
+                "sample_count": 5,
+                "success_count": 5,
+                "error_count": 0,
+                "p50_latency_ms": clob_p50,
+                "p95_latency_ms": clob_p95,
+            },
+        },
+        "recommendation": {
+            "source": source,
+            "latency_ms": clob_p95,
+            "latency_jitter_ms": clob_p95 - clob_p50,
+            "env": [],
+        },
+    }
+
+
 def tradable_markets_for_rows(rows):
     raw_markets = GammaClobClient.flatten_event_markets([{"id": "cached-event", "markets": rows}])
     return GammaClobClient.tradable_binary_markets(raw_markets)
@@ -351,6 +393,7 @@ def test_market_universe_fetch_logs_startup_progress(tmp_path, caplog):
         ),
         logger=logging.getLogger("test_market_universe_progress"),
         params=params,
+        startup_latency_calibrator=None,
     )
 
     with caplog.at_level(logging.INFO, logger="test_market_universe_progress"):
@@ -375,6 +418,7 @@ def test_market_universe_fetch_stops_between_event_pages(tmp_path):
         ),
         logger=null_logger(),
         params=params,
+        startup_latency_calibrator=None,
     )
     scanner.running = False
 
@@ -945,6 +989,7 @@ def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
         ),
         logger=null_logger(),
         params=params,
+        startup_latency_calibrator=None,
     )
 
     result = scanner.run_once()
@@ -960,6 +1005,141 @@ def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
     assert state["executions"][0]["market_id"] == "m1"
     assert state["executions"][0]["quantity_redeemed"] == 10.0
     assert state["inventory"] == {}
+
+
+def test_startup_latency_calibration_precedes_first_evaluation(tmp_path, monkeypatch):
+    cfg = replace(scan_config(tmp_path), market_ws_enabled=False)
+    params = PaperPortfolioParams.from_config(cfg)
+    calls = []
+
+    def fake_measure(*, scan_config, settings):
+        calls.append(("calibrate", settings.rest_samples, settings.include_websocket))
+        assert scan_config == cfg
+        return latency_report(clob_p50=41.0, clob_p95=91.0)
+
+    monkeypatch.setattr("polymarket_conditional_arb.scan_bot.measure_polymarket_latency", fake_measure)
+
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=FakeClient(),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=null_logger(),
+        params=params,
+    )
+    original_evaluate = scanner._evaluate_from_cache
+
+    def recording_evaluate(*args, **kwargs):
+        calls.append(("evaluate", scanner.params.simulation.latency_ms, scanner.params.simulation.latency_jitter_ms))
+        return original_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_evaluate_from_cache", recording_evaluate)
+
+    result = scanner.run_once()
+
+    assert result["summary"]["executions"] == 1
+    assert calls[0] == ("calibrate", 5, False)
+    assert calls[1] == ("evaluate", 91.0, 50.0)
+    assert json.loads(cfg.latency_report_path.read_text(encoding="utf-8"))["recommendation"]["source"] == "clob_books"
+
+
+def test_startup_latency_calibration_replaces_session_params_and_preserves_simulation_fields(tmp_path, monkeypatch):
+    simulation = config.PaperExecutionSimulationConfig(
+        enabled=True,
+        seed=99,
+        latency_ms=1.0,
+        latency_jitter_ms=2.0,
+        signing_latency_ms=333.0,
+        settlement_latency_ms=444.0,
+        submit_failure_probability=0.123,
+        accept_failure_probability=0.045,
+        fill_failure_probability=0.067,
+        cancel_failure_probability=0.089,
+        slippage_max_bps=12.0,
+        step_quantity_shares=7.0,
+        max_step_count=4,
+    )
+    cfg = replace(scan_config(tmp_path), market_ws_enabled=True, paper_simulation=simulation)
+    params = PaperPortfolioParams.from_config(cfg)
+    monkeypatch.setattr(
+        "polymarket_conditional_arb.scan_bot.measure_polymarket_latency",
+        lambda *, scan_config, settings: latency_report(clob_p50=50.0, clob_p95=125.0),
+    )
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=FakeClient(),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=null_logger(),
+        params=params,
+    )
+
+    scanner.bootstrap()
+    scanner._start_runtime(detail="test calibration")
+    try:
+        runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    finally:
+        scanner._stop_runtime()
+
+    calibrated = scanner.params.simulation
+    assert calibrated.latency_ms == pytest.approx(125.0)
+    assert calibrated.latency_jitter_ms == pytest.approx(75.0)
+    assert calibrated.signing_latency_ms == pytest.approx(333.0)
+    assert calibrated.settlement_latency_ms == pytest.approx(444.0)
+    assert calibrated.submit_failure_probability == pytest.approx(0.123)
+    assert calibrated.slippage_max_bps == pytest.approx(12.0)
+    assert calibrated.step_quantity_shares == pytest.approx(7.0)
+    assert scanner.portfolio.params is scanner.params
+    assert runtime["latency_calibration_source"] == "clob_books"
+    assert runtime["latency_calibration_p50_ms"] == pytest.approx(50.0)
+    assert runtime["latency_calibration_p95_ms"] == pytest.approx(125.0)
+    events = [
+        json.loads(line)
+        for line in cfg.paper_portfolio_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    startup = events[-1]
+    assert startup["event_type"] == "paper_portfolio_instance_started"
+    assert startup["startup_latency_calibration"]["latency_ms"] == pytest.approx(125.0)
+    assert startup["startup_latency_calibration"]["latency_jitter_ms"] == pytest.approx(75.0)
+
+
+def test_startup_latency_calibration_aborts_before_market_evaluation(tmp_path, monkeypatch):
+    cfg = scan_config(tmp_path)
+    params = PaperPortfolioParams.from_config(cfg)
+    client = RecordingDiscoveryClient(fail_on_discovery=True)
+    bad_report = latency_report()
+    bad_report["summaries"]["clob_books"]["success_count"] = 0
+    bad_report["summaries"]["clob_books"]["p50_latency_ms"] = None
+    bad_report["summaries"]["clob_books"]["p95_latency_ms"] = None
+    monkeypatch.setattr(
+        "polymarket_conditional_arb.scan_bot.measure_polymarket_latency",
+        lambda *, scan_config, settings: bad_report,
+    )
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=client,
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=null_logger(),
+        params=params,
+    )
+
+    with pytest.raises(RuntimeError, match="no usable clob_books samples"):
+        scanner.run_once()
+
+    assert client.full_calls == 0
+    assert client.slice_calls == []
+    assert not cfg.paper_portfolio_runtime_path.exists()
+    assert not cfg.paper_portfolio_events_path.exists()
 
 
 def test_runtime_status_records_warmup_progress_before_startup_evaluation(tmp_path):
@@ -1559,6 +1739,7 @@ def test_dirty_pair_backfill_stall_warning_updates_runtime_last_error(tmp_path, 
         ),
         logger=logging.getLogger("test_targeted_backfill_stall"),
         params=params,
+        startup_latency_calibrator=None,
     )
     scanner._runtime_started = True
     monitor = _RestBookSeedBatchStallMonitor(
@@ -1791,6 +1972,7 @@ def test_rest_cycle_retries_and_recovers_after_book_failure(tmp_path, caplog):
         logger=logging.getLogger("test_rest_cycle_retry"),
         params=params,
         retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+        startup_latency_calibrator=None,
     )
     scanner.bootstrap()
 
@@ -1837,6 +2019,7 @@ def test_websocket_startup_market_fetch_retries(tmp_path, caplog):
         logger=logging.getLogger("test_market_universe_retry"),
         params=params,
         retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+        startup_latency_calibrator=None,
     )
 
     with caplog.at_level(logging.INFO, logger="test_market_universe_retry"):
@@ -1863,6 +2046,7 @@ def test_websocket_bootstrap_rest_seed_retries(tmp_path, caplog):
         logger=logging.getLogger("test_rest_seed_retry"),
         params=params,
         retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+        startup_latency_calibrator=None,
     )
     cache = MarketDataCache()
 
@@ -1896,6 +2080,7 @@ def test_websocket_bootstrap_rest_seed_ignores_runtime_progress_write_failure(tm
         logger=logging.getLogger("test_runtime_status_seed"),
         params=params,
         retry_policy=ScannerRetryPolicy(initial_backoff_seconds=0.0, max_attempts=3),
+        startup_latency_calibrator=None,
     )
     scanner.bootstrap()
     scanner._runtime_started = True
@@ -2144,6 +2329,48 @@ def test_cli_run_fails_fast_when_portfolio_lock_exists(tmp_path, monkeypatch, ca
 
     assert excinfo.value.code == 2
     assert "paper portfolio data is locked" in capsys.readouterr().err
+
+
+def test_cli_run_calibrates_after_lock_before_first_evaluation(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COND_ARB_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COND_ARB_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("COND_ARB_MARKET_WS_ENABLED", "false")
+    calls = []
+
+    def fake_measure(*, scan_config, settings):
+        state_path = config.paper_portfolio_instance_path(data_dir)
+        assert state_path.with_name(state_path.name + ".lock").exists()
+        calls.append(("calibrate", settings.rest_samples, settings.include_websocket))
+        return latency_report(clob_p50=44.0, clob_p95=99.0)
+
+    monkeypatch.setattr("polymarket_conditional_arb.scan_bot.measure_polymarket_latency", fake_measure)
+    monkeypatch.setattr(
+        "polymarket_conditional_arb.scan_bot.GammaClobClient",
+        lambda clob_host: FakeClient(),
+    )
+    original_incremental_evaluation = ConditionalArbScanner._run_incremental_rest_evaluation
+
+    def stop_after_startup_evaluation(self, universe, *, reason):
+        calls.append(("evaluate", self.params.simulation.latency_ms, self.params.simulation.latency_jitter_ms))
+        result = original_incremental_evaluation(self, universe, reason=reason)
+        self.running = False
+        return result
+
+    monkeypatch.setattr(
+        ConditionalArbScanner,
+        "_run_incremental_rest_evaluation",
+        stop_after_startup_evaluation,
+    )
+
+    main(["run"])
+
+    assert calls[:2] == [("calibrate", 5, False), ("evaluate", 99.0, 55.0)]
+    state_path = config.paper_portfolio_instance_path(data_dir)
+    assert not state_path.with_name(state_path.name + ".lock").exists()
+    assert json.loads(config.latency_report_path(data_dir).read_text(encoding="utf-8"))["summaries"]["clob_books"][
+        "p95_latency_ms"
+    ] == 99.0
 
 
 def test_cli_latency_is_read_only_and_can_save_report(tmp_path, monkeypatch, capsys):

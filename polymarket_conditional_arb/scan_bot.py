@@ -99,6 +99,130 @@ class _BookChunkResult:
     failure_categories: Mapping[str, int]
 
 
+@dataclass(frozen=True)
+class _StartupLatencyCalibration:
+    source: str
+    p50_latency_ms: float
+    p95_latency_ms: float
+    latency_jitter_ms: float
+    measured_at_utc: str | None
+    report_path: str
+
+    def event_payload(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "p50_latency_ms": self.p50_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "latency_ms": self.p95_latency_ms,
+            "latency_jitter_ms": self.latency_jitter_ms,
+            "measured_at_utc": self.measured_at_utc,
+            "report_path": self.report_path,
+        }
+
+    def runtime_fields(self) -> dict[str, Any]:
+        return {
+            "latency_calibration_source": self.source,
+            "latency_calibration_p50_ms": self.p50_latency_ms,
+            "latency_calibration_p95_ms": self.p95_latency_ms,
+            "latency_calibration_jitter_ms": self.latency_jitter_ms,
+            "latency_calibration_measured_at_utc": self.measured_at_utc,
+            "latency_report_path": self.report_path,
+        }
+
+
+StartupLatencyCalibrator = Callable[
+    [Any],
+    _StartupLatencyCalibration | None,
+]
+
+
+def _float_latency_value(value: Any) -> float | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, parsed)
+
+
+def _latency_summary(
+    report: Mapping[str, Any],
+    endpoint_family: str,
+) -> Mapping[str, Any] | None:
+    summaries = report.get("summaries") if isinstance(report.get("summaries"), Mapping) else {}
+    summary = summaries.get(endpoint_family) if isinstance(summaries, Mapping) else None
+    return summary if isinstance(summary, Mapping) else None
+
+
+def _required_latency_values(
+    report: Mapping[str, Any],
+    endpoint_family: str,
+) -> tuple[float, float]:
+    summary = _latency_summary(report, endpoint_family)
+    if summary is None:
+        raise RuntimeError(f"startup latency calibration missing required {endpoint_family} summary")
+    p50 = _float_latency_value(summary.get("p50_latency_ms"))
+    p95 = _float_latency_value(summary.get("p95_latency_ms"))
+    success_count = _progress_int(summary.get("success_count"))
+    if success_count <= 0 or p50 is None or p95 is None:
+        raise RuntimeError(f"startup latency calibration has no usable {endpoint_family} samples")
+    return p50, p95
+
+
+def _startup_latency_calibration_from_report(
+    report: Mapping[str, Any],
+    *,
+    report_path: str,
+) -> _StartupLatencyCalibration:
+    _required_latency_values(report, "gamma_events")
+    _required_latency_values(report, "clob_books")
+
+    recommendation = report.get("recommendation") if isinstance(report.get("recommendation"), Mapping) else {}
+    recommended_source = str(recommendation.get("source") or "clob_books")
+    source_summary = _latency_summary(report, recommended_source)
+    source = recommended_source if source_summary is not None else "clob_books"
+    p50, p95 = _required_latency_values(report, source)
+    measured_at_utc = report.get("measured_at_utc")
+    return _StartupLatencyCalibration(
+        source=source,
+        p50_latency_ms=round(p50, 3),
+        p95_latency_ms=round(p95, 3),
+        latency_jitter_ms=round(max(0.0, p95 - p50), 3),
+        measured_at_utc=str(measured_at_utc) if measured_at_utc else None,
+        report_path=report_path,
+    )
+
+
+def _calibrate_startup_latency(scanner: Any) -> _StartupLatencyCalibration:
+    settings = LatencyProbeSettings(include_websocket=bool(scanner.config.market_ws_enabled))
+    scanner.logger.info(
+        "startup_latency_calibration_start rest_samples=%s include_websocket=%s report_path=%s",
+        settings.rest_samples,
+        settings.include_websocket,
+        scanner.config.latency_report_path,
+    )
+    try:
+        report = measure_polymarket_latency(scan_config=scanner.config, settings=settings)
+    except Exception as exc:
+        if not settings.include_websocket:
+            raise RuntimeError(f"startup latency calibration failed: {type(exc).__name__}: {exc}") from exc
+        scanner.logger.warning(
+            "startup_latency_calibration_websocket_probe_failed error=%r; retrying_rest_only",
+            exc,
+        )
+        rest_settings = replace(settings, include_websocket=False)
+        report = measure_polymarket_latency(scan_config=scanner.config, settings=rest_settings)
+
+    write_latency_report(scanner.config.latency_report_path, report)
+    return _startup_latency_calibration_from_report(
+        report,
+        report_path=str(scanner.config.latency_report_path),
+    )
+
+
 @dataclass
 class _RestBookSeedBatchStallMonitor:
     reason: str
@@ -386,6 +510,7 @@ class ConditionalArbScanner:
         logger: logging.Logger | None = None,
         params: PaperPortfolioParams | None = None,
         retry_policy: ScannerRetryPolicy | None = None,
+        startup_latency_calibrator: StartupLatencyCalibrator | None = _calibrate_startup_latency,
         **_legacy_kwargs: Any,
     ):
         self.config = scan_config or config.load_scan_config()
@@ -398,6 +523,8 @@ class ConditionalArbScanner:
         )
         self.logger = logger or logging.getLogger("polymarket_conditional_arb.portfolio")
         self.retry_policy = retry_policy or ScannerRetryPolicy()
+        self._startup_latency_calibrator = startup_latency_calibrator
+        self.startup_latency_calibration: _StartupLatencyCalibration | None = None
         self.running = True
         self.runtime = RuntimeStatusWriter(
             self.config.paper_portfolio_runtime_path,
@@ -441,6 +568,8 @@ class ConditionalArbScanner:
     def _start_runtime(self, *, detail: str) -> None:
         self._runtime_started = True
         self.runtime.start(phase="warmup", detail=detail)
+        if self.startup_latency_calibration is not None:
+            self._runtime_update(**self.startup_latency_calibration.runtime_fields())
 
     def _stop_runtime(self, *, detail: str = "stopping") -> None:
         if not self._runtime_started:
@@ -476,6 +605,37 @@ class ConditionalArbScanner:
 
     def _runtime_error(self, exc: Exception) -> None:
         self._runtime_update(last_error=f"{type(exc).__name__}: {exc}")
+
+    def _apply_startup_latency_calibration(self) -> _StartupLatencyCalibration | None:
+        if self._startup_latency_calibrator is None:
+            return None
+        try:
+            calibration = self._startup_latency_calibrator(self)
+        except Exception as exc:
+            self.logger.error("startup_latency_calibration_failed error=%r", exc)
+            raise
+        if calibration is None:
+            return None
+        calibrated_simulation = replace(
+            self.params.simulation,
+            latency_ms=calibration.p95_latency_ms,
+            latency_jitter_ms=calibration.latency_jitter_ms,
+        )
+        self.params = replace(self.params, simulation=calibrated_simulation)
+        self.portfolio.params = self.params
+        self.startup_latency_calibration = calibration
+        fields = calibration.event_payload()
+        self.logger.info(
+            "startup_latency_calibrated source=%s p50_ms=%.3f p95_ms=%.3f jitter_ms=%.3f measured_at=%s report_path=%s",
+            fields["source"],
+            fields["p50_latency_ms"],
+            fields["p95_latency_ms"],
+            fields["latency_jitter_ms"],
+            fields.get("measured_at_utc"),
+            fields["report_path"],
+        )
+        self._runtime_update(**calibration.runtime_fields())
+        return calibration
 
     def _log_rest_book_seed_failures(self, *, reason: str) -> None:
         if not self._runtime_started:
@@ -976,6 +1136,7 @@ class ConditionalArbScanner:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.config.log_dir.mkdir(parents=True, exist_ok=True)
         self.portfolio.load()
+        latency_calibration = self._apply_startup_latency_calibration()
         self.portfolio.append_event(
             "paper_portfolio_instance_started",
             {
@@ -993,6 +1154,11 @@ class ConditionalArbScanner:
                 "min_net_return_bps": self.params.min_net_return_bps,
                 "starting_capital_usd": self.params.starting_capital_usd,
                 "trade_ceiling_usd": self.params.trade_ceiling_usd,
+                "startup_latency_calibration": (
+                    latency_calibration.event_payload()
+                    if latency_calibration is not None
+                    else None
+                ),
             },
         )
 
