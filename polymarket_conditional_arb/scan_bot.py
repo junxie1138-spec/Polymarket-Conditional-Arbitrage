@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import signal
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -1136,6 +1137,15 @@ class ConditionalArbScanner:
         self.config.data_dir.mkdir(parents=True, exist_ok=True)
         self.config.log_dir.mkdir(parents=True, exist_ok=True)
         self.portfolio.load()
+        recovery = self.portfolio.recover_completed_active_execution()
+        if recovery is not None:
+            self.logger.warning(
+                "paper_portfolio_execution_recovered execution_id=%s market_id=%s steps=%s already_recorded=%s",
+                recovery.get("execution_id"),
+                recovery.get("market_id"),
+                recovery.get("step_count"),
+                recovery.get("already_recorded"),
+            )
         latency_calibration = self._apply_startup_latency_calibration()
         self.portfolio.append_event(
             "paper_portfolio_instance_started",
@@ -1162,6 +1172,16 @@ class ConditionalArbScanner:
             },
         )
 
+    def _save_portfolio_on_shutdown(self) -> None:
+        had_active_exception = sys.exc_info()[0] is not None
+        try:
+            self.portfolio.save()
+        except Exception as exc:
+            self.logger.warning("paper_portfolio_shutdown_save_failed error=%r", exc)
+            if had_active_exception:
+                return
+            raise
+
     def install_signal_handlers(self) -> None:
         def _stop(signum, _frame):
             self.logger.info("shutdown_signal signal=%s", signum)
@@ -1180,7 +1200,7 @@ class ConditionalArbScanner:
             raise
         finally:
             self._stop_runtime(detail="one-shot run stopped")
-            self.portfolio.save()
+            self._save_portfolio_on_shutdown()
 
     def run_forever(self) -> None:
         self.bootstrap()
@@ -1198,7 +1218,7 @@ class ConditionalArbScanner:
             raise
         finally:
             self._stop_runtime()
-            self.portfolio.save()
+            self._save_portfolio_on_shutdown()
 
     def _run_rest_forever(self) -> None:
         first_cycle = True

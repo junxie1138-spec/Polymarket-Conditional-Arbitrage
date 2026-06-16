@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -16,6 +18,12 @@ from .event_log import AppendOnlyJsonl, jsonable, utc_iso
 EPSILON = 1e-9
 SCHEMA_VERSION = 1
 PORTFOLIO_SCHEMA_VERSION = 3
+PAPER_STATE_WRITE_RETRY_ATTEMPTS = 10
+PAPER_STATE_WRITE_RETRY_INITIAL_SECONDS = 0.05
+PAPER_STATE_WRITE_RETRY_MAX_SECONDS = 1.0
+PAPER_STATE_READ_RETRY_ATTEMPTS = 3
+PAPER_STATE_READ_RETRY_INITIAL_SECONDS = 0.01
+PAPER_STATE_READ_RETRY_MAX_SECONDS = 0.05
 LOGGER = logging.getLogger(__name__)
 
 
@@ -931,6 +939,7 @@ def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfo
     steps = _normalize_step_history(active.get("steps"))
     if not steps:
         return planned
+    max_step_count = _active_execution_max_step_count(active, params=params)
 
     def total(field: str, default: float = 0.0) -> float:
         return sum(_as_float(step.get(field), default) for step in steps)
@@ -956,7 +965,7 @@ def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfo
     details = dict(planned.get("details")) if isinstance(planned.get("details"), Mapping) else {}
     details["stepped_execution"] = {
         "step_count": len(steps),
-        "max_step_count": params.simulation.max_step_count,
+        "max_step_count": max_step_count,
         "step_plan": dict(active.get("step_plan")) if isinstance(active.get("step_plan"), Mapping) else {},
         "steps": _step_summary_rows(steps),
     }
@@ -967,7 +976,7 @@ def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfo
         "step_count": len(steps),
         "completed_quantity": quantity,
         "target_quantity": _as_float(active.get("target_quantity"), _as_float(planned.get("quantity"))),
-        "max_step_count": params.simulation.max_step_count,
+        "max_step_count": max_step_count,
         "step_plan": dict(active.get("step_plan")) if isinstance(active.get("step_plan"), Mapping) else {},
         "started_at_utc": active.get("started_at_utc"),
         "completed_at_utc": steps[-1].get("executed_at_utc"),
@@ -1014,6 +1023,33 @@ def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfo
         planned["preexisting_redeemed_value"] = preexisting_redeemed
         planned["preexisting_redeemed_cost_basis_usd"] = preexisting_cost_basis
     return planned
+
+
+def _active_execution_max_step_count(active: Mapping[str, Any], *, params: PaperPortfolioParams) -> int:
+    step_plan = active.get("step_plan")
+    if isinstance(step_plan, Mapping):
+        try:
+            max_step_count = int(step_plan.get("max_step_count"))
+        except (TypeError, ValueError):
+            max_step_count = 0
+        if max_step_count >= 1:
+            return max_step_count
+    return params.simulation.max_step_count
+
+
+def _active_execution_completed(active: Mapping[str, Any], *, params: PaperPortfolioParams) -> tuple[bool, str | None]:
+    steps = _normalize_step_history(active.get("steps"))
+    if not steps:
+        return False, None
+    target_quantity = _as_float(active.get("target_quantity"))
+    completed_quantity = _as_float(active.get("completed_quantity"))
+    if target_quantity <= EPSILON:
+        return True, "target_quantity_limit"
+    if completed_quantity >= target_quantity - EPSILON:
+        return True, str(active.get("stop_reason") or "target_quantity_limit")
+    if len(steps) >= _active_execution_max_step_count(active, params=params):
+        return True, "max_step_count"
+    return False, None
 
 
 def _stage_random(
@@ -2437,11 +2473,27 @@ class PaperPortfolio:
     def _read_state(self) -> dict[str, Any]:
         if not self.path.exists():
             return initial_portfolio_state(self.params)
-        try:
-            with self.path.open(encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PaperPortfolioLoadError(f"failed to load paper portfolio {self.path}: {exc}") from exc
+        last_exc: Exception | None = None
+        data: Any = None
+        delay = PAPER_STATE_READ_RETRY_INITIAL_SECONDS
+        for attempt in range(1, PAPER_STATE_READ_RETRY_ATTEMPTS + 1):
+            try:
+                with self.path.open(encoding="utf-8") as f:
+                    data = json.load(f)
+                break
+            except (OSError, json.JSONDecodeError) as exc:
+                last_exc = exc
+                if attempt >= PAPER_STATE_READ_RETRY_ATTEMPTS:
+                    raise PaperPortfolioLoadError(f"failed to load paper portfolio {self.path}: {exc}") from exc
+                if delay > 0.0:
+                    time.sleep(delay)
+                delay = min(
+                    delay * 2.0 if delay > 0.0 else PAPER_STATE_READ_RETRY_INITIAL_SECONDS,
+                    PAPER_STATE_READ_RETRY_MAX_SECONDS,
+                )
+        else:
+            assert last_exc is not None
+            raise PaperPortfolioLoadError(f"failed to load paper portfolio {self.path}: {last_exc}") from last_exc
         if not isinstance(data, dict):
             raise PaperPortfolioLoadError(
                 f"paper portfolio {self.path} must contain a JSON object, got {type(data).__name__}"
@@ -2475,15 +2527,97 @@ class PaperPortfolio:
     def _write_state(self, state: Mapping[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(jsonable(state), f, indent=2, sort_keys=True)
-        tmp.replace(self.path)
+        payload = jsonable(state)
+        last_exc: OSError | None = None
+        delay = PAPER_STATE_WRITE_RETRY_INITIAL_SECONDS
+        for attempt in range(1, PAPER_STATE_WRITE_RETRY_ATTEMPTS + 1):
+            try:
+                with tmp.open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp.replace(self.path)
+                return
+            except OSError as exc:
+                last_exc = exc
+                if attempt >= PAPER_STATE_WRITE_RETRY_ATTEMPTS:
+                    raise
+                if delay > 0.0:
+                    time.sleep(delay)
+                delay = min(
+                    delay * 2.0 if delay > 0.0 else PAPER_STATE_WRITE_RETRY_INITIAL_SECONDS,
+                    PAPER_STATE_WRITE_RETRY_MAX_SECONDS,
+                )
+        assert last_exc is not None
+        raise last_exc
 
     def _reload_after_failed_save(self, fallback_state: Mapping[str, Any]) -> None:
         try:
             self.state = self._read_state() if self.path.exists() else deepcopy(dict(fallback_state))
         except PaperPortfolioLoadError:
             self.state = deepcopy(dict(fallback_state))
+
+    def recover_completed_active_execution(self) -> dict[str, Any] | None:
+        active = _active_execution_state(self.state)
+        if active is None:
+            return None
+        completed, stop_reason = _active_execution_completed(active, params=self.params)
+        if not completed:
+            return None
+
+        base_state = deepcopy(self.state)
+        working_state = deepcopy(self.state)
+        execution_id = str(active.get("execution_id") or "")
+        already_recorded = False
+        executions = working_state.setdefault("executions", [])
+        if isinstance(executions, list):
+            already_recorded = any(
+                isinstance(row, Mapping) and str(row.get("execution_id") or "") == execution_id
+                for row in executions
+            )
+        else:
+            executions = []
+            working_state["executions"] = executions
+
+        recovery_active = deepcopy(active)
+        if stop_reason is not None:
+            recovery_active["stop_reason"] = stop_reason
+        final_execution = _aggregate_step_executions(recovery_active, params=self.params)
+        if not already_recorded:
+            executions.append(deepcopy(final_execution))
+            fingerprints = working_state.setdefault("book_fingerprints", {})
+            if isinstance(fingerprints, dict):
+                fingerprints[str(final_execution["market_id"])] = {
+                    "fingerprint": final_execution["book_fingerprint"],
+                    "execution_id": final_execution["execution_id"],
+                    "executed_at_utc": final_execution["executed_at_utc"],
+                }
+            working_state["last_execution_at_utc"] = final_execution["executed_at_utc"]
+        working_state.pop("active_execution", None)
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+        self.state = working_state
+
+        summary = {
+            "execution_id": final_execution.get("execution_id"),
+            "market_id": final_execution.get("market_id"),
+            "book_fingerprint": final_execution.get("book_fingerprint"),
+            "executed_at_utc": final_execution.get("executed_at_utc"),
+            "step_count": len(_normalize_step_history(active.get("steps"))),
+            "already_recorded": already_recorded,
+        }
+        try:
+            self.append_event("paper_portfolio_execution_recovered", summary)
+        except Exception as exc:
+            LOGGER.warning(
+                "paper_portfolio_execution_recovered_event_append_failed execution_id=%s error=%r",
+                summary.get("execution_id"),
+                exc,
+            )
+        return summary
 
     def append_event(self, event_type: str, payload: dict[str, Any] | None = None, **fields: Any) -> dict[str, Any]:
         merged = dict(payload or {})

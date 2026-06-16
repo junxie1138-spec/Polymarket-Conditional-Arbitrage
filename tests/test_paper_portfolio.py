@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from polymarket_conditional_arb import config
+from polymarket_conditional_arb import paper as paper_module
 from polymarket_conditional_arb.arb_models import BinaryMarket
 from polymarket_conditional_arb.order_book import asks_from_book
 from polymarket_conditional_arb.paper import (
@@ -71,6 +73,125 @@ def state_for(p: PaperPortfolioParams | None = None, *, cash: float | None = Non
     state = initial_portfolio_state(p, as_of=AS_OF)
     if cash is not None:
         state["cash"] = cash
+    return state
+
+
+def completed_active_execution_state(p: PaperPortfolioParams) -> dict:
+    state = state_for(p)
+    state["cash"] = 1000.3
+    state["realized_pnl"] = 0.3
+    state["total_equity"] = 1000.3
+    state["active_execution"] = {
+        "execution_id": "paper:m1:1:deadbeef",
+        "market_id": "m1",
+        "condition_id": "c1",
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "book_fingerprint": "deadbeef",
+        "target_quantity": 10.0,
+        "target_yes_filled_quantity": 10.0,
+        "target_no_filled_quantity": 10.0,
+        "completed_quantity": 10.0,
+        "completed_yes_filled_quantity": 10.0,
+        "completed_no_filled_quantity": 10.0,
+        "current_step_quantity": 5.0,
+        "step_plan": {
+            "step_quantity_shares": 5.0,
+            "max_step_count": 4,
+            "grow_step_size_after_success": False,
+            "merge_cost_per_step": False,
+        },
+        "planned_execution": {
+            "execution_id": "paper:m1:1:deadbeef",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "event_id": "e1",
+            "event_title": "Event",
+            "question": "Will X happen?",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "executed_at_utc": "2026-06-08T12:00:00Z",
+            "book_fingerprint": "deadbeef",
+            "quantity": 10.0,
+            "quantity_redeemed": 10.0,
+            "yes_filled_quantity": 10.0,
+            "no_filled_quantity": 10.0,
+            "yes_vwap": 0.48,
+            "no_vwap": 0.49,
+            "yes_cost": 4.8,
+            "no_cost": 4.9,
+            "gross_cost": 9.7,
+            "estimated_fees": 0.0,
+            "slippage_buffer": 0.0,
+            "tax_cost": 0.0,
+            "merge_cost": 0.0,
+            "capital_used": 9.7,
+            "redeemed_value": 10.0,
+            "net_profit": 0.3,
+            "net_return_bps": 309.27835051546396,
+            "effective_slippage_bps": 0.0,
+            "trade_ceiling_usd": 100.0,
+            "ceiling_used_usd": 9.7,
+            "stop_reason": "cash_or_ceiling_limit",
+            "simulation": {"fill_timestamp_utc": "2026-06-08T12:00:00Z"},
+            "details": {
+                "yes_best_ask": 0.48,
+                "no_best_ask": 0.49,
+                "yes_source": "rest_book",
+                "no_source": "rest_book",
+                "min_order_size": 5.0,
+                "signal_book_fingerprint": "deadbeef",
+            },
+        },
+        "steps": [
+            {
+                "execution_id": "paper:m1:1:deadbeef:step:1",
+                "executed_at_utc": "2026-06-08T12:00:00Z",
+                "book_fingerprint": "deadbeef-step-1",
+                "quantity": 5.0,
+                "yes_filled_quantity": 5.0,
+                "no_filled_quantity": 5.0,
+                "quantity_redeemed": 5.0,
+                "yes_cost": 2.4,
+                "no_cost": 2.45,
+                "gross_cost": 4.85,
+                "estimated_fees": 0.0,
+                "slippage_buffer": 0.0,
+                "tax_cost": 0.0,
+                "merge_cost": 0.0,
+                "capital_used": 4.85,
+                "redeemed_value": 5.0,
+                "net_profit": 0.15,
+                "cash_before": 1000.0,
+                "cash_after": 1000.15,
+                "redeemed_cost_basis_usd": 4.85,
+                "simulation": {"step_index": 1},
+            },
+            {
+                "execution_id": "paper:m1:1:deadbeef:step:2",
+                "executed_at_utc": "2026-06-08T12:00:01Z",
+                "book_fingerprint": "deadbeef-step-2",
+                "quantity": 5.0,
+                "yes_filled_quantity": 5.0,
+                "no_filled_quantity": 5.0,
+                "quantity_redeemed": 5.0,
+                "yes_cost": 2.4,
+                "no_cost": 2.45,
+                "gross_cost": 4.85,
+                "estimated_fees": 0.0,
+                "slippage_buffer": 0.0,
+                "tax_cost": 0.0,
+                "merge_cost": 0.0,
+                "capital_used": 4.85,
+                "redeemed_value": 5.0,
+                "net_profit": 0.15,
+                "cash_before": 1000.15,
+                "cash_after": 1000.3,
+                "redeemed_cost_basis_usd": 4.85,
+                "simulation": {"step_index": 2},
+            },
+        ],
+    }
     return state
 
 
@@ -1080,6 +1201,117 @@ def test_resumed_active_execution_finishes_and_clears_state(tmp_path):
     assert portfolio.state["executions"][-1]["details"]["stepped_execution"]["step_count"] == 2
 
 
+def test_completed_active_execution_recovery_finalizes_without_reapplying_steps(tmp_path):
+    p = params(
+        simulation=simulation(
+            max_step_count=4,
+            step_quantity_shares=5.0,
+            merge_cost_per_step=False,
+        )
+    )
+    path = tmp_path / "portfolio.json"
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    portfolio.state = completed_active_execution_state(p)
+    portfolio.save()
+    portfolio.load()
+
+    summary = portfolio.recover_completed_active_execution()
+
+    assert summary is not None
+    assert summary["execution_id"] == "paper:m1:1:deadbeef"
+    assert summary["already_recorded"] is False
+    assert "active_execution" not in portfolio.state
+    assert portfolio.state["cash"] == pytest.approx(1000.3)
+    assert portfolio.state["realized_pnl"] == pytest.approx(0.3)
+    assert len(portfolio.state["executions"]) == 1
+    assert portfolio.state["executions"][0]["quantity_redeemed"] == pytest.approx(10.0)
+    assert portfolio.state["executions"][0]["net_profit"] == pytest.approx(0.3)
+    assert portfolio.state["book_fingerprints"]["m1"]["execution_id"] == "paper:m1:1:deadbeef"
+    events = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert "paper_portfolio_execution_recovered" in events
+
+
+def test_completed_active_execution_recovery_is_idempotent(tmp_path):
+    p = params(
+        simulation=simulation(
+            max_step_count=4,
+            step_quantity_shares=5.0,
+            merge_cost_per_step=False,
+        )
+    )
+    path = tmp_path / "portfolio.json"
+    state = completed_active_execution_state(p)
+    recovered = deepcopy(state["active_execution"])
+    final_execution = deepcopy(recovered["planned_execution"])
+    final_execution.update(
+        {
+            "execution_id": recovered["execution_id"],
+            "book_fingerprint": recovered["book_fingerprint"],
+            "executed_at_utc": "2026-06-08T12:00:01Z",
+            "quantity": 10.0,
+            "quantity_redeemed": 10.0,
+            "yes_filled_quantity": 10.0,
+            "no_filled_quantity": 10.0,
+            "yes_cost": 4.8,
+            "no_cost": 4.9,
+            "gross_cost": 9.7,
+            "capital_used": 9.7,
+            "redeemed_value": 10.0,
+            "net_profit": 0.3,
+            "cash_before": 1000.0,
+            "cash_after": 1000.3,
+        }
+    )
+    state["executions"] = [final_execution]
+    state["book_fingerprints"] = {
+        "m1": {
+            "fingerprint": "deadbeef",
+            "execution_id": "paper:m1:1:deadbeef",
+            "executed_at_utc": "2026-06-08T12:00:01Z",
+        }
+    }
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    first = portfolio.recover_completed_active_execution()
+    second = portfolio.recover_completed_active_execution()
+
+    assert first is not None
+    assert first["already_recorded"] is True
+    assert second is None
+    assert "active_execution" not in portfolio.state
+    assert len(portfolio.state["executions"]) == 1
+    assert portfolio.state["book_fingerprints"]["m1"]["execution_id"] == "paper:m1:1:deadbeef"
+
+
+def test_completed_active_execution_recovery_uses_persisted_max_step_count(tmp_path):
+    p = params(
+        simulation=simulation(
+            max_step_count=8,
+            step_quantity_shares=5.0,
+            merge_cost_per_step=False,
+        )
+    )
+    path = tmp_path / "portfolio.json"
+    state = completed_active_execution_state(p)
+    state["active_execution"]["target_quantity"] = 15.0
+    state["active_execution"]["target_yes_filled_quantity"] = 15.0
+    state["active_execution"]["target_no_filled_quantity"] = 15.0
+    state["active_execution"]["completed_quantity"] = 10.0
+    state["active_execution"]["completed_yes_filled_quantity"] = 10.0
+    state["active_execution"]["completed_no_filled_quantity"] = 10.0
+    state["active_execution"]["step_plan"]["max_step_count"] = 2
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    summary = portfolio.recover_completed_active_execution()
+
+    assert summary is not None
+    assert "active_execution" not in portfolio.state
+    assert portfolio.state["executions"][0]["stop_reason"] == "max_step_count"
+    assert portfolio.state["executions"][0]["details"]["stepped_execution"]["max_step_count"] == 2
+
+
 def test_state_file_load_ignores_leftover_tmp_file(tmp_path):
     p = params()
     path = tmp_path / "portfolio.json"
@@ -1116,6 +1348,100 @@ def test_status_uses_state_when_event_append_fails_after_save(tmp_path):
     assert "event append failed" in decision.execution["event_log_error"]
     assert status["trade_count"] == 1
     assert status["cash"] == pytest.approx(1000.3)
+
+
+def test_state_save_retries_transient_replace_permission_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper_module, "PAPER_STATE_WRITE_RETRY_INITIAL_SECONDS", 0.0)
+    p = params()
+    path = tmp_path / "portfolio.json"
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    path_type = type(path)
+    original_replace = path_type.replace
+    replace_calls = 0
+
+    def flaky_replace(self, target):
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 1:
+            raise PermissionError("portfolio file is temporarily locked")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(path_type, "replace", flaky_replace)
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 10)]),
+        asks("no-token", [(0.49, 10)]),
+        as_of=AS_OF,
+    )
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert decision.action == "EXECUTE"
+    assert replace_calls == 2
+    assert len(portfolio.state["executions"]) == 1
+    assert len(saved["executions"]) == 1
+    assert saved["executions"][0]["execution_id"] == portfolio.state["executions"][0]["execution_id"]
+
+
+def test_state_save_exhausted_replace_retries_raise_and_roll_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper_module, "PAPER_STATE_WRITE_RETRY_ATTEMPTS", 2)
+    monkeypatch.setattr(paper_module, "PAPER_STATE_WRITE_RETRY_INITIAL_SECONDS", 0.0)
+    p = params()
+    path = tmp_path / "portfolio.json"
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    path_type = type(path)
+    replace_calls = 0
+
+    def locked_replace(self, target):
+        nonlocal replace_calls
+        replace_calls += 1
+        raise PermissionError("portfolio file is locked")
+
+    monkeypatch.setattr(path_type, "replace", locked_replace)
+
+    with pytest.raises(PermissionError, match="portfolio file is locked"):
+        portfolio.execute_binary_complete_set(
+            market(),
+            asks("yes-token", [(0.48, 10)]),
+            asks("no-token", [(0.49, 10)]),
+            as_of=AS_OF,
+        )
+
+    assert replace_calls == 2
+    assert not path.exists()
+    assert path.with_name(path.name + ".tmp").exists()
+    assert portfolio.state["cash"] == pytest.approx(1000.0)
+    assert portfolio.state["executions"] == []
+    assert portfolio.state["inventory"] == {}
+
+
+def test_status_retries_transient_read_failure_without_mutating_state_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper_module, "PAPER_STATE_READ_RETRY_INITIAL_SECONDS", 0.0)
+    p = params()
+    path = tmp_path / "portfolio.json"
+    PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).reset(yes=True)
+    before = path.read_text(encoding="utf-8")
+    path_type = type(path)
+    original_open = path_type.open
+    open_calls = 0
+
+    def flaky_open(self, *args, **kwargs):
+        nonlocal open_calls
+        if self == path and open_calls == 0:
+            open_calls += 1
+            raise PermissionError("portfolio file is briefly locked")
+        open_calls += 1
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "open", flaky_open)
+
+    status = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).status()
+    with original_open(path, encoding="utf-8") as f:
+        after = f.read()
+
+    assert open_calls == 2
+    assert status["trade_count"] == 0
+    assert before == after
 
 
 def test_status_reports_realized_and_open_inventory_metrics(tmp_path):

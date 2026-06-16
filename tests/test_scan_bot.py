@@ -20,7 +20,7 @@ from polymarket_conditional_arb.fetcher import GammaClobClient
 from polymarket_conditional_arb.market_data import MarketDataCache
 from polymarket_conditional_arb.market_universe_cache import write_market_universe_cache
 from polymarket_conditional_arb.order_book import asks_from_book
-from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams
+from polymarket_conditional_arb.paper import PaperPortfolio, PaperPortfolioParams, initial_portfolio_state
 from polymarket_conditional_arb.portfolio_lock import PortfolioDataLock, PortfolioLockError
 from polymarket_conditional_arb.runtime_status import (
     RuntimeStatusWriter,
@@ -282,6 +282,116 @@ def scan_config(tmp_path: Path):
         include_neg_risk=True,
         paper_simulation=config.PaperExecutionSimulationConfig.zero_friction(),
     )
+
+
+def completed_active_execution_state(params: PaperPortfolioParams) -> dict:
+    state = initial_portfolio_state(params)
+    state["cash"] = 1000.3
+    state["realized_pnl"] = 0.3
+    state["total_equity"] = 1000.3
+    state["active_execution"] = {
+        "execution_id": "paper:m1:1:deadbeef",
+        "market_id": "m1",
+        "condition_id": "c1",
+        "yes_token_id": "yes-token",
+        "no_token_id": "no-token",
+        "book_fingerprint": "deadbeef",
+        "target_quantity": 10.0,
+        "target_yes_filled_quantity": 10.0,
+        "target_no_filled_quantity": 10.0,
+        "completed_quantity": 10.0,
+        "completed_yes_filled_quantity": 10.0,
+        "completed_no_filled_quantity": 10.0,
+        "current_step_quantity": 5.0,
+        "step_plan": {
+            "step_quantity_shares": 5.0,
+            "max_step_count": 4,
+            "grow_step_size_after_success": False,
+            "merge_cost_per_step": False,
+        },
+        "planned_execution": {
+            "execution_id": "paper:m1:1:deadbeef",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "event_id": "e1",
+            "event_title": "Event",
+            "question": "Will X happen?",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "executed_at_utc": "2026-06-08T12:00:00Z",
+            "book_fingerprint": "deadbeef",
+            "quantity": 10.0,
+            "quantity_redeemed": 10.0,
+            "yes_filled_quantity": 10.0,
+            "no_filled_quantity": 10.0,
+            "yes_vwap": 0.48,
+            "no_vwap": 0.49,
+            "yes_cost": 4.8,
+            "no_cost": 4.9,
+            "gross_cost": 9.7,
+            "estimated_fees": 0.0,
+            "slippage_buffer": 0.0,
+            "tax_cost": 0.0,
+            "merge_cost": 0.0,
+            "capital_used": 9.7,
+            "redeemed_value": 10.0,
+            "net_profit": 0.3,
+            "effective_slippage_bps": 0.0,
+            "ceiling_used_usd": 9.7,
+            "stop_reason": "cash_or_ceiling_limit",
+            "simulation": {},
+            "details": {},
+        },
+        "steps": [
+            {
+                "execution_id": "paper:m1:1:deadbeef:step:1",
+                "executed_at_utc": "2026-06-08T12:00:00Z",
+                "book_fingerprint": "deadbeef-step-1",
+                "quantity": 5.0,
+                "yes_filled_quantity": 5.0,
+                "no_filled_quantity": 5.0,
+                "quantity_redeemed": 5.0,
+                "yes_cost": 2.4,
+                "no_cost": 2.45,
+                "gross_cost": 4.85,
+                "estimated_fees": 0.0,
+                "slippage_buffer": 0.0,
+                "tax_cost": 0.0,
+                "merge_cost": 0.0,
+                "capital_used": 4.85,
+                "redeemed_value": 5.0,
+                "net_profit": 0.15,
+                "cash_before": 1000.0,
+                "cash_after": 1000.15,
+                "redeemed_cost_basis_usd": 4.85,
+                "simulation": {"step_index": 1},
+            },
+            {
+                "execution_id": "paper:m1:1:deadbeef:step:2",
+                "executed_at_utc": "2026-06-08T12:00:01Z",
+                "book_fingerprint": "deadbeef-step-2",
+                "quantity": 5.0,
+                "yes_filled_quantity": 5.0,
+                "no_filled_quantity": 5.0,
+                "quantity_redeemed": 5.0,
+                "yes_cost": 2.4,
+                "no_cost": 2.45,
+                "gross_cost": 4.85,
+                "estimated_fees": 0.0,
+                "slippage_buffer": 0.0,
+                "tax_cost": 0.0,
+                "merge_cost": 0.0,
+                "capital_used": 4.85,
+                "redeemed_value": 5.0,
+                "net_profit": 0.15,
+                "cash_before": 1000.15,
+                "cash_after": 1000.3,
+                "redeemed_cost_basis_usd": 4.85,
+                "simulation": {"step_index": 2},
+            },
+        ],
+    }
+    return state
 
 
 def scanner_for(tmp_path: Path, client, cfg=None):
@@ -1005,6 +1115,50 @@ def test_runner_executes_and_persists_paper_portfolio_state(tmp_path):
     assert state["executions"][0]["market_id"] == "m1"
     assert state["executions"][0]["quantity_redeemed"] == 10.0
     assert state["inventory"] == {}
+
+
+def test_bootstrap_recovers_completed_active_execution(tmp_path):
+    simulation = config.PaperExecutionSimulationConfig(
+        enabled=True,
+        max_step_count=4,
+        step_quantity_shares=5.0,
+    )
+    cfg = replace(scan_config(tmp_path), paper_simulation=simulation)
+    params = PaperPortfolioParams.from_config(cfg)
+    cfg.paper_portfolio_instance_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.paper_portfolio_instance_path.write_text(
+        json.dumps(completed_active_execution_state(params)),
+        encoding="utf-8",
+    )
+    scanner = ConditionalArbScanner(
+        scan_config=cfg,
+        client=FakeClient(),
+        portfolio=PaperPortfolio(
+            cfg.paper_portfolio_instance_path,
+            events_path=cfg.paper_portfolio_events_path,
+            params=params,
+        ),
+        logger=null_logger(),
+        params=params,
+        startup_latency_calibrator=None,
+    )
+
+    scanner.bootstrap()
+
+    state = json.loads(cfg.paper_portfolio_instance_path.read_text(encoding="utf-8"))
+    events = [
+        json.loads(line)
+        for line in cfg.paper_portfolio_events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert "active_execution" not in state
+    assert state["cash"] == pytest.approx(1000.3)
+    assert len(state["executions"]) == 1
+    assert state["executions"][0]["execution_id"] == "paper:m1:1:deadbeef"
+    assert state["book_fingerprints"]["m1"]["execution_id"] == "paper:m1:1:deadbeef"
+    assert [event["event_type"] for event in events] == [
+        "paper_portfolio_execution_recovered",
+        "paper_portfolio_instance_started",
+    ]
 
 
 def test_startup_latency_calibration_precedes_first_evaluation(tmp_path, monkeypatch):
