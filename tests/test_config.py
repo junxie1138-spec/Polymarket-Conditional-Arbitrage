@@ -87,6 +87,8 @@ def test_load_scan_config_reads_conservative_paper_simulation_defaults(monkeypat
 
     loaded = config.load_scan_config()
 
+    assert loaded.min_net_profit_usd == 0.50
+    assert loaded.min_net_return_bps == 75.0
     assert loaded.paper_simulation.enabled is True
     assert loaded.paper_simulation.seed == 0
     assert loaded.paper_simulation.latency_ms == 250.0
@@ -113,6 +115,12 @@ def test_load_scan_config_reads_conservative_paper_simulation_defaults(monkeypat
     assert loaded.paper_simulation.max_step_count == 20
     assert loaded.paper_simulation.grow_step_size_after_success is False
     assert loaded.paper_simulation.merge_cost_per_step is True
+    assert loaded.paper_simulation.pair_fill_policy == "strict_matched_pair"
+    assert loaded.paper_simulation.dynamic_thresholds_enabled is True
+    assert loaded.paper_simulation.block_unmatched_market_reentry is True
+    assert loaded.paper_simulation.block_unmatched_event_reentry is False
+    assert loaded.paper_simulation.max_unmatched_cost_usd_total == 0.0
+    assert loaded.paper_simulation.unmatched_inventory_management == "block_and_hold"
     assert loaded.paper_simulation.queue_depth_ratio == 0.75
     assert loaded.paper_simulation.queue_fill_probability == 0.95
     assert loaded.paper_simulation.partial_fill_probability == 0.15
@@ -126,7 +134,25 @@ def test_load_scan_config_reads_conservative_paper_simulation_defaults(monkeypat
     assert loaded.paper_simulation.adverse_selection_probability == 0.25
     assert loaded.paper_simulation.adverse_depth_removal_ratio == 0.50
     assert loaded.paper_simulation.adverse_price_move_bps == 10.0
+    assert loaded.paper_min_cash_reserve_usd == config.DEFAULT_TRADE_CEILING_USD
+    assert loaded.execution_health_gates_enabled is True
+    assert loaded.health_max_ws_reconnects_per_minute == 3
+    assert loaded.health_max_ws_errors_per_minute == 3
+    assert loaded.health_max_dirty_tokens == 100
+    assert loaded.health_max_dirty_batches == 10
+    assert loaded.health_max_latency_p95_ms == 1000.0
+    assert loaded.health_max_latency_jitter_ms == 500.0
     assert loaded.paper_simulation.is_zero_friction is False
+
+
+def test_load_scan_config_reads_paper_cash_reserve_override(monkeypatch):
+    monkeypatch.setenv("POLYMARKET_CLOB_HOST", "https://clob.example")
+    monkeypatch.setenv("COND_ARB_MARKET_WS_ENDPOINT", "wss://ws.example/ws/market")
+    monkeypatch.setenv("COND_ARB_PAPER_MIN_CASH_RESERVE_USD", "25")
+
+    loaded = config.load_scan_config()
+
+    assert loaded.paper_min_cash_reserve_usd == 25.0
 
 
 def test_load_scan_config_reads_zero_friction_paper_simulation(monkeypatch):

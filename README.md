@@ -64,7 +64,7 @@ The runner is paper-only. It never places orders, uses API credentials, reads wa
 
 Paper sizing mirrors Polymarket's API order-size floor: each simulated YES and NO order must be at least 5 outcome shares. If market metadata advertises a stricter minimum, that higher per-market minimum takes precedence.
 
-`COND_ARB_TRADE_CEILING_USD` is a per-execution maximum capital spend. Profitable depth above the ceiling is clamped down to that spend limit instead of being rejected, and the 5-share floor is checked against the final simulated YES and NO order sizes after the clamp.
+`COND_ARB_TRADE_CEILING_USD` is a per-execution maximum capital spend. Profitable depth above the ceiling is clamped down to that spend limit instead of being rejected, and the 5-share floor is checked against the final simulated YES and NO order sizes after the clamp. `COND_ARB_PAPER_MIN_CASH_RESERVE_USD` keeps a cash buffer before new paper executions are sized; by default it equals the current trade ceiling, so the runner stops opening new paper trades before cash is drained to zero.
 
 Paper fills use live-market-data-driven simulated execution by default while staying strictly paper-only. A signal-time opportunity is rechecked at the simulated fill timestamp using public YES/NO ask books from the WebSocket cache or fresh REST `/books`/`/book` snapshots. The simulator records public source type, timestamps, source revisions/hashes, snapshot readiness/generation, recent `price_change` deltas, `last_trade_price` prints, `tick_size_change` metadata, request latency/retry/status evidence, and public/network errors. It compares signal-time and fill-time books, skips safely on missing, unready, stale, timeout, or errored public data, and treats deterministic queue/adverse/partial fallback as opt-in when no usable public evidence exists. Completed paper fills store a top-level `simulation` object with `live_public_data`, `inferred`, and `fallback` sections plus fill timestamp, book source, queue inputs, rate-limit/local-pressure evidence, public-depth eligibility, and calibrated slippage metadata. Simulated failures append `paper_portfolio_execution_failed` audit events and do not mutate the portfolio.
 
@@ -106,6 +106,7 @@ The files below are generated local operational state and are ignored by Git. Tr
 - `COND_ARB_LOG_DIR`
 - `COND_ARB_STARTING_CAPITAL_USD`
 - `COND_ARB_TRADE_CEILING_USD`
+- `COND_ARB_PAPER_MIN_CASH_RESERVE_USD`
 - `COND_ARB_SLIPPAGE_BUFFER_BPS`
 - `COND_ARB_TAKER_FEE_BPS`
 - `COND_ARB_TAX_BPS`
@@ -149,6 +150,19 @@ The files below are generated local operational state and are ignored by Git. Tr
 - `COND_ARB_PAPER_SLIPPAGE_MAX_BPS`
 - `COND_ARB_PAPER_SLIPPAGE_LOOKBACK_EVENTS`
 - `COND_ARB_PAPER_SLIPPAGE_COMBINE_MODE`
+- `COND_ARB_PAPER_PAIR_FILL_POLICY`
+- `COND_ARB_PAPER_DYNAMIC_THRESHOLDS_ENABLED`
+- `COND_ARB_PAPER_BLOCK_UNMATCHED_MARKET_REENTRY`
+- `COND_ARB_PAPER_BLOCK_UNMATCHED_EVENT_REENTRY`
+- `COND_ARB_PAPER_MAX_UNMATCHED_COST_USD_TOTAL`
+- `COND_ARB_PAPER_UNMATCHED_INVENTORY_MANAGEMENT`
+- `COND_ARB_EXECUTION_HEALTH_GATES_ENABLED`
+- `COND_ARB_HEALTH_MAX_WS_RECONNECTS_PER_MINUTE`
+- `COND_ARB_HEALTH_MAX_WS_ERRORS_PER_MINUTE`
+- `COND_ARB_HEALTH_MAX_DIRTY_TOKENS`
+- `COND_ARB_HEALTH_MAX_DIRTY_BATCHES`
+- `COND_ARB_HEALTH_MAX_LATENCY_P95_MS`
+- `COND_ARB_HEALTH_MAX_LATENCY_JITTER_MS`
 - `COND_ARB_PAPER_QUEUE_DEPTH_RATIO`
 - `COND_ARB_PAPER_QUEUE_FILL_PROBABILITY`
 - `COND_ARB_PAPER_PARTIAL_FILL_PROBABILITY`

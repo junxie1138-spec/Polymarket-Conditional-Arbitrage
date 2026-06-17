@@ -16,10 +16,11 @@ MARKET_WS_PRODUCTION_ENDPOINT = "wss://ws-subscriptions-clob.polymarket.com/ws/m
 
 DEFAULT_MARKET_LIMIT = 0
 DEFAULT_POLL_INTERVAL_SECONDS = 60
-DEFAULT_MIN_NET_PROFIT_USD = 0.0
-DEFAULT_MIN_NET_RETURN_BPS = 0.0
+DEFAULT_MIN_NET_PROFIT_USD = 0.50
+DEFAULT_MIN_NET_RETURN_BPS = 75.0
 DEFAULT_STARTING_CAPITAL_USD = 1_000.0
 DEFAULT_TRADE_CEILING_USD = 100.0
+DEFAULT_PAPER_MIN_CASH_RESERVE_USD = DEFAULT_TRADE_CEILING_USD
 DEFAULT_MAX_CAPITAL_USD = DEFAULT_TRADE_CEILING_USD
 DEFAULT_SLIPPAGE_BUFFER_BPS = 10.0
 DEFAULT_MERGE_COST_USD = 0.02
@@ -80,6 +81,19 @@ DEFAULT_PAPER_STEP_QUANTITY_SHARES = 5.0
 DEFAULT_PAPER_MAX_STEP_COUNT = 20
 DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS = False
 DEFAULT_PAPER_MERGE_COST_PER_STEP = True
+DEFAULT_PAPER_PAIR_FILL_POLICY = "strict_matched_pair"
+DEFAULT_PAPER_DYNAMIC_THRESHOLDS_ENABLED = True
+DEFAULT_PAPER_BLOCK_UNMATCHED_MARKET_REENTRY = True
+DEFAULT_PAPER_BLOCK_UNMATCHED_EVENT_REENTRY = False
+DEFAULT_PAPER_MAX_UNMATCHED_COST_USD_TOTAL = 0.0
+DEFAULT_PAPER_UNMATCHED_INVENTORY_MANAGEMENT = "block_and_hold"
+DEFAULT_EXECUTION_HEALTH_GATES_ENABLED = True
+DEFAULT_HEALTH_MAX_WS_RECONNECTS_PER_MINUTE = 3
+DEFAULT_HEALTH_MAX_WS_ERRORS_PER_MINUTE = 3
+DEFAULT_HEALTH_MAX_DIRTY_TOKENS = 100
+DEFAULT_HEALTH_MAX_DIRTY_BATCHES = 10
+DEFAULT_HEALTH_MAX_LATENCY_P95_MS = 1000.0
+DEFAULT_HEALTH_MAX_LATENCY_JITTER_MS = 500.0
 
 LATENCY_MODES = {"fixed", "telemetry"}
 LATENCY_JITTER_SEED_SCOPES = {"global", "market", "market_stage", "market_book_stage"}
@@ -88,6 +102,8 @@ SETTLEMENT_SOURCES = {"public_metadata_or_ws"}
 UNMATCHED_OPEN_VALUATION_MODES = {"best_bid_midpoint_or_zero"}
 SLIPPAGE_MODES = {"fixed_only", "fixed_plus_calibrated"}
 SLIPPAGE_COMBINE_MODES = {"max", "add"}
+PAIR_FILL_POLICIES = {"strict_matched_pair"}
+UNMATCHED_INVENTORY_MANAGEMENT_MODES = {"block_and_hold", "complete_missing_leg_if_profitable"}
 
 
 @dataclass(frozen=True)
@@ -118,6 +134,12 @@ class PaperExecutionSimulationConfig:
     max_step_count: int = DEFAULT_PAPER_MAX_STEP_COUNT
     grow_step_size_after_success: bool = DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS
     merge_cost_per_step: bool = DEFAULT_PAPER_MERGE_COST_PER_STEP
+    pair_fill_policy: str = DEFAULT_PAPER_PAIR_FILL_POLICY
+    dynamic_thresholds_enabled: bool = DEFAULT_PAPER_DYNAMIC_THRESHOLDS_ENABLED
+    block_unmatched_market_reentry: bool = DEFAULT_PAPER_BLOCK_UNMATCHED_MARKET_REENTRY
+    block_unmatched_event_reentry: bool = DEFAULT_PAPER_BLOCK_UNMATCHED_EVENT_REENTRY
+    max_unmatched_cost_usd_total: float = DEFAULT_PAPER_MAX_UNMATCHED_COST_USD_TOTAL
+    unmatched_inventory_management: str = DEFAULT_PAPER_UNMATCHED_INVENTORY_MANAGEMENT
     queue_depth_ratio: float = DEFAULT_PAPER_QUEUE_DEPTH_RATIO
     queue_fill_probability: float = DEFAULT_PAPER_QUEUE_FILL_PROBABILITY
     partial_fill_probability: float = DEFAULT_PAPER_PARTIAL_FILL_PROBABILITY
@@ -165,6 +187,15 @@ class PaperExecutionSimulationConfig:
                 "slippage_combine_mode must be one of "
                 f"{sorted(SLIPPAGE_COMBINE_MODES)}; got {self.slippage_combine_mode!r}"
             )
+        if self.pair_fill_policy not in PAIR_FILL_POLICIES:
+            raise ValueError(
+                f"pair_fill_policy must be one of {sorted(PAIR_FILL_POLICIES)}; got {self.pair_fill_policy!r}"
+            )
+        if self.unmatched_inventory_management not in UNMATCHED_INVENTORY_MANAGEMENT_MODES:
+            raise ValueError(
+                "unmatched_inventory_management must be one of "
+                f"{sorted(UNMATCHED_INVENTORY_MANAGEMENT_MODES)}; got {self.unmatched_inventory_management!r}"
+            )
         if self.local_timeout_ms < 0.0:
             raise ValueError("local_timeout_ms must be greater than or equal to 0")
         if self.telemetry_latency_window < 1:
@@ -177,6 +208,8 @@ class PaperExecutionSimulationConfig:
             raise ValueError("step_quantity_shares must be greater than 0")
         if self.max_step_count < 1:
             raise ValueError("max_step_count must be greater than or equal to 1")
+        if self.max_unmatched_cost_usd_total < 0.0:
+            raise ValueError("max_unmatched_cost_usd_total must be greater than or equal to 0")
 
     @classmethod
     def zero_friction(cls) -> "PaperExecutionSimulationConfig":
@@ -206,6 +239,12 @@ class PaperExecutionSimulationConfig:
             max_step_count=DEFAULT_PAPER_MAX_STEP_COUNT,
             grow_step_size_after_success=DEFAULT_PAPER_GROW_STEP_SIZE_AFTER_SUCCESS,
             merge_cost_per_step=DEFAULT_PAPER_MERGE_COST_PER_STEP,
+            pair_fill_policy=DEFAULT_PAPER_PAIR_FILL_POLICY,
+            dynamic_thresholds_enabled=False,
+            block_unmatched_market_reentry=DEFAULT_PAPER_BLOCK_UNMATCHED_MARKET_REENTRY,
+            block_unmatched_event_reentry=DEFAULT_PAPER_BLOCK_UNMATCHED_EVENT_REENTRY,
+            max_unmatched_cost_usd_total=DEFAULT_PAPER_MAX_UNMATCHED_COST_USD_TOTAL,
+            unmatched_inventory_management=DEFAULT_PAPER_UNMATCHED_INVENTORY_MANAGEMENT,
             queue_depth_ratio=0.0,
             queue_fill_probability=0.0,
             partial_fill_probability=0.0,
@@ -396,6 +435,12 @@ def trade_ceiling_usd() -> float:
     return value
 
 
+def paper_min_cash_reserve_usd() -> float:
+    if os.getenv("COND_ARB_PAPER_MIN_CASH_RESERVE_USD") in (None, ""):
+        return max(0.0, trade_ceiling_usd())
+    return max(0.0, env_float("COND_ARB_PAPER_MIN_CASH_RESERVE_USD", DEFAULT_PAPER_MIN_CASH_RESERVE_USD))
+
+
 def slippage_buffer_bps() -> float:
     return max(0.0, env_float("COND_ARB_SLIPPAGE_BUFFER_BPS", DEFAULT_SLIPPAGE_BUFFER_BPS))
 
@@ -512,6 +557,40 @@ def universe_cache_max_age_seconds() -> int:
     return max(0, env_int("COND_ARB_UNIVERSE_CACHE_MAX_AGE_SECONDS", DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS))
 
 
+def execution_health_gates_enabled() -> bool:
+    return env_bool("COND_ARB_EXECUTION_HEALTH_GATES_ENABLED", DEFAULT_EXECUTION_HEALTH_GATES_ENABLED)
+
+
+def health_max_ws_reconnects_per_minute() -> int:
+    return _non_negative_int_env(
+        "COND_ARB_HEALTH_MAX_WS_RECONNECTS_PER_MINUTE",
+        DEFAULT_HEALTH_MAX_WS_RECONNECTS_PER_MINUTE,
+    )
+
+
+def health_max_ws_errors_per_minute() -> int:
+    return _non_negative_int_env(
+        "COND_ARB_HEALTH_MAX_WS_ERRORS_PER_MINUTE",
+        DEFAULT_HEALTH_MAX_WS_ERRORS_PER_MINUTE,
+    )
+
+
+def health_max_dirty_tokens() -> int:
+    return _non_negative_int_env("COND_ARB_HEALTH_MAX_DIRTY_TOKENS", DEFAULT_HEALTH_MAX_DIRTY_TOKENS)
+
+
+def health_max_dirty_batches() -> int:
+    return _non_negative_int_env("COND_ARB_HEALTH_MAX_DIRTY_BATCHES", DEFAULT_HEALTH_MAX_DIRTY_BATCHES)
+
+
+def health_max_latency_p95_ms() -> float:
+    return _non_negative_float_env("COND_ARB_HEALTH_MAX_LATENCY_P95_MS", DEFAULT_HEALTH_MAX_LATENCY_P95_MS)
+
+
+def health_max_latency_jitter_ms() -> float:
+    return _non_negative_float_env("COND_ARB_HEALTH_MAX_LATENCY_JITTER_MS", DEFAULT_HEALTH_MAX_LATENCY_JITTER_MS)
+
+
 def paper_execution_simulation_config() -> PaperExecutionSimulationConfig:
     return PaperExecutionSimulationConfig(
         enabled=env_bool("COND_ARB_PAPER_SIMULATION_ENABLED", DEFAULT_PAPER_SIMULATION_ENABLED),
@@ -615,6 +694,32 @@ def paper_execution_simulation_config() -> PaperExecutionSimulationConfig:
             "COND_ARB_PAPER_MERGE_COST_PER_STEP",
             DEFAULT_PAPER_MERGE_COST_PER_STEP,
         ),
+        pair_fill_policy=_choice_env(
+            "COND_ARB_PAPER_PAIR_FILL_POLICY",
+            DEFAULT_PAPER_PAIR_FILL_POLICY,
+            PAIR_FILL_POLICIES,
+        ),
+        dynamic_thresholds_enabled=env_bool(
+            "COND_ARB_PAPER_DYNAMIC_THRESHOLDS_ENABLED",
+            DEFAULT_PAPER_DYNAMIC_THRESHOLDS_ENABLED,
+        ),
+        block_unmatched_market_reentry=env_bool(
+            "COND_ARB_PAPER_BLOCK_UNMATCHED_MARKET_REENTRY",
+            DEFAULT_PAPER_BLOCK_UNMATCHED_MARKET_REENTRY,
+        ),
+        block_unmatched_event_reentry=env_bool(
+            "COND_ARB_PAPER_BLOCK_UNMATCHED_EVENT_REENTRY",
+            DEFAULT_PAPER_BLOCK_UNMATCHED_EVENT_REENTRY,
+        ),
+        max_unmatched_cost_usd_total=_non_negative_float_env(
+            "COND_ARB_PAPER_MAX_UNMATCHED_COST_USD_TOTAL",
+            DEFAULT_PAPER_MAX_UNMATCHED_COST_USD_TOTAL,
+        ),
+        unmatched_inventory_management=_choice_env(
+            "COND_ARB_PAPER_UNMATCHED_INVENTORY_MANAGEMENT",
+            DEFAULT_PAPER_UNMATCHED_INVENTORY_MANAGEMENT,
+            UNMATCHED_INVENTORY_MANAGEMENT_MODES,
+        ),
         queue_depth_ratio=_ratio_env("COND_ARB_PAPER_QUEUE_DEPTH_RATIO", DEFAULT_PAPER_QUEUE_DEPTH_RATIO),
         queue_fill_probability=_probability_env(
             "COND_ARB_PAPER_QUEUE_FILL_PROBABILITY",
@@ -707,6 +812,7 @@ class ScanConfig:
     max_capital_usd: float
     starting_capital_usd: float = DEFAULT_STARTING_CAPITAL_USD
     trade_ceiling_usd: float = DEFAULT_TRADE_CEILING_USD
+    paper_min_cash_reserve_usd: float = DEFAULT_PAPER_MIN_CASH_RESERVE_USD
     slippage_buffer_bps: float = DEFAULT_SLIPPAGE_BUFFER_BPS
     gas_cost_usd: float = DEFAULT_GAS_COST_USD
     merge_cost_usd: float = DEFAULT_MERGE_COST_USD
@@ -727,6 +833,13 @@ class ScanConfig:
     fast_start_event_limit: int = DEFAULT_FAST_START_EVENT_LIMIT
     fast_start_token_limit: int = DEFAULT_FAST_START_TOKEN_LIMIT
     universe_cache_max_age_seconds: int = DEFAULT_UNIVERSE_CACHE_MAX_AGE_SECONDS
+    execution_health_gates_enabled: bool = DEFAULT_EXECUTION_HEALTH_GATES_ENABLED
+    health_max_ws_reconnects_per_minute: int = DEFAULT_HEALTH_MAX_WS_RECONNECTS_PER_MINUTE
+    health_max_ws_errors_per_minute: int = DEFAULT_HEALTH_MAX_WS_ERRORS_PER_MINUTE
+    health_max_dirty_tokens: int = DEFAULT_HEALTH_MAX_DIRTY_TOKENS
+    health_max_dirty_batches: int = DEFAULT_HEALTH_MAX_DIRTY_BATCHES
+    health_max_latency_p95_ms: float = DEFAULT_HEALTH_MAX_LATENCY_P95_MS
+    health_max_latency_jitter_ms: float = DEFAULT_HEALTH_MAX_LATENCY_JITTER_MS
     paper_simulation: PaperExecutionSimulationConfig = field(default_factory=PaperExecutionSimulationConfig)
 
     @property
@@ -770,6 +883,7 @@ def load_scan_config() -> ScanConfig:
         max_capital_usd=max_capital_usd(),
         starting_capital_usd=starting_capital_usd(),
         trade_ceiling_usd=trade_ceiling_usd(),
+        paper_min_cash_reserve_usd=paper_min_cash_reserve_usd(),
         slippage_buffer_bps=slippage_buffer_bps(),
         gas_cost_usd=gas_cost_usd(),
         merge_cost_usd=merge_cost_usd(),
@@ -790,5 +904,12 @@ def load_scan_config() -> ScanConfig:
         fast_start_event_limit=fast_start_event_limit(),
         fast_start_token_limit=fast_start_token_limit(),
         universe_cache_max_age_seconds=universe_cache_max_age_seconds(),
+        execution_health_gates_enabled=execution_health_gates_enabled(),
+        health_max_ws_reconnects_per_minute=health_max_ws_reconnects_per_minute(),
+        health_max_ws_errors_per_minute=health_max_ws_errors_per_minute(),
+        health_max_dirty_tokens=health_max_dirty_tokens(),
+        health_max_dirty_batches=health_max_dirty_batches(),
+        health_max_latency_p95_ms=health_max_latency_p95_ms(),
+        health_max_latency_jitter_ms=health_max_latency_jitter_ms(),
         paper_simulation=paper_execution_simulation_config(),
     )

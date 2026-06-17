@@ -63,6 +63,7 @@ class PaperPortfolioParams:
     taker_fee_bps: float
     tax_bps: float
     merge_cost_usd: float
+    min_cash_reserve_usd: float = 0.0
     min_net_profit_usd: float = 0.0
     min_net_return_bps: float = 0.0
     max_book_age_seconds: float = config.DEFAULT_MAX_BOOK_AGE_SECONDS
@@ -94,6 +95,7 @@ class PaperPortfolioParams:
             taker_fee_bps=loaded.taker_fee_bps,
             tax_bps=loaded.tax_bps,
             merge_cost_usd=loaded.merge_cost_usd,
+            min_cash_reserve_usd=loaded.paper_min_cash_reserve_usd,
             min_net_profit_usd=loaded.min_net_profit_usd,
             min_net_return_bps=loaded.min_net_return_bps,
             max_book_age_seconds=loaded.max_book_age_seconds,
@@ -275,6 +277,98 @@ def _open_inventory_market_ids(state: Mapping[str, Any]) -> set[str]:
     }
 
 
+def _unmatched_inventory_rows(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    inventory = _inventory_rows(state)
+    by_market: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in inventory.values():
+        market_id = str(row.get("market_id") or "")
+        outcome = str(row.get("outcome") or "").upper()
+        if not market_id or outcome not in {"YES", "NO"}:
+            continue
+        by_market.setdefault(market_id, {})[outcome] = row
+
+    unmatched: list[dict[str, Any]] = []
+    for market_id, rows in sorted(by_market.items()):
+        yes_row = rows.get("YES")
+        no_row = rows.get("NO")
+        yes_quantity = _as_float(yes_row.get("quantity")) if yes_row is not None else 0.0
+        no_quantity = _as_float(no_row.get("quantity")) if no_row is not None else 0.0
+        paired = min(yes_quantity, no_quantity)
+        for outcome, row, quantity in (
+            ("YES", yes_row, yes_quantity),
+            ("NO", no_row, no_quantity),
+        ):
+            if row is None:
+                continue
+            unmatched_quantity = max(0.0, quantity - paired)
+            if unmatched_quantity <= EPSILON:
+                continue
+            cost_basis = _as_float(row.get("cost_basis_usd"))
+            cost_per_share = cost_basis / quantity if quantity > EPSILON else 0.0
+            unmatched.append(
+                {
+                    **dict(row),
+                    "outcome": outcome,
+                    "quantity": unmatched_quantity,
+                    "paired_quantity": paired,
+                    "inventory_status": "unmatched",
+                    "unmatched_quantity": unmatched_quantity,
+                    "unmatched_cost_basis_usd": unmatched_quantity * cost_per_share,
+                    "unmatched_since_utc": row.get("unmatched_since_utc")
+                    or row.get("last_valued_at_utc")
+                    or row.get("opened_at_utc"),
+                    "opened_by_execution_id": row.get("opened_by_execution_id"),
+                    "last_management_action": row.get("last_management_action"),
+                }
+            )
+    return unmatched
+
+
+def _inventory_by_market_outcome(state: Mapping[str, Any], market_id: str) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for row in _inventory_rows(state).values():
+        if str(row.get("market_id") or "") != market_id:
+            continue
+        outcome = str(row.get("outcome") or "").upper()
+        if outcome in {"YES", "NO"}:
+            rows[outcome] = row
+    return rows
+
+
+def _unmatched_inventory_market_ids(state: Mapping[str, Any]) -> set[str]:
+    return {str(row.get("market_id") or "") for row in _unmatched_inventory_rows(state) if row.get("market_id")}
+
+
+def _unmatched_inventory_event_ids(state: Mapping[str, Any]) -> set[str]:
+    event_ids: set[str] = set()
+    executions = state.get("executions") if isinstance(state.get("executions"), list) else []
+    event_by_market = {
+        str(row.get("market_id") or ""): str(row.get("event_id") or "")
+        for row in executions
+        if isinstance(row, Mapping)
+    }
+    for row in _unmatched_inventory_rows(state):
+        event_id = str(row.get("event_id") or "") or event_by_market.get(str(row.get("market_id") or ""), "")
+        if event_id:
+            event_ids.add(event_id)
+    return event_ids
+
+
+def unmatched_inventory_risk_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    rows = _unmatched_inventory_rows(state)
+    total_cost = sum(_as_float(row.get("unmatched_cost_basis_usd")) for row in rows)
+    market_ids = sorted({str(row.get("market_id") or "") for row in rows if row.get("market_id")})
+    event_ids = sorted(_unmatched_inventory_event_ids(state))
+    return {
+        "unmatched_position_count": len(rows),
+        "unmatched_market_count": len(market_ids),
+        "unmatched_event_count": len(event_ids),
+        "unmatched_cost_basis_usd_total": total_cost,
+        "unmatched_market_ids": market_ids,
+        "unmatched_event_ids": event_ids,
+    }
+
+
 def initial_portfolio_state(
     params: PaperPortfolioParams,
     *,
@@ -340,7 +434,128 @@ def _normalized_state(data: Mapping[str, Any], params: PaperPortfolioParams) -> 
 
 
 def _simulation_budget(cash: float, params: PaperPortfolioParams) -> float:
-    return min(max(0.0, cash), params.trade_ceiling_usd)
+    spendable_cash = max(0.0, cash - max(0.0, params.min_cash_reserve_usd))
+    return min(spendable_cash, params.trade_ceiling_usd)
+
+
+def _recent_partial_failure_rate(state: Mapping[str, Any], *, window: int = 20) -> float:
+    failures = state.get("simulation_failures")
+    if not isinstance(failures, list):
+        return 0.0
+    recent = [
+        row
+        for row in failures[-max(1, int(window)) :]
+        if isinstance(row, Mapping)
+    ]
+    if not recent:
+        return 0.0
+    partial_failures = sum(
+        1
+        for row in recent
+        if str(row.get("reason") or "") in {"rejected_partial_pair", "zero_fill"}
+    )
+    return partial_failures / len(recent)
+
+
+def _effective_profit_thresholds(
+    params: PaperPortfolioParams,
+    *,
+    simulation: Mapping[str, Any] | None = None,
+    state: Mapping[str, Any] | None = None,
+    effective_slippage_bps: float = 0.0,
+) -> tuple[float, float, dict[str, Any]]:
+    min_profit = max(0.0, params.min_net_profit_usd)
+    min_return_bps = max(0.0, params.min_net_return_bps)
+    metadata: dict[str, Any] = {
+        "static_min_net_profit_usd": min_profit,
+        "static_min_net_return_bps": min_return_bps,
+        "dynamic_enabled": bool(params.simulation.dynamic_thresholds_enabled),
+        "risk_adjustments": {},
+    }
+    if not params.simulation.dynamic_thresholds_enabled:
+        metadata["effective_min_net_profit_usd"] = min_profit
+        metadata["effective_min_net_return_bps"] = min_return_bps
+        return min_profit, min_return_bps, metadata
+
+    risk_profit = 0.0
+    risk_return_bps = 0.0
+    adjustments = metadata["risk_adjustments"]
+    sim = simulation or {}
+
+    book_comparison = sim.get("live_public_data", {}).get("book_comparison") if isinstance(sim, Mapping) else None
+    if isinstance(book_comparison, Mapping):
+        changed_legs = sum(
+            1
+            for row in book_comparison.values()
+            if isinstance(row, Mapping) and bool(row.get("levels_changed"))
+        )
+        if changed_legs:
+            adjustments["book_levels_changed"] = changed_legs
+            risk_profit += 0.05 * changed_legs
+            risk_return_bps += 10.0 * changed_legs
+
+    fill_time = sim.get("live_public_data", {}).get("fill_time") if isinstance(sim, Mapping) else None
+    if isinstance(fill_time, Mapping) and fill_time.get("fallback_reason"):
+        adjustments["public_data_fallback"] = str(fill_time["fallback_reason"])
+        risk_profit += 0.10
+        risk_return_bps += 15.0
+
+    telemetry = sim.get("telemetry") if isinstance(sim, Mapping) else None
+    if isinstance(telemetry, Mapping):
+        p95_ms = _as_float(telemetry.get("p95_latency_ms"))
+        if p95_ms > 0.0:
+            latency_excess = max(0.0, p95_ms - 250.0)
+            if latency_excess > 0.0:
+                adjustments["latency_p95_ms"] = p95_ms
+                risk_profit += min(0.50, latency_excess / 1000.0 * 0.10)
+                risk_return_bps += min(75.0, latency_excess / 100.0 * 5.0)
+
+    jitter_ms = _as_float(sim.get("latency_jitter_ms")) if isinstance(sim, Mapping) else 0.0
+    if jitter_ms > 50.0:
+        adjustments["latency_jitter_ms"] = jitter_ms
+        risk_profit += min(0.25, (jitter_ms - 50.0) / 1000.0 * 0.10)
+        risk_return_bps += min(50.0, (jitter_ms - 50.0) / 100.0 * 3.0)
+
+    slippage_excess = max(0.0, effective_slippage_bps - params.slippage_buffer_bps)
+    if slippage_excess > 0.0:
+        adjustments["calibrated_slippage_excess_bps"] = slippage_excess
+        risk_profit += min(0.50, slippage_excess / 10_000.0 * params.trade_ceiling_usd)
+        risk_return_bps += min(100.0, slippage_excess)
+
+    partial_failure_rate = _recent_partial_failure_rate(state or {})
+    if partial_failure_rate > 0.0:
+        adjustments["recent_partial_failure_rate"] = partial_failure_rate
+        risk_profit += min(0.50, partial_failure_rate * 0.25)
+        risk_return_bps += min(100.0, partial_failure_rate * 50.0)
+
+    min_profit = max(min_profit, risk_profit)
+    min_return_bps = max(min_return_bps, risk_return_bps)
+    metadata["effective_min_net_profit_usd"] = min_profit
+    metadata["effective_min_net_return_bps"] = min_return_bps
+    return min_profit, min_return_bps, metadata
+
+
+def _profit_threshold_failure(
+    *,
+    net_profit: float,
+    net_return_bps: float,
+    params: PaperPortfolioParams,
+    simulation: Mapping[str, Any] | None = None,
+    state: Mapping[str, Any] | None = None,
+    effective_slippage_bps: float = 0.0,
+) -> tuple[bool, dict[str, Any]]:
+    min_profit, min_return_bps, metadata = _effective_profit_thresholds(
+        params,
+        simulation=simulation,
+        state=state,
+        effective_slippage_bps=effective_slippage_bps,
+    )
+    failed = (
+        net_profit <= EPSILON
+        or net_profit + EPSILON < min_profit
+        or net_return_bps + EPSILON < min_return_bps
+    )
+    return failed, metadata
 
 
 def _simulate_paired_tranches(
@@ -592,11 +807,16 @@ def _execute_paper_step(
     full_fill_net_return_bps = (
         (full_fill_net_profit / full_fill_capital_used) * 10_000.0 if full_fill_capital_used > 0 else 0.0
     )
-    if (
-        full_fill_net_profit <= EPSILON
-        or full_fill_net_profit + EPSILON < params.min_net_profit_usd
-        or full_fill_net_return_bps + EPSILON < params.min_net_return_bps
-    ):
+    full_threshold_failed, full_thresholds = _profit_threshold_failure(
+        net_profit=full_fill_net_profit,
+        net_return_bps=full_fill_net_return_bps,
+        params=params,
+        simulation=simulation_metadata,
+        state=state,
+        effective_slippage_bps=effective_slippage_bps,
+    )
+    simulation_metadata["profit_thresholds"] = full_thresholds
+    if full_threshold_failed:
         return _simulation_failure_decision(
             "simulation_not_profitable_at_fill",
             market=market,
@@ -642,10 +862,67 @@ def _execute_paper_step(
         yes_filled_quantity = quantity * yes_ratio
         no_filled_quantity = quantity * no_ratio
 
-    yes_actual_cost = _fill_cost(yes_asks, yes_filled_quantity)
-    no_actual_cost = _fill_cost(no_asks, no_filled_quantity)
-    gross_cost = yes_actual_cost + no_actual_cost
     matched_quantity = min(yes_filled_quantity, no_filled_quantity)
+    unmatched_yes_quantity = max(0.0, yes_filled_quantity - matched_quantity)
+    unmatched_no_quantity = max(0.0, no_filled_quantity - matched_quantity)
+    simulation_metadata["partial_fill"] = {
+        "applied": partial_applied,
+        "source": side_fill_source,
+        "policy": params.simulation.pair_fill_policy,
+        "target_quantity": quantity,
+        "yes_filled_quantity": yes_filled_quantity,
+        "no_filled_quantity": no_filled_quantity,
+        "matched_quantity": matched_quantity,
+        "unmatched_yes_quantity": unmatched_yes_quantity,
+        "unmatched_no_quantity": unmatched_no_quantity,
+    }
+    if yes_filled_quantity <= EPSILON and no_filled_quantity <= EPSILON:
+        return _simulation_failure_decision(
+            "zero_fill",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            requested_quantity=quantity,
+            yes_filled_quantity=yes_filled_quantity,
+            no_filled_quantity=no_filled_quantity,
+        )
+    if abs(yes_filled_quantity - no_filled_quantity) > EPSILON:
+        return _simulation_failure_decision(
+            "rejected_partial_pair",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            requested_quantity=quantity,
+            filled_pair_quantity=matched_quantity,
+            yes_filled_quantity=yes_filled_quantity,
+            no_filled_quantity=no_filled_quantity,
+            unmatched_yes_quantity=unmatched_yes_quantity,
+            unmatched_no_quantity=unmatched_no_quantity,
+        )
+    if matched_quantity <= EPSILON:
+        return _simulation_failure_decision(
+            "zero_fill",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            requested_quantity=quantity,
+            yes_filled_quantity=yes_filled_quantity,
+            no_filled_quantity=no_filled_quantity,
+        )
+    if matched_quantity + EPSILON < min_quantity:
+        return _simulation_failure_decision(
+            "rejected_partial_pair",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            requested_quantity=quantity,
+            filled_pair_quantity=matched_quantity,
+            min_quantity=min_quantity,
+        )
+
+    yes_actual_cost = _fill_cost(yes_asks, matched_quantity)
+    no_actual_cost = _fill_cost(no_asks, matched_quantity)
+    gross_cost = yes_actual_cost + no_actual_cost
     merge_cost = _merge_cost_for_step(params, int(_as_float(simulation_metadata.get("step_index"), 1.0)))
     costs = _cost_breakdown(
         gross_cost,
@@ -657,17 +934,30 @@ def _execute_paper_step(
     redeemed_value = matched_quantity
     net_profit = redeemed_value - capital_used
     net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > 0 else 0.0
+    threshold_failed, thresholds = _profit_threshold_failure(
+        net_profit=net_profit,
+        net_return_bps=net_return_bps,
+        params=params,
+        simulation=simulation_metadata,
+        state=state,
+        effective_slippage_bps=effective_slippage_bps,
+    )
+    simulation_metadata["profit_thresholds"] = thresholds
+    if threshold_failed:
+        return _simulation_failure_decision(
+            "simulation_not_profitable_at_fill",
+            market=market,
+            simulation=simulation_metadata,
+            book_fingerprint=fingerprint,
+            requested_quantity=quantity,
+            filled_pair_quantity=matched_quantity,
+            gross_cost=gross_cost,
+            capital_used=capital_used,
+            net_profit=net_profit,
+            net_return_bps=net_return_bps,
+        )
 
-    simulation_metadata["partial_fill"] = {
-        "applied": partial_applied,
-        "source": side_fill_source,
-        "target_quantity": quantity,
-        "yes_filled_quantity": yes_filled_quantity,
-        "no_filled_quantity": no_filled_quantity,
-        "matched_quantity": matched_quantity,
-        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
-        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
-    }
+    fill_status = "full_pair_success" if matched_quantity >= quantity - EPSILON else "paired_partial_success"
     execution_count = len(state.get("executions") or [])
     execution_id = f"paper:{market.market_id}:{execution_count + 1}:{fingerprint[:12]}"
     execution = {
@@ -684,14 +974,18 @@ def _execute_paper_step(
         "no_token_id": market.no_token_id,
         "executed_at_utc": simulation_metadata["fill_timestamp_utc"],
         "book_fingerprint": fingerprint,
-        "quantity": quantity,
+        "execution_status": fill_status,
+        "fill_status": fill_status,
+        "requested_quantity": quantity,
+        "filled_pair_quantity": matched_quantity,
+        "quantity": matched_quantity,
         "quantity_redeemed": matched_quantity,
-        "yes_filled_quantity": yes_filled_quantity,
-        "no_filled_quantity": no_filled_quantity,
-        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
-        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
-        "yes_vwap": yes_actual_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
-        "no_vwap": no_actual_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
+        "yes_filled_quantity": matched_quantity,
+        "no_filled_quantity": matched_quantity,
+        "unmatched_yes_quantity": 0.0,
+        "unmatched_no_quantity": 0.0,
+        "yes_vwap": yes_actual_cost / matched_quantity if matched_quantity > EPSILON else 0.0,
+        "no_vwap": no_actual_cost / matched_quantity if matched_quantity > EPSILON else 0.0,
         "yes_cost": yes_actual_cost,
         "no_cost": no_actual_cost,
         "gross_cost": gross_cost,
@@ -805,6 +1099,7 @@ def _scaled_partial_fill(
             "target_quantity": target_quantity,
             "yes_filled_quantity": yes_filled_quantity,
             "no_filled_quantity": no_filled_quantity,
+            "policy": base.get("policy") or config.DEFAULT_PAPER_PAIR_FILL_POLICY,
             "matched_quantity": matched_quantity,
             "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
             "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
@@ -831,8 +1126,11 @@ def _build_step_execution(
 
     planned_yes_filled = max(0.0, _as_float(planned.get("yes_filled_quantity"), planned_quantity))
     planned_no_filled = max(0.0, _as_float(planned.get("no_filled_quantity"), planned_quantity))
-    yes_filled_quantity = min(max(0.0, yes_fill_quantity), step_quantity)
-    no_filled_quantity = min(max(0.0, no_fill_quantity), step_quantity)
+    raw_yes_filled_quantity = min(max(0.0, yes_fill_quantity), step_quantity)
+    raw_no_filled_quantity = min(max(0.0, no_fill_quantity), step_quantity)
+    matched_quantity = min(raw_yes_filled_quantity, raw_no_filled_quantity)
+    yes_filled_quantity = matched_quantity
+    no_filled_quantity = matched_quantity
     yes_ratio = yes_filled_quantity / planned_yes_filled if planned_yes_filled > EPSILON else 0.0
     no_ratio = no_filled_quantity / planned_no_filled if planned_no_filled > EPSILON else 0.0
     yes_cost = _as_float(planned.get("yes_cost")) * yes_ratio
@@ -845,7 +1143,6 @@ def _build_step_execution(
     tax_cost = _as_float(planned.get("tax_cost")) * gross_ratio
     merge_cost = _merge_cost_for_step(params, step_index)
     capital_used = gross_cost + estimated_fees + slippage_buffer + tax_cost + merge_cost
-    matched_quantity = min(yes_filled_quantity, no_filled_quantity)
     net_profit = matched_quantity - capital_used
     net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > EPSILON else 0.0
     target_ratio = step_quantity / planned_quantity if planned_quantity > EPSILON else 0.0
@@ -867,8 +1164,8 @@ def _build_step_execution(
         partial_fill,
         ratio=target_ratio,
         target_quantity=step_quantity,
-        yes_filled_quantity=yes_filled_quantity,
-        no_filled_quantity=no_filled_quantity,
+        yes_filled_quantity=raw_yes_filled_quantity,
+        no_filled_quantity=raw_no_filled_quantity,
     )
     simulation["stepped_execution"] = {
         "active_execution_id": active_execution_id,
@@ -888,12 +1185,16 @@ def _build_step_execution(
         "execution_id": f"{active_execution_id}:step:{step_index}",
         "parent_execution_id": active_execution_id,
         "book_fingerprint": step_fingerprint,
-        "quantity": step_quantity,
+        "execution_status": "full_pair_success" if matched_quantity >= step_quantity - EPSILON else "paired_partial_success",
+        "fill_status": "full_pair_success" if matched_quantity >= step_quantity - EPSILON else "paired_partial_success",
+        "requested_quantity": step_quantity,
+        "filled_pair_quantity": matched_quantity,
+        "quantity": matched_quantity,
         "quantity_redeemed": matched_quantity,
         "yes_filled_quantity": yes_filled_quantity,
         "no_filled_quantity": no_filled_quantity,
-        "unmatched_yes_quantity": max(0.0, yes_filled_quantity - matched_quantity),
-        "unmatched_no_quantity": max(0.0, no_filled_quantity - matched_quantity),
+        "unmatched_yes_quantity": 0.0,
+        "unmatched_no_quantity": 0.0,
         "yes_vwap": yes_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
         "no_vwap": no_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
         "yes_cost": yes_cost,
@@ -944,6 +1245,14 @@ def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfo
     def total(field: str, default: float = 0.0) -> float:
         return sum(_as_float(step.get(field), default) for step in steps)
 
+    step_requested_quantity = sum(
+        _as_float(step.get("requested_quantity"), _as_float(step.get("quantity")))
+        for step in steps
+    )
+    requested_quantity = _as_float(
+        active.get("requested_quantity"),
+        _as_float(planned.get("requested_quantity"), step_requested_quantity),
+    )
     quantity = total("quantity")
     yes_filled_quantity = total("yes_filled_quantity")
     no_filled_quantity = total("no_filled_quantity")
@@ -988,12 +1297,16 @@ def _aggregate_step_executions(active: Mapping[str, Any], *, params: PaperPortfo
             "execution_id": str(active.get("execution_id") or planned.get("execution_id") or ""),
             "book_fingerprint": str(active.get("book_fingerprint") or planned.get("book_fingerprint") or ""),
             "executed_at_utc": steps[-1].get("executed_at_utc"),
+            "execution_status": "full_pair_success" if quantity_redeemed >= requested_quantity - EPSILON else "paired_partial_success",
+            "fill_status": "full_pair_success" if quantity_redeemed >= requested_quantity - EPSILON else "paired_partial_success",
+            "requested_quantity": requested_quantity,
+            "filled_pair_quantity": quantity_redeemed,
             "quantity": quantity,
             "quantity_redeemed": quantity_redeemed,
             "yes_filled_quantity": yes_filled_quantity,
             "no_filled_quantity": no_filled_quantity,
-            "unmatched_yes_quantity": max(0.0, yes_filled_quantity - quantity_redeemed),
-            "unmatched_no_quantity": max(0.0, no_filled_quantity - quantity_redeemed),
+            "unmatched_yes_quantity": 0.0,
+            "unmatched_no_quantity": 0.0,
             "yes_vwap": yes_cost / yes_filled_quantity if yes_filled_quantity > EPSILON else 0.0,
             "no_vwap": no_cost / no_filled_quantity if no_filled_quantity > EPSILON else 0.0,
             "yes_cost": yes_cost,
@@ -1050,6 +1363,50 @@ def _active_execution_completed(active: Mapping[str, Any], *, params: PaperPortf
     if len(steps) >= _active_execution_max_step_count(active, params=params):
         return True, "max_step_count"
     return False, None
+
+
+def _execution_pair_is_valid(
+    execution: Mapping[str, Any],
+    *,
+    market: BinaryMarket | None = None,
+    params: PaperPortfolioParams,
+) -> tuple[bool, str | None]:
+    requested_quantity = _as_float(execution.get("requested_quantity"), _as_float(execution.get("quantity")))
+    yes_quantity = _as_float(execution.get("yes_filled_quantity"), _as_float(execution.get("quantity")))
+    no_quantity = _as_float(execution.get("no_filled_quantity"), _as_float(execution.get("quantity")))
+    pair_quantity = _as_float(execution.get("filled_pair_quantity"), _as_float(execution.get("quantity_redeemed")))
+    simulation = execution.get("simulation") if isinstance(execution.get("simulation"), Mapping) else {}
+    partial_fill = simulation.get("partial_fill") if isinstance(simulation, Mapping) else None
+    if isinstance(partial_fill, Mapping):
+        raw_yes_quantity = _as_float(partial_fill.get("yes_filled_quantity"), yes_quantity)
+        raw_no_quantity = _as_float(partial_fill.get("no_filled_quantity"), no_quantity)
+        if raw_yes_quantity <= EPSILON and raw_no_quantity <= EPSILON:
+            return False, "zero_fill"
+        if abs(raw_yes_quantity - raw_no_quantity) > EPSILON:
+            return False, "rejected_partial_pair"
+    min_quantity = market.effective_min_order_size if market is not None else 0.0
+    if yes_quantity <= EPSILON and no_quantity <= EPSILON:
+        return False, "zero_fill"
+    if abs(yes_quantity - no_quantity) > EPSILON:
+        return False, "rejected_partial_pair"
+    if pair_quantity <= EPSILON:
+        return False, "zero_fill"
+    if min_quantity > EPSILON and pair_quantity + EPSILON < min_quantity:
+        return False, "rejected_partial_pair"
+    net_profit = _as_float(execution.get("net_profit"))
+    net_return_bps = _as_float(execution.get("net_return_bps"))
+    threshold_failed, _thresholds = _profit_threshold_failure(
+        net_profit=net_profit,
+        net_return_bps=net_return_bps,
+        params=params,
+        simulation=execution.get("simulation") if isinstance(execution.get("simulation"), Mapping) else None,
+        effective_slippage_bps=_as_float(execution.get("effective_slippage_bps")),
+    )
+    if threshold_failed:
+        return False, "simulation_not_profitable_at_fill"
+    if requested_quantity <= EPSILON:
+        return False, "zero_fill"
+    return True, None
 
 
 def _stage_random(
@@ -1783,11 +2140,13 @@ def _evaluate_optimistic_binary_paper_execution(
     redeemed_value = quantity
     net_profit = redeemed_value - capital_used
     net_return_bps = (net_profit / capital_used) * 10_000.0 if capital_used > 0 else 0.0
-    if (
-        net_profit <= EPSILON
-        or net_profit + EPSILON < params.min_net_profit_usd
-        or net_return_bps + EPSILON < params.min_net_return_bps
-    ):
+    threshold_failed, thresholds = _profit_threshold_failure(
+        net_profit=net_profit,
+        net_return_bps=net_return_bps,
+        params=params,
+        state=state,
+    )
+    if threshold_failed:
         return PaperPortfolioDecision.skip(
             "not_profitable",
             market_id=market.market_id,
@@ -1796,6 +2155,7 @@ def _evaluate_optimistic_binary_paper_execution(
             capital_used=capital_used,
             net_profit=net_profit,
             net_return_bps=net_return_bps,
+            profit_thresholds=thresholds,
             book_fingerprint=fingerprint,
         )
 
@@ -1815,8 +2175,16 @@ def _evaluate_optimistic_binary_paper_execution(
         "no_token_id": market.no_token_id,
         "executed_at_utc": utc_iso(now),
         "book_fingerprint": fingerprint,
+        "execution_status": "full_pair_success",
+        "fill_status": "full_pair_success",
+        "requested_quantity": quantity,
+        "filled_pair_quantity": quantity,
         "quantity": quantity,
         "quantity_redeemed": quantity,
+        "yes_filled_quantity": quantity,
+        "no_filled_quantity": quantity,
+        "unmatched_yes_quantity": 0.0,
+        "unmatched_no_quantity": 0.0,
         "yes_vwap": yes_cost / quantity,
         "no_vwap": no_cost / quantity,
         "yes_cost": yes_cost,
@@ -2634,6 +3002,18 @@ class PaperPortfolio:
     def _append_execution_failure_event(self, market: BinaryMarket, decision: PaperPortfolioDecision) -> None:
         simulation_details = decision.details.get("simulation")
         simulation_payload = dict(simulation_details) if isinstance(simulation_details, Mapping) else {}
+        if self.state:
+            failures = self.state.setdefault("simulation_failures", [])
+            if isinstance(failures, list):
+                failures.append(
+                    {
+                        "market_id": market.market_id,
+                        "reason": decision.reason,
+                        "book_fingerprint": decision.details.get("book_fingerprint"),
+                        "timestamp_utc": utc_iso(),
+                    }
+                )
+                del failures[:-100]
         try:
             self.append_event(
                 "paper_portfolio_execution_failed",
@@ -2689,6 +3069,8 @@ class PaperPortfolio:
         equity = cash + open_position_value
         costs = state.get("costs") if isinstance(state.get("costs"), Mapping) else {}
         inventory = list(_inventory_rows(state).values())
+        unmatched_inventory = _unmatched_inventory_rows(state)
+        unmatched_risk = unmatched_inventory_risk_summary(state)
         capital_committed = sum(max(0.0, _as_float(row.get("cost_basis_usd"))) for row in inventory)
         active_trade_count = len(
             {
@@ -2728,13 +3110,30 @@ class PaperPortfolio:
             "pending_settlement_count": sum(1 for row in inventory if bool(row.get("pending_settlement"))),
             "settlements_applied_count": len(settlements),
             "last_settlement_at_utc": last_settlement,
-            "unmatched_inventory": inventory,
+            "inventory": inventory,
+            "unmatched_inventory": unmatched_inventory,
+            **unmatched_risk,
         }
 
     def open_inventory_market_ids(self) -> set[str]:
         if not self.state:
             self.load()
         return _open_inventory_market_ids(self.state)
+
+    def unmatched_inventory_market_ids(self) -> set[str]:
+        if not self.state:
+            self.load()
+        return _unmatched_inventory_market_ids(self.state)
+
+    def unmatched_inventory_event_ids(self) -> set[str]:
+        if not self.state:
+            self.load()
+        return _unmatched_inventory_event_ids(self.state)
+
+    def unmatched_inventory_risk_summary(self) -> dict[str, Any]:
+        if not self.state:
+            self.load()
+        return unmatched_inventory_risk_summary(self.state)
 
     def reconcile_public_markets(
         self,
@@ -2944,6 +3343,177 @@ class PaperPortfolio:
                 )
         return summary
 
+    def complete_missing_leg_if_profitable(
+        self,
+        market: BinaryMarket,
+        yes_asks: OrderBookSide,
+        no_asks: OrderBookSide,
+        *,
+        as_of: datetime | None = None,
+        params: PaperPortfolioParams | None = None,
+    ) -> PaperPortfolioDecision:
+        if not self.state:
+            self.load()
+        execution_params = params or self.params
+        rows = _inventory_by_market_outcome(self.state, market.market_id)
+        yes_row = rows.get("YES")
+        no_row = rows.get("NO")
+        yes_quantity = _as_float(yes_row.get("quantity")) if yes_row is not None else 0.0
+        no_quantity = _as_float(no_row.get("quantity")) if no_row is not None else 0.0
+        if abs(yes_quantity - no_quantity) <= EPSILON:
+            return PaperPortfolioDecision.skip("no_unmatched_inventory", market_id=market.market_id)
+        missing_outcome = "NO" if yes_quantity > no_quantity else "YES"
+        missing_quantity = abs(yes_quantity - no_quantity)
+        book = no_asks if missing_outcome == "NO" else yes_asks
+        token_id = market.no_token_id if missing_outcome == "NO" else market.yes_token_id
+        existing_row = yes_row if missing_outcome == "NO" else no_row
+        if existing_row is None:
+            return PaperPortfolioDecision.skip("missing_existing_leg_inventory", market_id=market.market_id)
+        min_quantity = market.effective_min_order_size
+        if missing_quantity + EPSILON < min_quantity:
+            return PaperPortfolioDecision.skip(
+                "inventory_management_below_min_size",
+                market_id=market.market_id,
+                missing_quantity=missing_quantity,
+                min_quantity=min_quantity,
+            )
+        gross_cost = book.cost_to_fill(missing_quantity)
+        if gross_cost is None:
+            return PaperPortfolioDecision.skip(
+                "inventory_management_insufficient_depth",
+                market_id=market.market_id,
+                missing_outcome=missing_outcome,
+                missing_quantity=missing_quantity,
+            )
+        costs = _cost_breakdown(gross_cost, execution_params)
+        capital_used = gross_cost + sum(costs.values())
+        cash = _as_float(self.state.get("cash"), execution_params.starting_capital_usd)
+        spendable_cash = max(0.0, cash - max(0.0, execution_params.min_cash_reserve_usd))
+        if capital_used > spendable_cash + EPSILON:
+            return PaperPortfolioDecision.skip(
+                "cash_limit",
+                market_id=market.market_id,
+                required_capital=capital_used,
+                spendable_cash=spendable_cash,
+            )
+        existing_cost_basis = _as_float(existing_row.get("cost_basis_usd"))
+        existing_cost_for_pair = existing_cost_basis * (
+            missing_quantity / _as_float(existing_row.get("quantity"))
+            if _as_float(existing_row.get("quantity")) > EPSILON
+            else 0.0
+        )
+        net_profit = missing_quantity - existing_cost_for_pair - capital_used
+        net_return_bps = (
+            (net_profit / (existing_cost_for_pair + capital_used)) * 10_000.0
+            if existing_cost_for_pair + capital_used > EPSILON
+            else 0.0
+        )
+        threshold_failed, thresholds = _profit_threshold_failure(
+            net_profit=net_profit,
+            net_return_bps=net_return_bps,
+            params=execution_params,
+            state=self.state,
+        )
+        if threshold_failed:
+            return PaperPortfolioDecision.skip(
+                "inventory_management_not_profitable",
+                market_id=market.market_id,
+                missing_outcome=missing_outcome,
+                missing_quantity=missing_quantity,
+                net_profit=net_profit,
+                net_return_bps=net_return_bps,
+                profit_thresholds=thresholds,
+            )
+
+        base_state = deepcopy(self.state)
+        working_state = deepcopy(self.state)
+        now = utc_iso(as_of or _utc_now())
+        fingerprint = book_pair_fingerprint(
+            market,
+            yes_asks,
+            no_asks,
+            tranches=(
+                {
+                    "quantity": missing_quantity,
+                    "yes_price": yes_asks.best_price or 0.0,
+                    "no_price": no_asks.best_price or 0.0,
+                    "unit_gross_cost": (yes_asks.best_price or 0.0) + (no_asks.best_price or 0.0),
+                },
+            ),
+            step_plan={"inventory_management": "complete_missing_leg_if_profitable"},
+        )
+        execution_count = len(working_state.get("executions") or [])
+        execution = {
+            "execution_id": f"paper:{market.market_id}:{execution_count + 1}:{fingerprint[:12]}:inventory",
+            "opportunity_id": f"inventory:{market.market_id}:{fingerprint[:12]}",
+            "kind": "binary_complete_set",
+            "mode": "paper_portfolio_instance",
+            "execution_status": "inventory_management",
+            "fill_status": "inventory_management",
+            "market_id": market.market_id,
+            "condition_id": market.condition_id,
+            "event_id": market.event_id,
+            "event_title": market.event_title,
+            "question": market.question,
+            "yes_token_id": market.yes_token_id,
+            "no_token_id": market.no_token_id,
+            "executed_at_utc": now,
+            "book_fingerprint": fingerprint,
+            "requested_quantity": missing_quantity,
+            "filled_pair_quantity": missing_quantity,
+            "quantity": missing_quantity,
+            "quantity_redeemed": missing_quantity,
+            "yes_filled_quantity": missing_quantity if missing_outcome == "YES" else 0.0,
+            "no_filled_quantity": missing_quantity if missing_outcome == "NO" else 0.0,
+            "unmatched_yes_quantity": 0.0,
+            "unmatched_no_quantity": 0.0,
+            "yes_vwap": gross_cost / missing_quantity if missing_outcome == "YES" else 0.0,
+            "no_vwap": gross_cost / missing_quantity if missing_outcome == "NO" else 0.0,
+            "yes_cost": gross_cost if missing_outcome == "YES" else 0.0,
+            "no_cost": gross_cost if missing_outcome == "NO" else 0.0,
+            "gross_cost": gross_cost,
+            "estimated_fees": costs["fees_usd"],
+            "slippage_buffer": costs["slippage_usd"],
+            "tax_cost": costs["tax_usd"],
+            "merge_cost": costs["merge_usd"],
+            "capital_used": capital_used,
+            "redeemed_value": missing_quantity,
+            "net_profit": net_profit,
+            "net_return_bps": net_return_bps,
+            "trade_ceiling_usd": execution_params.trade_ceiling_usd,
+            "ceiling_used_usd": capital_used,
+            "stop_reason": "inventory_management",
+            "source_timestamps": _book_timestamps(yes_asks, no_asks),
+            "details": {
+                "inventory_management": "complete_missing_leg_if_profitable",
+                "missing_outcome": missing_outcome,
+                "missing_token_id": token_id,
+                "missing_quantity": missing_quantity,
+                "existing_cost_basis_usd": existing_cost_for_pair,
+                "profit_thresholds": thresholds,
+            },
+        }
+        self._apply_execution_to_state(working_state, execution, params=execution_params)
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+
+        self.state = working_state
+        returned_execution = deepcopy(execution)
+        try:
+            self.append_event("paper_portfolio_execution", returned_execution)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            returned_execution["event_log_error"] = error
+            LOGGER.warning(
+                "paper_portfolio_execution_event_append_failed execution_id=%s error=%r",
+                returned_execution.get("execution_id"),
+                exc,
+            )
+        return PaperPortfolioDecision.execute(returned_execution)
+
     def execute_binary_complete_set(
         self,
         market: BinaryMarket,
@@ -3071,6 +3641,14 @@ class PaperPortfolio:
             "yes_token_id": market.yes_token_id,
             "no_token_id": market.no_token_id,
             "book_fingerprint": parent_fingerprint,
+            "requested_quantity": _as_float(
+                planned_execution.get("requested_quantity"),
+                _as_float(planned_execution.get("quantity")),
+            ),
+            "filled_pair_quantity": _as_float(
+                planned_execution.get("filled_pair_quantity"),
+                _as_float(planned_execution.get("quantity")),
+            ),
             "target_quantity": _as_float(planned_execution.get("quantity")),
             "target_yes_filled_quantity": _as_float(
                 planned_execution.get("yes_filled_quantity"),
@@ -3194,6 +3772,20 @@ class PaperPortfolio:
                 no_fill_quantity=no_fill,
                 params=params,
             )
+            valid_step, invalid_reason = _execution_pair_is_valid(step_execution, market=market, params=params)
+            if not valid_step:
+                if steps:
+                    final_execution = self._finalize_stepped_execution(
+                        {**current_active, "stop_reason": invalid_reason or "rejected_partial_pair"},
+                        params=params,
+                    )
+                    break
+                return self._abort_stepped_execution(
+                    current_active,
+                    market,
+                    reason=invalid_reason or "rejected_partial_pair",
+                    step_execution=step_execution,
+                )
             working_state = deepcopy(self.state)
             self._apply_execution_to_state(
                 working_state,
@@ -3253,10 +3845,45 @@ class PaperPortfolio:
             details=details,
         )
 
+    def _abort_stepped_execution(
+        self,
+        active: Mapping[str, Any],
+        market: BinaryMarket,
+        *,
+        reason: str,
+        step_execution: Mapping[str, Any],
+    ) -> PaperPortfolioDecision:
+        base_state = deepcopy(self.state)
+        working_state = deepcopy(self.state)
+        working_state.pop("active_execution", None)
+        try:
+            self._save_state(working_state)
+        except Exception:
+            self._reload_after_failed_save(base_state)
+            raise
+        self.state = working_state
+        decision = PaperPortfolioDecision.skip(
+            reason,
+            market_id=market.market_id,
+            active_execution_id=active.get("execution_id"),
+            book_fingerprint=step_execution.get("book_fingerprint"),
+            simulation=step_execution.get("simulation") if isinstance(step_execution.get("simulation"), Mapping) else {},
+            simulation_failure=True,
+        )
+        self._append_execution_failure_event(market, decision)
+        return decision
+
     def _finalize_stepped_execution(self, active: Mapping[str, Any], *, params: PaperPortfolioParams) -> dict[str, Any]:
         base_state = deepcopy(self.state)
         working_state = deepcopy(self.state)
         final_execution = _aggregate_step_executions(active, params=params)
+        pair_quantity = _as_float(final_execution.get("filled_pair_quantity"), _as_float(final_execution.get("quantity_redeemed")))
+        requested_quantity = _as_float(final_execution.get("requested_quantity"), _as_float(final_execution.get("quantity")))
+        status = "full_pair_success" if pair_quantity >= requested_quantity - EPSILON else "paired_partial_success"
+        final_execution["execution_status"] = status
+        final_execution["fill_status"] = status
+        final_execution["unmatched_yes_quantity"] = 0.0
+        final_execution["unmatched_no_quantity"] = 0.0
         executions = working_state.setdefault("executions", [])
         if isinstance(executions, list):
             executions.append(deepcopy(final_execution))
@@ -3339,6 +3966,7 @@ class PaperPortfolio:
             quantity=yes_quantity,
             cost_basis_usd=yes_cost_basis,
             valued_at_utc=execution.get("executed_at_utc"),
+            opened_by_execution_id=str(execution.get("execution_id") or ""),
         )
         self._add_inventory_to_state(
             state,
@@ -3349,6 +3977,7 @@ class PaperPortfolio:
             quantity=no_quantity,
             cost_basis_usd=no_cost_basis,
             valued_at_utc=execution.get("executed_at_utc"),
+            opened_by_execution_id=str(execution.get("execution_id") or ""),
         )
         redeemed, redeemed_cost_basis = self._redeem_completed_pairs_with_cost_from_state(
             state,
@@ -3401,6 +4030,7 @@ class PaperPortfolio:
         quantity: float,
         cost_basis_usd: float = 0.0,
         valued_at_utc: Any = None,
+        opened_by_execution_id: str | None = None,
     ) -> None:
         self._add_inventory_to_state(
             self.state,
@@ -3411,6 +4041,7 @@ class PaperPortfolio:
             quantity=quantity,
             cost_basis_usd=cost_basis_usd,
             valued_at_utc=valued_at_utc,
+            opened_by_execution_id=opened_by_execution_id,
         )
 
     @staticmethod
@@ -3424,6 +4055,7 @@ class PaperPortfolio:
         quantity: float,
         cost_basis_usd: float = 0.0,
         valued_at_utc: Any = None,
+        opened_by_execution_id: str | None = None,
     ) -> None:
         if quantity <= EPSILON:
             return
@@ -3449,6 +4081,10 @@ class PaperPortfolio:
         row["last_valuation_source"] = row.get("last_valuation_source") or "zero"
         row["last_valued_at_utc"] = row.get("last_valued_at_utc") or valued_at_utc
         row["pending_settlement"] = bool(row.get("pending_settlement"))
+        row["inventory_status"] = row.get("inventory_status") or "open"
+        row["unmatched_since_utc"] = row.get("unmatched_since_utc") or valued_at_utc
+        row["opened_by_execution_id"] = row.get("opened_by_execution_id") or opened_by_execution_id
+        row["last_management_action"] = row.get("last_management_action")
         inventory[token_id] = row
 
     def _redeem_completed_pairs(self, *, market_id: str, yes_token_id: str, no_token_id: str) -> float:
