@@ -222,6 +222,10 @@ class RuntimeStatusWriter:
             "last_cycle_skip_counts": {},
             "last_cycle_simulation_failure_counts": {},
             "last_simulated_execution_failure_reason": None,
+            "execution_health_status": "unknown",
+            "execution_health_paused": False,
+            "execution_health_pause_reasons": [],
+            "execution_health_metrics": {},
             "dirty_tokens_pending": 0,
             "dirty_full_universe_pending": False,
             "dirty_full_reconcile_active": False,
@@ -597,6 +601,7 @@ def format_status_dashboard(
         _kv("Status", health_status),
         _kv("Phase", runtime_row.get("phase") or "unknown"),
         _kv("Executor", executor_status),
+        _kv("Exec health", runtime_row.get("execution_health_status") or "unknown"),
         _kv("Coverage", coverage_text),
         _kv("Detail", detail),
     ]
@@ -723,6 +728,20 @@ def format_status_dashboard(
         reconcile_text = f"{_format_count(completed_tokens)} / {_format_count(total_tokens)} seeded"
     simulation_failure_text = _format_category_counts(runtime_row.get("last_cycle_simulation_failure_counts"))
     last_simulation_failure_reason = runtime_row.get("last_simulated_execution_failure_reason") or "none"
+    execution_health = str(runtime_row.get("execution_health_status") or "unknown")
+    pause_reasons = runtime_row.get("execution_health_pause_reasons")
+    pause_reason_text = _format_sample(pause_reasons)
+    health_metrics = runtime_row.get("execution_health_metrics")
+    if isinstance(health_metrics, Mapping) and health_metrics:
+        health_metric_text = (
+            f"dirty={_format_count(_int_value(health_metrics.get('dirty_tokens_pending')))} "
+            f"ws_err={_format_count(_int_value(health_metrics.get('market_ws_error_count')))} "
+            f"p95={_float_value(health_metrics.get('latency_p95_ms')) or 0.0:.0f}ms"
+        )
+    else:
+        health_metric_text = "n/a"
+    unmatched_cost = _float_value(portfolio.get("unmatched_cost_basis_usd_total")) or 0.0
+    unmatched_market_count = _int_value(portfolio.get("unmatched_market_count"))
 
     execution_lines = [
         "COSTS",
@@ -742,7 +761,12 @@ def format_status_dashboard(
         _kv("Skips", _format_count(_int_value(runtime_row.get("last_cycle_skips")))),
         _kv("Live sim fails", simulation_failure_text),
         _kv("Last live sim", last_simulation_failure_reason),
+        _kv("Exec health", execution_health),
+        _kv("Pause reasons", pause_reason_text),
+        _kv("Health metrics", health_metric_text),
         _kv("Unmatched", unmatched_text),
+        _kv("Unmatched mkts", _format_count(unmatched_market_count)),
+        _kv("Unmatched cost", _format_money(unmatched_cost)),
         _kv("Pending settle", _format_count(pending_settlement_count)),
         _kv("Settlements", _format_count(settlements_applied_count)),
         _kv("Last settle", _format_timestamp(latest_settlement_at)),

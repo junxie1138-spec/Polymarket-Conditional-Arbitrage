@@ -285,6 +285,39 @@ def test_paired_execution_respects_trade_ceiling_and_cash():
     assert cash_limited.execution["capital_used"] == pytest.approx(5.0)
 
 
+def test_paired_execution_preserves_min_cash_reserve():
+    p = params(trade_ceiling_usd=100.0, min_cash_reserve_usd=100.0)
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 100)]),
+        asks("no-token", [(0.49, 100)]),
+        state=state_for(p, cash=150.0),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution is not None
+    assert decision.execution["capital_used"] == pytest.approx(50.0)
+    assert decision.execution["quantity"] == pytest.approx(50.0 / 0.97)
+    assert decision.execution["stop_reason"] == "cash_or_ceiling_limit"
+
+
+def test_paired_execution_skips_when_cash_is_at_min_reserve():
+    p = params(trade_ceiling_usd=100.0, min_cash_reserve_usd=100.0)
+    decision = evaluate_binary_paper_execution(
+        market(),
+        asks("yes-token", [(0.48, 100)]),
+        asks("no-token", [(0.49, 100)]),
+        state=state_for(p, cash=100.0),
+        params=p,
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "cash_limit"
+
+
 def test_trade_ceiling_clamps_deep_profitable_book_instead_of_skipping():
     p = params(trade_ceiling_usd=100.0)
     decision = evaluate_binary_paper_execution(
@@ -664,15 +697,18 @@ def test_public_queue_evidence_drives_partial_one_sided_fill(tmp_path):
         fill_time_book_reader=fill_reader,
     )
 
-    assert decision.action == "EXECUTE"
-    execution = decision.execution
-    assert execution["yes_filled_quantity"] == pytest.approx(10.0)
-    assert execution["no_filled_quantity"] == pytest.approx(6.0)
-    assert execution["quantity_redeemed"] == pytest.approx(6.0)
-    assert execution["unmatched_yes_quantity"] == pytest.approx(4.0)
-    assert execution["simulation"]["queue"]["public_queue_evidence"]["source"] == "public_trade_delta_evidence"
-    assert execution["simulation"]["partial_fill"]["source"] == "public_queue_evidence"
-    assert portfolio.status()["unmatched_inventory"]
+    assert decision.action == "SKIP"
+    assert decision.reason == "rejected_partial_pair"
+    assert decision.details["simulation_failure"] is True
+    assert portfolio.state["cash"] == pytest.approx(1000.0)
+    assert portfolio.state["executions"] == []
+    assert portfolio.state["inventory"] == {}
+    assert portfolio.state["book_fingerprints"] == {}
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[0]["event_type"] == "paper_portfolio_execution_failed"
+    assert events[0]["reason"] == "rejected_partial_pair"
+    assert events[0]["simulation"]["queue"]["public_queue_evidence"]["source"] == "public_trade_delta_evidence"
+    assert events[0]["simulation"]["partial_fill"]["source"] == "public_queue_evidence"
 
 
 def test_deterministic_fallback_can_fill_without_public_evidence_when_enabled():
@@ -681,8 +717,6 @@ def test_deterministic_fallback_can_fill_without_public_evidence_when_enabled():
             allow_deterministic_fill_fallback=True,
             queue_depth_ratio=0.5,
             queue_fill_probability=1.0,
-            partial_fill_probability=1.0,
-            partial_fill_min_ratio=0.5,
         )
     )
 
@@ -699,35 +733,128 @@ def test_deterministic_fallback_can_fill_without_public_evidence_when_enabled():
     assert decision.execution["simulation"]["fallback"]["queue"]["source"] == "deterministic_depth_fallback"
 
 
-def test_partial_fill_redeems_matched_quantity_and_leaves_unmatched_inventory(tmp_path):
+def test_equal_matched_partial_executes_without_unmatched_inventory(tmp_path):
     p = params(
         trade_ceiling_usd=100.0,
         simulation=simulation(
-            partial_fill_probability=1.0,
-            partial_fill_min_ratio=0.5,
-            allow_deterministic_fill_fallback=True,
+            allow_deterministic_fill_fallback=False,
         ),
     )
     portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
+
+    def fill_reader(_market, _fill_time):
+        return FillTimeBookEvidence(
+            source="rest_snapshot",
+            yes_book=asks("yes-token", [(0.48, 100)]),
+            no_book=asks("no-token", [(0.49, 100)]),
+            observed_at=AS_OF,
+            snapshot_ready={"yes-token": True, "no-token": True},
+            public_price_changes={
+                "yes-token": (
+                    {
+                        "side": "ask",
+                        "price": 0.48,
+                        "old_size": 100.0,
+                        "new_size": 90.0,
+                        "delta_size": -10.0,
+                    },
+                ),
+                "no-token": (
+                    {
+                        "side": "ask",
+                        "price": 0.49,
+                        "old_size": 100.0,
+                        "new_size": 90.0,
+                        "delta_size": -10.0,
+                    },
+                ),
+            },
+        )
 
     decision = portfolio.execute_binary_complete_set(
         market(),
         asks("yes-token", [(0.48, 100)]),
         asks("no-token", [(0.49, 100)]),
         as_of=AS_OF,
+        fill_time_book_reader=fill_reader,
     )
 
     assert decision.action == "EXECUTE"
     execution = decision.execution
-    assert execution["yes_filled_quantity"] <= execution["quantity"]
-    assert execution["no_filled_quantity"] <= execution["quantity"]
-    assert execution["quantity_redeemed"] == pytest.approx(
-        min(execution["yes_filled_quantity"], execution["no_filled_quantity"])
-    )
-    unmatched_total = execution["unmatched_yes_quantity"] + execution["unmatched_no_quantity"]
-    assert unmatched_total > 0.0
+    assert execution["fill_status"] == "paired_partial_success"
+    assert execution["requested_quantity"] > execution["filled_pair_quantity"]
+    assert execution["yes_filled_quantity"] == pytest.approx(execution["no_filled_quantity"])
+    assert execution["quantity_redeemed"] == pytest.approx(execution["filled_pair_quantity"])
+    assert execution["unmatched_yes_quantity"] == 0.0
+    assert execution["unmatched_no_quantity"] == 0.0
     status = portfolio.status()
-    assert status["unmatched_inventory"]
+    assert status["unmatched_inventory"] == []
+    assert status["unmatched_cost_basis_usd_total"] == pytest.approx(0.0)
+
+
+def test_zero_fill_records_failure_event_without_costs_or_fingerprint(tmp_path):
+    p = params(
+        simulation=simulation(
+            allow_deterministic_fill_fallback=False,
+        ),
+    )
+    path = tmp_path / "portfolio.json"
+    events_path = tmp_path / "events.jsonl"
+    portfolio = PaperPortfolio(path, events_path=events_path, params=p).load()
+
+    def fill_reader(_market, _fill_time):
+        return FillTimeBookEvidence(
+            source="rest_snapshot",
+            yes_book=asks("yes-token", [(0.48, 100)]),
+            no_book=asks("no-token", [(0.49, 100)]),
+            observed_at=AS_OF,
+            snapshot_ready={"yes-token": True, "no-token": True},
+            public_price_changes={
+                "yes-token": (
+                    {
+                        "side": "ask",
+                        "price": 0.48,
+                        "old_size": 100.0,
+                        "new_size": 100.0,
+                        "delta_size": 0.0,
+                    },
+                ),
+                "no-token": (
+                    {
+                        "side": "ask",
+                        "price": 0.49,
+                        "old_size": 100.0,
+                        "new_size": 100.0,
+                        "delta_size": 0.0,
+                    },
+                ),
+            },
+        )
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 100)]),
+        asks("no-token", [(0.49, 100)]),
+        as_of=AS_OF,
+        fill_time_book_reader=fill_reader,
+    )
+
+    assert decision.action == "SKIP"
+    assert decision.reason == "zero_fill"
+    assert not path.exists()
+    assert portfolio.state["cash"] == pytest.approx(1000.0)
+    assert portfolio.state["executions"] == []
+    assert portfolio.state["inventory"] == {}
+    assert portfolio.state["costs"] == {
+        "fees_usd": 0.0,
+        "slippage_usd": 0.0,
+        "tax_usd": 0.0,
+        "merge_usd": 0.0,
+    }
+    assert portfolio.state["book_fingerprints"] == {}
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert events[0]["event_type"] == "paper_portfolio_execution_failed"
+    assert events[0]["reason"] == "zero_fill"
 
 
 def test_strict_mode_skips_when_only_signal_book_is_available():
@@ -1201,6 +1328,49 @@ def test_resumed_active_execution_finishes_and_clears_state(tmp_path):
     assert portfolio.state["executions"][-1]["details"]["stepped_execution"]["step_count"] == 2
 
 
+def test_resumed_active_execution_finalizes_prior_steps_before_bad_later_step(tmp_path):
+    p = params(
+        simulation=simulation(
+            max_step_count=4,
+            step_quantity_shares=5.0,
+            merge_cost_per_step=False,
+        )
+    )
+    path = tmp_path / "portfolio.json"
+    portfolio = PaperPortfolio(path, events_path=tmp_path / "events.jsonl", params=p).load()
+    portfolio.state["cash"] = 1000.15
+    portfolio.state["realized_pnl"] = 0.15
+    portfolio.state["total_equity"] = 1000.15
+    portfolio.state["active_execution"] = deepcopy(completed_active_execution_state(p)["active_execution"])
+    active = portfolio.state["active_execution"]
+    active["target_quantity"] = 10.0
+    active["target_yes_filled_quantity"] = 10.0
+    active["target_no_filled_quantity"] = 5.0
+    active["completed_quantity"] = 5.0
+    active["completed_yes_filled_quantity"] = 5.0
+    active["completed_no_filled_quantity"] = 5.0
+    active["steps"] = active["steps"][:1]
+    active["planned_execution"]["requested_quantity"] = 10.0
+    active["planned_execution"]["filled_pair_quantity"] = 10.0
+    portfolio.save()
+    portfolio.load()
+
+    decision = portfolio.execute_binary_complete_set(
+        market(),
+        asks("yes-token", [(0.48, 20)]),
+        asks("no-token", [(0.49, 20)]),
+        as_of=AS_OF,
+    )
+
+    assert decision.action == "EXECUTE"
+    assert decision.execution["fill_status"] == "paired_partial_success"
+    assert decision.execution["quantity_redeemed"] == pytest.approx(5.0)
+    assert decision.execution["details"]["stepped_execution"]["step_count"] == 1
+    assert "active_execution" not in portfolio.state
+    assert len(portfolio.state["executions"]) == 1
+    assert portfolio.state["cash"] == pytest.approx(1000.15)
+
+
 def test_completed_active_execution_recovery_finalizes_without_reapplying_steps(tmp_path):
     p = params(
         simulation=simulation(
@@ -1511,6 +1681,51 @@ def test_status_reports_realized_and_open_inventory_metrics(tmp_path):
     assert status["capital_committed_usd"] == pytest.approx(2.45)
     assert status["open_position_value_usd"] == pytest.approx(2.9)
     assert status["active_trade_count"] == 2
+
+
+def test_missing_leg_completion_runs_only_when_profitable_and_preserves_reserve(tmp_path):
+    p = params(min_net_profit_usd=0.0, min_net_return_bps=0.0, min_cash_reserve_usd=100.0)
+    portfolio = PaperPortfolio(tmp_path / "portfolio.json", events_path=tmp_path / "events.jsonl", params=p).load()
+    portfolio.state["cash"] = 102.0
+    portfolio.state["inventory"] = {
+        "yes-token": {
+            "token_id": "yes-token",
+            "market_id": "m1",
+            "condition_id": "c1",
+            "outcome": "YES",
+            "quantity": 5.0,
+            "cost_basis_usd": 2.0,
+            "last_valuation_price": 0.4,
+        }
+    }
+
+    blocked = portfolio.complete_missing_leg_if_profitable(
+        market(),
+        asks("yes-token", [(0.40, 5)]),
+        asks("no-token", [(0.50, 5)]),
+        as_of=AS_OF,
+        params=p,
+    )
+    assert blocked.action == "SKIP"
+    assert blocked.reason == "cash_limit"
+    assert portfolio.state["cash"] == pytest.approx(102.0)
+    assert portfolio.state["inventory"]["yes-token"]["quantity"] == pytest.approx(5.0)
+
+    portfolio.state["cash"] = 200.0
+    completed = portfolio.complete_missing_leg_if_profitable(
+        market(),
+        asks("yes-token", [(0.40, 5)]),
+        asks("no-token", [(0.50, 5)]),
+        as_of=AS_OF,
+        params=p,
+    )
+
+    assert completed.action == "EXECUTE"
+    assert completed.execution["execution_status"] == "inventory_management"
+    assert completed.execution["quantity_redeemed"] == pytest.approx(5.0)
+    assert completed.execution["net_profit"] == pytest.approx(0.5)
+    assert portfolio.state["cash"] == pytest.approx(202.5)
+    assert portfolio.state["inventory"] == {}
 
 
 def test_execution_save_failure_rolls_back_in_memory_state(tmp_path, monkeypatch):

@@ -47,6 +47,7 @@ from .runtime_status import (
 
 DIRTY_EVALUATION_DEBOUNCE_SECONDS = 0.1
 RUNTIME_STATUS_WARNING_INTERVAL_SECONDS = 60.0
+HEALTH_WINDOW_SECONDS = 60.0
 
 
 class ScannerStopped(RuntimeError):
@@ -90,6 +91,21 @@ class _DirtyTokenBatch:
     token_ids: set[str] | None
     evaluation_reason: str
     coalesced_updates: int
+
+
+@dataclass(frozen=True)
+class _ExecutionHealth:
+    paused: bool
+    reasons: tuple[str, ...]
+    metrics: Mapping[str, Any]
+
+    def runtime_fields(self) -> dict[str, Any]:
+        return {
+            "execution_health_status": "paused" if self.paused else "ok",
+            "execution_health_paused": self.paused,
+            "execution_health_pause_reasons": list(self.reasons),
+            "execution_health_metrics": dict(self.metrics),
+        }
 
 
 @dataclass(frozen=True)
@@ -448,6 +464,16 @@ def _progress_int(value: Any, default: int = 0) -> int:
         return max(0, int(default))
 
 
+def _float_or_zero(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return 0.0
+    return max(0.0, parsed)
+
+
 def _cap_markets_by_token_limit(markets: list[BinaryMarket], token_limit: int | None) -> list[BinaryMarket]:
     if token_limit is None:
         return list(markets)
@@ -606,6 +632,51 @@ class ConditionalArbScanner:
 
     def _runtime_error(self, exc: Exception) -> None:
         self._runtime_update(last_error=f"{type(exc).__name__}: {exc}")
+
+    def _execution_health_from_runtime(self) -> _ExecutionHealth:
+        if not self.config.execution_health_gates_enabled:
+            return _ExecutionHealth(paused=False, reasons=(), metrics={"enabled": False})
+        snapshot = self.runtime.snapshot() if self._runtime_started else {}
+        metrics = {
+            "enabled": True,
+            "market_ws_reconnect_count": _progress_int(snapshot.get("market_ws_reconnect_count")),
+            "market_ws_error_count": _progress_int(snapshot.get("market_ws_error_count")),
+            "dirty_tokens_pending": _progress_int(snapshot.get("dirty_tokens_pending")),
+            "dirty_update_batches_pending": _progress_int(snapshot.get("dirty_update_batches_pending")),
+            "latency_p95_ms": _float_or_zero(snapshot.get("latency_calibration_p95_ms")),
+            "latency_jitter_ms": _float_or_zero(snapshot.get("latency_calibration_jitter_ms")),
+        }
+        reasons: list[str] = []
+        if metrics["market_ws_reconnect_count"] > self.config.health_max_ws_reconnects_per_minute:
+            reasons.append("ws_reconnect_rate")
+        if metrics["market_ws_error_count"] > self.config.health_max_ws_errors_per_minute:
+            reasons.append("ws_error_rate")
+        if metrics["dirty_tokens_pending"] > self.config.health_max_dirty_tokens:
+            reasons.append("dirty_tokens_backlog")
+        if metrics["dirty_update_batches_pending"] > self.config.health_max_dirty_batches:
+            reasons.append("dirty_batches_backlog")
+        if metrics["latency_p95_ms"] > self.config.health_max_latency_p95_ms:
+            reasons.append("latency_p95")
+        if metrics["latency_jitter_ms"] > self.config.health_max_latency_jitter_ms:
+            reasons.append("latency_jitter")
+        health = _ExecutionHealth(paused=bool(reasons), reasons=tuple(reasons), metrics=metrics)
+        self._runtime_update(**health.runtime_fields())
+        return health
+
+    def _unmatched_reentry_skip_reason(self, market: BinaryMarket, params: PaperPortfolioParams) -> tuple[str | None, dict[str, Any]]:
+        simulation = params.simulation
+        risk = self.portfolio.unmatched_inventory_risk_summary()
+        max_unmatched_cost = max(0.0, simulation.max_unmatched_cost_usd_total)
+        if (
+            max_unmatched_cost > 0.0
+            and _float_or_zero(risk.get("unmatched_cost_basis_usd_total")) > max_unmatched_cost + 1e-9
+        ):
+            return "unmatched_inventory_risk_limit", risk
+        if simulation.block_unmatched_market_reentry and market.market_id in set(risk.get("unmatched_market_ids") or []):
+            return "unmatched_market_reentry_blocked", risk
+        if simulation.block_unmatched_event_reentry and market.event_id in set(risk.get("unmatched_event_ids") or []):
+            return "unmatched_event_reentry_blocked", risk
+        return None, risk
 
     def _apply_startup_latency_calibration(self) -> _StartupLatencyCalibration | None:
         if self._startup_latency_calibrator is None:
@@ -2285,6 +2356,7 @@ class ConditionalArbScanner:
             skip_counts=skip_counts,
         )
         executions: list[dict[str, Any]] = []
+        health = self._execution_health_from_runtime()
 
         for market in standard_markets:
             self._ensure_running()
@@ -2292,6 +2364,31 @@ class ConditionalArbScanner:
             no_book = books_by_token.get(market.no_token_id)
             if yes_book is None or no_book is None:
                 skip_counts["missing_ask_book"] = skip_counts.get("missing_ask_book", 0) + 1
+                continue
+            if health.paused:
+                skip_counts["execution_health_paused"] = skip_counts.get("execution_health_paused", 0) + 1
+                continue
+            reentry_reason, reentry_details = self._unmatched_reentry_skip_reason(market, params)
+            if reentry_reason is not None:
+                if params.simulation.unmatched_inventory_management == "complete_missing_leg_if_profitable":
+                    management_decision = self.portfolio.complete_missing_leg_if_profitable(
+                        market,
+                        yes_book,
+                        no_book,
+                        as_of=cycle_started,
+                        params=params,
+                    )
+                    if management_decision.action == "EXECUTE" and management_decision.execution is not None:
+                        self._handle_decision(
+                            management_decision,
+                            executions,
+                            skip_counts,
+                            simulation_failure_counts=simulation_failure_counts,
+                        )
+                        continue
+                    if management_decision.reason not in {"no_unmatched_inventory", "missing_existing_leg_inventory"}:
+                        reentry_details = {**reentry_details, "management_skip_reason": management_decision.reason}
+                skip_counts[reentry_reason] = skip_counts.get(reentry_reason, 0) + 1
                 continue
             market_fill_time_reader = fill_time_book_reader
             if market_fill_time_reader is None and not params.simulation.is_zero_friction:
@@ -2333,6 +2430,9 @@ class ConditionalArbScanner:
             "skip_counts": skip_counts,
             "simulation_failure_counts": simulation_failure_counts,
             "last_simulated_execution_failure_reason": last_simulation_failure_reason,
+            "execution_health_status": "paused" if health.paused else "ok",
+            "execution_health_pause_reasons": list(health.reasons),
+            "execution_health_metrics": dict(health.metrics),
             **settlement_summary,
         }
         self.portfolio.append_event("paper_portfolio_cycle_completed", summary)
@@ -2345,6 +2445,7 @@ class ConditionalArbScanner:
             last_cycle_skip_counts=skip_counts,
             last_cycle_simulation_failure_counts=simulation_failure_counts,
             last_simulated_execution_failure_reason=last_simulation_failure_reason,
+            **health.runtime_fields(),
             pending_settlement_count=_progress_int(settlement_summary.get("pending_settlement_count")),
             settlements_applied_count=_progress_int(settlement_summary.get("settlements_applied_count")),
             last_settlement_at_utc=settlement_summary.get("last_settlement_at_utc"),

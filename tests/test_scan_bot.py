@@ -1520,6 +1520,13 @@ def test_status_dashboard_formats_portfolio_metric_breakout():
         "heartbeat_at_utc": utc_iso(now),
         "phase": "online",
         "detail": "online",
+        "execution_health_status": "paused",
+        "execution_health_pause_reasons": ["dirty_tokens_backlog"],
+        "execution_health_metrics": {
+            "dirty_tokens_pending": 125,
+            "market_ws_error_count": 2,
+            "latency_p95_ms": 1200.0,
+        },
     }
     portfolio_status = {
         "cash": 992.5,
@@ -1534,6 +1541,8 @@ def test_status_dashboard_formats_portfolio_metric_breakout():
         "capital_committed_usd": 12.5,
         "open_position_value_usd": 11.5,
         "active_trade_count": 2,
+        "unmatched_market_count": 1,
+        "unmatched_cost_basis_usd_total": 0.8,
         "costs": {},
         "last_execution_at_utc": utc_iso(now),
         "unmatched_inventory": [
@@ -1553,6 +1562,11 @@ def test_status_dashboard_formats_portfolio_metric_breakout():
     assert "Committed       $12.50" in dashboard
     assert "Open value      $11.50" in dashboard
     assert "Active trades   2" in dashboard
+    assert "Exec health     paused" in dashboard
+    assert "Pause reasons   dirty_tokens_backlog" in dashboard
+    assert "Health metrics  dirty=125 ws_err=2 p95=1200ms" in dashboard
+    assert "Unmatched mkts  1" in dashboard
+    assert "Unmatched cost  $0.80" in dashboard
 
 
 def test_status_dashboard_formats_legacy_portfolio_metrics():
@@ -2594,6 +2608,103 @@ def test_dirty_token_update_evaluates_only_its_market(tmp_path):
 
     assert result["summary"]["evaluated_standard_binary_markets"] == 1
     assert result["executions"][0]["market_id"] == "m1"
+
+
+def test_unmatched_market_inventory_blocks_reentry(tmp_path):
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client)
+    scanner.portfolio.state["inventory"] = {
+        "yes-1": {
+            "token_id": "yes-1",
+            "market_id": "m1",
+            "condition_id": "c-m1",
+            "outcome": "YES",
+            "quantity": 5.0,
+            "cost_basis_usd": 2.4,
+            "last_valuation_price": 0.48,
+        }
+    }
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=datetime.now(timezone.utc)))
+
+    result = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+
+    assert result["summary"]["executions"] == 0
+    assert result["summary"]["skip_counts"]["unmatched_market_reentry_blocked"] == 1
+    assert scanner.portfolio.state["executions"] == []
+
+
+def test_unmatched_inventory_management_completes_profitable_missing_leg(tmp_path):
+    simulation = replace(
+        config.PaperExecutionSimulationConfig.zero_friction(),
+        unmatched_inventory_management="complete_missing_leg_if_profitable",
+    )
+    cfg = replace(scan_config(tmp_path), paper_simulation=simulation)
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+    scanner.portfolio.state["inventory"] = {
+        "yes-1": {
+            "token_id": "yes-1",
+            "market_id": "m1",
+            "condition_id": "c-m1",
+            "outcome": "YES",
+            "quantity": 5.0,
+            "cost_basis_usd": 2.0,
+            "last_valuation_price": 0.4,
+        }
+    }
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=datetime.now(timezone.utc)))
+
+    result = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+
+    assert result["summary"]["executions"] == 1
+    assert result["executions"][0]["execution_status"] == "inventory_management"
+    assert scanner.portfolio.state["inventory"] == {}
+    assert "unmatched_market_reentry_blocked" not in result["summary"]["skip_counts"]
+
+
+def test_execution_health_pause_skips_execution_but_keeps_cycle_summary(tmp_path):
+    cfg = replace(scan_config(tmp_path), health_max_ws_errors_per_minute=1)
+    client = TwoMarketClient()
+    scanner = scanner_for(tmp_path, client, cfg=cfg)
+    scanner._start_runtime(detail="test health gate")
+    scanner._runtime_update(market_ws_error_count=2)
+    universe = scanner._fetch_market_universe()
+    cache = MarketDataCache()
+    cache.seed_ask_books(profitable_books(universe.token_ids, updated_at=datetime.now(timezone.utc)))
+
+    result = scanner._evaluate_from_cache(
+        universe,
+        cache,
+        dirty_token_ids={"yes-1"},
+        evaluation_reason="ws_dirty_update",
+        params=scanner.params,
+    )
+
+    assert result["summary"]["evaluated_standard_binary_markets"] == 1
+    assert result["summary"]["executions"] == 0
+    assert result["summary"]["skip_counts"]["execution_health_paused"] == 1
+    assert result["summary"]["execution_health_status"] == "paused"
+    assert result["summary"]["execution_health_pause_reasons"] == ["ws_error_rate"]
+    runtime = json.loads(cfg.paper_portfolio_runtime_path.read_text(encoding="utf-8"))
+    assert runtime["execution_health_status"] == "paused"
+    assert runtime["execution_health_pause_reasons"] == ["ws_error_rate"]
+    scanner._stop_runtime()
 
 
 def test_websocket_dirty_tick_does_not_fetch_rest_books(tmp_path):
